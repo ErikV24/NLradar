@@ -1,4 +1,4 @@
-units: kts
+units: m/s
 step: 20
 include for ticks: -140,140
 

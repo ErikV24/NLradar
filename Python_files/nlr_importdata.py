@@ -70,13 +70,28 @@ def process_azis_array(azis, da, calc_azi_offset, azi_pos='center'):
         azi_offset = np.mean([ft.angle_diff(0.5*da, (azis[i]+offset) % da) for i in range(n_azi)])
     return azis, n_azi, da, azi_offset, diffs
 
-ij_map = ref_azi_offset = None
-input_before = {j:None for j in ('n_azi', 'azis', 'diffs', 'da', 'azi_offset', 'azi_pos')}
+_map_onto_regular_grid_cache = {} # key -> (ij_map, ref_azi_offset)
+_map_onto_regular_grid_cache_maxsize = 20 # Klein houden: dit is puur een prestatie-optimalisatie voor
+# herhaalde aanroepen met exact dezelfde azimutale roostergeometrie (bv. hetzelfde paneel opnieuw getekend),
+# geen inhoudelijke noodzaak om veel te bewaren.
 def map_onto_regular_grid(data, n_azi, azis, diffs, da, azi_offset, azi_pos='center'):
-    global ij_map, ref_azi_offset, input_before
+    # FIX (6 juli 2026): dit was voorheen een globale cache van precies EEN vorige aanroep (ij_map/
+    # ref_azi_offset/input_before als module-brede variabelen, gedeeld door ALLE radars/panelen/producten
+    # door elkaar). Zodra twee aanroepen na elkaar plaatsvonden -- bv. snel wisselen tussen panelen, of
+    # toevallig overeenkomende azimutale parameters tussen verschillende radars/scans -- kon de cache-check
+    # ("komt dit overeen met de vorige aanroep?") een verkeerde, van een ANDERE scan afkomstige ij_map laten
+    # hergebruiken. Omdat ij_map bepaalt WELKE ruwe waarde op WELKE positie in de uitvoer terechtkomt, gaf dat
+    # geen crash of overduidelijk foute waarden, maar een stilletjes VERKEERD ruimtelijk herschikte scan --
+    # een aannemelijke verklaring voor de willekeurige, moeilijk te reproduceren foute velocity-weergave bij
+    # snel wisselen tussen panelen/producten. Nu een echte, per-parameterset gesleutelde cache (klein en
+    # begrensd), zodat verschillende aanroepen elkaar nooit meer per ongeluk kunnen overschrijven/verwarren.
+    global _map_onto_regular_grid_cache
     args = locals()
-    _input = {k:(args[k].tolist() if type(args[k]) is np.ndarray else args[k]) for k in input_before}
-    if _input == input_before:
+    _input_keys = ('n_azi', 'azis', 'diffs', 'da', 'azi_offset', 'azi_pos')
+    _input = {k:(args[k].tolist() if type(args[k]) is np.ndarray else args[k]) for k in _input_keys}
+    cache_key = repr(_input)
+    if cache_key in _map_onto_regular_grid_cache:
+        ij_map, ref_azi_offset = _map_onto_regular_grid_cache[cache_key]
         data = data[ij_map]
         data[ij_map == -1] = np.nan
         return data, ref_azi_offset
@@ -171,7 +186,11 @@ def map_onto_regular_grid(data, n_azi, azis, diffs, da, azi_offset, azi_pos='cen
     
     data = data[ij_map]
     data[ij_map == -1] = np.nan
-    input_before = _input
+    if len(_map_onto_regular_grid_cache) >= _map_onto_regular_grid_cache_maxsize:
+        # Verwijder gewoon de eerst toegevoegde entry (simpele FIFO-eviction, geen noodzaak voor iets
+        # geavanceerders gezien de kleine, puur prestatie-gerichte cache-omvang).
+        _map_onto_regular_grid_cache.pop(next(iter(_map_onto_regular_grid_cache)))
+    _map_onto_regular_grid_cache[cache_key] = (ij_map, ref_azi_offset)
     return data, ref_azi_offset
 
 
@@ -614,13 +633,52 @@ class KNMI_hdf5():
         self.refscans=(7,9) #Scans for which the attributes are checked in order to determine whether the attributes for this radar volume are
         #different from those of the previous volume.
         
+        self._warned_unrecognized_datasets = set() # Tracks (radar, dataset name) combinations already warned about.
+        # All dataset names ('scan_<name>_data') that NLradar knows how to interpret, including the filtered/unfiltered
+        # ('u' prefix) and horizontal/vertical polarization ('v' suffix) variants.
+        self._known_dataset_names = {prefix+pname+suffix for pname in gv.productnames_KNMI.values()
+                                      for prefix in ('', 'u') for suffix in ('', 'v')}
+        
     
-    
+    def check_scan_datasets(self, scangroup, scannum):
+        """Checks whether all 'scan_<name>_data' datasets present in this scan group are recognized. If not, this could mean
+        that the KNMI has started providing a new product that wasn't available before (similar to what happened with the
+        velocity filter that was silently removed in 2020). Returns True if anything unrecognized was found.
+        """
+        found_unrecognized = False
+        for key in scangroup:
+            if key.startswith('scan_') and key.endswith('_data'):
+                name = key[len('scan_'):-len('_data')]
+                if not name in self._known_dataset_names:
+                    found_unrecognized = True
+                    warn_key = (self.crd.radar, name)
+                    if not warn_key in self._warned_unrecognized_datasets:
+                        self._warned_unrecognized_datasets.add(warn_key)
+                        msg = (f"onbekend KNMI-dataproduct '{name}' aangetroffen in scan {scannum} voor radar {self.crd.radar} "
+                               "(wordt niet gebruikt). Mogelijk heeft het KNMI een nieuw product toegevoegd.")
+                        print("NLradar: "+msg)
+                        gv.log_product_check("WAARSCHUWING - KNMI - "+msg)
+        return found_unrecognized
+        
     def process_attr(self, attr):
         attr = ft.from_list_or_nolist(attr)
         return attr.decode('utf-8') if type(attr) in (bytes, np.bytes_) else attr
-    
+
+    # LET OP (22 juli): update_melting_levels() (het vroegere "1-punts" mechanisme, gebruikt voor de
+    # inmiddels verwijderde 0C/-20C-balk in nlr.py) is hier verwijderd. HCLASS gebruikt sinds de
+    # invoering van het gedeelde temperatuurrooster (nlr_hclass.NL_GRID_POINTS,
+    # DataSource_General.ensure_melting_level_grid_current) toch al niet meer deze radar-gebonden
+    # 1-puntsversie, en met de balk weg was dit de laatste gebruiker ervan.
+
     def get_scans_information(self,filepath):
+        # LET OP (22 juli, bugfix): update_melting_levels() werd hier voorheen aangeroepen, maar deze
+        # functie wordt door DataSource_General.get_scans_information (nlr_datasourcegeneral.py)
+        # OVERGESLAGEN zodra de volume-attributen al eerder zijn opgeslagen (attributes_available==True) --
+        # dus bij elk hernieuwd bekijken van al eerder ingelezen data, alleen niet bij een verse/nog niet
+        # eerder geziene download. Erik merkte dit op: de 0C/-20C-balk werkte alleen direct na een download.
+        # De aanroep staat daarom nu in DataSource_General.get_scans_information zelf, die wel altijd
+        # wordt uitgevoerd, ongeacht deze cache. update_melting_levels() zelf blijft hier gedefinieerd
+        # (het is een methode van deze klasse, alleen de aanroep is verplaatst).
         with h5py.File(filepath,'r') as hf:
             n_datasets=len([0 for j in hf if j.startswith('scan')])
             
@@ -748,6 +806,16 @@ class KNMI_hdf5():
             product, i_p = self.crd.products[j], gv.i_p[self.crd.products[j]]
             scan=self.dsg.scannumbers_all[i_p][self.crd.scans[j]][self.dsg.scannumbers_forduplicates[self.crd.scans[j]]]
             scangroup=hf['scan'+str(scan)]
+
+            # This runs every time data is fetched for display, regardless of whether NLradar's own volume-attribute
+            # cache was used (unlike a check placed in get_scans_information, which can be skipped entirely for a
+            # previously-viewed date/time).
+            try:
+                found_unrecognized = self.check_scan_datasets(scangroup, scan)
+                if not found_unrecognized:
+                    gv.log_product_check(f"OK - KNMI - check uitgevoerd voor radar {self.crd.radar}, geen onbekende datasets gevonden.")
+            except Exception as e:
+                gv.log_product_check(f"FOUT - KNMI - check_scan_datasets faalde voor radar {self.crd.radar}, scan {scan}: {e}")
             
             productname, dataset, success, self.crd.using_unfilteredproduct[j], self.crd.using_verticalpolarization[j] =\
                 self.try_various_combis_of_filter_and_polarization(i_p,scangroup,self.crd.productunfiltered[j],self.crd.polarization[j])
@@ -891,7 +959,7 @@ class KNMI_hdf5():
                         self.try_various_combis_of_filter_and_polarization(i_p,scangroup,productunfiltered,polarization)
                                         
                     calibrationgroup=scangroup['calibration']
-                    calibration_formula=self.process_attr(calibrationgroup.attrs['calibration_'+i_p.upper()+'_formulas'])
+                    calibration_formula=self.process_attr(calibrationgroup.attrs['calibration_'+productname+'_formulas'])
                     gain=float(calibration_formula[calibration_formula.index('=')+1:calibration_formula.index('*')])
                     offset=float(calibration_formula[calibration_formula.index('+')+1:])
                         
@@ -943,6 +1011,7 @@ class ODIM_hdf5():
                               'ZDR':'d','AttCorrZDRCorr':'d','RHOHV':'c','URHOHV':'c','PHIDP':'p','UPHIDP':'p',
                               'KDPCorr':'k','KDP':'k','SQI':'q','SQIH':'q','SNR':'i','STAT2':'STAT2',
                               'LDR':'x', 'ULDR':'ux'}
+        self._warned_unrecognized_quantities = set() # Tracks (radar, quantity) combinations already warned about.
         
             
     def get_scans_information(self,filepath,product='z'):
@@ -973,10 +1042,20 @@ class ODIM_hdf5():
                     radar_wavelength = float(scangroup['how'].attrs.get('wavelength', 0))/100 if radar_wavelength == 0 else radar_wavelength
                     radar_wavelength = 299792458/float(hf['how'].attrs.get('frequency')) if radar_wavelength == 0 else radar_wavelength
                     if not self.crd.radar in ('Jabbeke', 'Wideumont'):
-                        if 'lowprf' in scangroup['how'].attrs:
+                        if 'lowprf' in scangroup['how'].attrs and float(scangroup['how'].attrs['lowprf']) != 0:
+                            # A scan-level lowprf of exactly 0 is physically impossible (a zero pulse repetition
+                            # frequency is meaningless) -- this has been observed in actual Helchteren files,
+                            # where the scan-level 'how' group has lowprf=0.0 even though highprf is correctly
+                            # set (e.g. to 550.0), while the top-level (volume) 'how' group has both lowprf and
+                            # highprf correctly set to the same, matching value. Using the erroneous scan-level
+                            # value of 0 here propagates a Nyquist velocity of 0 to self.dsg.low_nyquist_velocities_all_mps,
+                            # which later causes a division by zero in the dealiasing code and visibly corrupts
+                            # the resulting velocity display. Falling through to the top-level attributes (or
+                            # the prf/prffac branch) below avoids that, without needing any change to the
+                            # dealiasing code itself.
                             prf_l = float(scangroup['how'].attrs['lowprf'])
                             prf_h = float(scangroup['how'].attrs['highprf'])
-                        elif 'lowprf' in hf['how'].attrs:
+                        elif 'lowprf' in hf['how'].attrs and float(hf['how'].attrs['lowprf']) != 0:
                             prf_l = float(hf['how'].attrs['lowprf'])
                             prf_h = float(hf['how'].attrs['highprf'])
                         else:
@@ -1001,6 +1080,13 @@ class ODIM_hdf5():
                         vn_h = vn_l
                     if prf_l == prf_h and 0.9 < vn_l/self.dsg.nyquist_velocities_all_mps[j] < 1.1:
                         raise Exception # In this case the scan is mono-PRF
+                    # Extra safety net, consistent with the existing 'None if prf_l == 0.0 else ...' pattern
+                    # used elsewhere in this file (e.g. for other data sources) for the same underlying reason:
+                    # a Nyquist velocity of exactly 0 is physically meaningless and would cause a division by
+                    # zero in the dual-PRF dealiasing code further downstream. This guards against that
+                    # outcome regardless of which branch above produced it.
+                    if vn_l == 0 or vn_h == 0:
+                        raise Exception
                     self.dsg.low_nyquist_velocities_all_mps[j], self.dsg.high_nyquist_velocities_all_mps[j] = vn_l, vn_h
                 except Exception:
                     self.dsg.high_nyquist_velocities_all_mps[j] = self.dsg.low_nyquist_velocities_all_mps[j] = None
@@ -1095,12 +1181,23 @@ class ODIM_hdf5():
             dataset = scangroup[d]
             p_name = dataset['what'].attrs['quantity'].decode('utf-8')
             if self.product_names.get(p_name, '') == product:
+                gv.log_product_check(f"OK - ODIM - check uitgevoerd voor radar {self.crd.radar}, geen onbekende quantities gevonden.")
                 return dataset
             elif not p_name in self.product_names:
                 if p_name == 'SCAN' and len(datasets) == 1:
                     # In this case the product name is not correctly specified, and with only 1 dataset present it is assumed
                     # that it contains the requested product
-                    return dataset                
+                    return dataset
+                # p_name (the ODIM 'quantity' attribute) is not recognized at all, meaning this dataset is silently
+                # skipped. Could be an unsupported product, but could also mean the data source has started
+                # providing a new product. Warn once per radar+quantity, so it doesn't go unnoticed.
+                warn_key = (self.crd.radar, p_name)
+                if not warn_key in self._warned_unrecognized_quantities:
+                    self._warned_unrecognized_quantities.add(warn_key)
+                    msg = (f"onbekende ODIM-quantity '{p_name}' aangetroffen voor radar {self.crd.radar} (dataset wordt "
+                           "genegeerd). Mogelijk biedt deze databron een nieuw product aan dat nog niet wordt ondersteund.")
+                    print("NLradar: "+msg)
+                    gv.log_product_check("WAARSCHUWING - ODIM - "+msg)
                                 
     def read_data(self, filepath, product, scan, apply_dealiasing=True, productunfiltered=False, panel=None, data_mask=False, check_azis=True):
         # When a product is not included in gv.i_p, one can provide a productname instead.
@@ -1547,13 +1644,57 @@ class skeyes_hdf5():
     
     
 class DWD_odimh5():
+    # DWD does not publish a native KDP (specific differential phase) product -- their open data server
+    # only offers Z, V, PHIDP, RHOHV and ZDR. KDP is therefore derived here from PHIDP (which is what's
+    # actually read out of the aliased 'k' files, see Source_DWD.get_file_availability_info), using the
+    # standard approach: smooth PHIDP over a range window (to suppress noise), then take the slope of that
+    # smoothed profile over the same window, and halve it (KDP is defined as half the range derivative of
+    # PHIDP).
+    #
+    # KDP_PRESETS bundles the tunable parameters into named configurations, so that trying/comparing
+    # different settings never requires keeping multiple copies of this whole file around -- just switch
+    # KDP_ACTIVE_PRESET below and everything else (bugfixes, other features) stays in this one file.
+    #   window_km            -- half-window length (km) for the radial regression; full window is 2x this.
+    #   rhohv_min             -- minimum RHOHV (0-1) required to trust a PHIDP bin; excludes clear-air/noise.
+    #   azimuthal_smooth_km  -- physical width (km) to also average over azimuthally; 0 disables this.
+    #
+    # 'A': smoother/more conservative -- window=3km, rhohv=0.9, no azimuthal smoothing.
+    # 'B': more detail/sensitive -- window=2km, rhohv=0.85, no azimuthal smoothing. Was preferred after
+    #      comparison against real hail damage near Hilversum showed it better preserved the hail-core
+    #      signature (high Z / low KDP) that config A smoothed away.
+    # 'C': MAXIMAAL detail (15 juli 2026, op Eriks expliciete verzoek na vergelijking met Borkum-iRadar,
+    #      waar duidelijk meer fijne structuur zichtbaar was dan in onze -- destijds gladdere -- B-instelling).
+    #      window_km=0.1 ligt met opzet ver onder elke realistische radiale resolutie, zodat win_bins hierboven
+    #      (regel 'max(int(round(self.KDP_WINDOW_KM / radial_res)), 1)') altijd op zijn absolute technische
+    #      ondergrens van 1 uitkomt -- het kleinst mogelijke venster dat de regressie nog kan berekenen (3
+    #      metingen: 1 ervoor, het punt zelf, 1 erna). LET OP, dit is een bewuste ruil: dit geeft het scherpst
+    #      mogelijke detail, maar ook merkbaar meer ruis dan B, omdat een regressie over maar 3 punten nog
+    #      maar weinig van de ruisonderdrukking heeft die een groter venster wel biedt. Nog niet door Erik
+    #      bevestigd of dit ook daadwerkelijk dichter bij Borkum's detailniveau uitkomt.
+    # 'D': TUSSENWEG (15 juli 2026, op Eriks verzoek na te veel losse ruis-spikkels bij C): venster van 1 km,
+    #      tussen B (2 km, gladder) en C (technisch minimum, ~3 metingen, veel ruis) in. Nog niet door Erik
+    #      bevestigd of dit een goede balans tussen detail en ruis geeft.
+    KDP_PRESETS = {
+        'A': dict(window_km=3.0, rhohv_min=0.9, azimuthal_smooth_km=0.0),
+        'B': dict(window_km=2.0, rhohv_min=0.85, azimuthal_smooth_km=0.0),
+        'C': dict(window_km=0.1, rhohv_min=0.85, azimuthal_smooth_km=0.0),
+        'D': dict(window_km=1.0, rhohv_min=0.85, azimuthal_smooth_km=0.0),
+    }
+    KDP_ACTIVE_PRESET = 'D'  # <-- wijzig dit ene woord ('A', 'B', 'C' of 'D') om van instelling te wisselen
+
+    KDP_WINDOW_KM = KDP_PRESETS[KDP_ACTIVE_PRESET]['window_km']
+    RHOHV_MIN_FOR_KDP = KDP_PRESETS[KDP_ACTIVE_PRESET]['rhohv_min']
+    KDP_AZIMUTHAL_SMOOTH_KM = KDP_PRESETS[KDP_ACTIVE_PRESET]['azimuthal_smooth_km']
+
     def __init__(self, gui_class, dsg_class, parent = None):  
         self.gui=gui_class
         self.dsg=dsg_class
         self.crd=self.dsg.crd
         self.pb = self.gui.pb
-           
-           
+
+    # LET OP (22 juli): update_melting_levels() hier verwijderd, zie zelfde toelichting bij
+    # KNMI_hdf5 hierboven - niet meer gebruikt sinds het gedeelde temperatuurrooster en het
+    # weghalen van de 0C/-20C-balk.
 
     def get_scans_information(self, filepaths, products, fileids_per_product): #These should be the paths to the files that contain the velocity,
         #because otherwise it is not possible to determine the Nyquist velocity.
@@ -1571,7 +1712,7 @@ class DWD_odimh5():
                     scanangles_all[j]=np.mean(dataset['how'].attrs['startelA'])
                     radial_bins_all[j]=int(attrs['nbins'])
                     radial_res_all[j]=float(attrs['rscale']/1000.)
-                    self.dsg.nyquist_velocities_all_mps[j]=np.abs(float(dataset['how'].attrs['NI'])) if product=='v' else None
+                    self.dsg.nyquist_velocities_all_mps[j]=np.abs(float(dataset['how'].attrs['NI'])) if product in ('v', 'uv') else None
                         
                     prf_l = float(dataset['how'].attrs['lowprf'])
                     prf_h = float(dataset['how'].attrs['highprf'])
@@ -1664,11 +1805,143 @@ class DWD_odimh5():
             data_mask = data < 20.
         elif i_p == 'p':
             data %= 360.
+        elif i_p == 'k':
+            # These files are actually PHIDP files (aliased, since DWD has no native KDP product) -- the
+            # values read above are therefore PHIDP in degrees, not yet KDP. PHIDP noise is very large in
+            # non-meteorological (clear-air/noise) bins, so quality-gate using the companion RHOHV file:
+            # KDP is only trusted where the correlation coefficient is high enough to indicate a real
+            # precipitation echo.
+            data %= 360.
+            rhohv_valid = self._load_rhohv_validity_mask(filepaths, data.shape)
+            data = self.compute_kdp_from_phidp(data, scan, rhohv_valid)
+            data_mask = data_mask | ~np.isfinite(data)
         elif i_p == 'v':
             if apply_dealiasing and not self.dsg.low_nyquist_velocities_all_mps[scan] is None:
                 data = self.dealias_velocity(data, data_mask, scan, vn_first_azimuth, combi=len(filepaths) > 0)
         
         return data, data_mask, scantime
+
+    def _load_rhohv_validity_mask(self, phidp_filepaths, expected_shape):
+        """Loads the RHOHV file(s) corresponding to the given PHIDP file(s) (same fileid/timestamp, just
+        'urhohv' instead of 'uphidp' in the filename) and returns a boolean mask of which bins have a high
+        enough correlation coefficient (RHOHV_MIN_FOR_KDP, on the 0-1 scale) to trust for KDP. Falls back
+        to an all-True mask (no extra filtering) if a companion RHOHV file can't be found or read, so a
+        missing/renamed file doesn't break KDP entirely -- it just loses this extra quality gate.
+        """
+        valid = np.ones(expected_shape, dtype=bool)
+        for filepath in phidp_filepaths:
+            rhohv_path = filepath.replace('_uphidp_', '_urhohv_')
+            if rhohv_path == filepath or not os.path.exists(rhohv_path):
+                return valid  # No companion file found; proceed without RHOHV gating.
+            try:
+                with h5py.File(rhohv_path, 'r') as hf:
+                    dataset = hf['dataset1']
+                    calibrationgroup = dataset['data1']['what']
+                    gain = float(calibrationgroup.attrs['gain'])
+                    offset = float(calibrationgroup.attrs['offset'])
+                    undetect = calibrationgroup.attrs['undetect']
+                    nodata = calibrationgroup.attrs['nodata']
+                    raw = np.array(dataset['data1']['data'])
+                    if len(raw) > 360:
+                        azis = np.array(dataset['how'].attrs['startazA'])
+                        diff = np.diff(azis)
+                        raw = np.delete(raw, diff.argmin(), axis=0)
+                    rmask = (raw == undetect) | (raw == nodata)
+                    rhohv = raw.astype('float32') * gain + offset
+                    if rhohv.shape == expected_shape:
+                        valid &= (rhohv > self.RHOHV_MIN_FOR_KDP) & ~rmask
+            except Exception as e:
+                print(f'DWD_odimh5: kon RHOHV-bestand voor KDP-kwaliteitscontrole niet laden '
+                      f'({rhohv_path}): {e}')
+        return valid
+
+    def compute_kdp_from_phidp(self, phidp, scan, extra_valid=None):
+        """Derives KDP (specific differential phase, deg/km) from PHIDP (differential phase, degrees),
+        since DWD does not publish KDP as a separate product. phidp has shape (azimuths, range_bins).
+        extra_valid, if given, is a same-shaped boolean mask (typically from RHOHV) marking which bins
+        contain a real enough meteorological echo to trust for this calculation -- without it, PHIDP in
+        clear-air/noise bins produces large spurious KDP values.
+
+        Uses a moving-window weighted linear-least-squares slope of PHIDP versus range (not a naive
+        two-point difference, which stays very noisy even after separately smoothing the data -- a
+        difference of two points only benefits from the noise reduction of *that* boxcar average, while
+        a full regression uses every point in the window and reduces the noise variance much further).
+        Missing (NaN) bins within a window are excluded via a 0/1 weight, using the standard weighted
+        least-squares slope formula, so a few gaps don't bias or invalidate the whole window.
+        """
+        radial_res = self.dsg.radial_res_all['k'][scan]  # km per range bin
+        if not radial_res or radial_res <= 0:
+            return np.full(phidp.shape, np.nan, dtype='float32')
+
+        win_bins = max(int(round(self.KDP_WINDOW_KM / radial_res)), 1)
+        offsets = np.arange(-win_bins, win_bins + 1, dtype='float64')  # range offsets, in units of bins
+        ones_kernel = np.ones_like(offsets)
+
+        valid = np.isfinite(phidp)
+        if extra_valid is not None:
+            valid = valid & extra_valid
+        y = np.where(valid, phidp, 0.)
+        w = valid.astype('float64')
+
+        # Weighted least-squares slope over each window: with x = offsets (bins) and weight w (0 or 1),
+        #   slope = (S0*Sxy - Sx*Sy) / (S0*Sxx - Sx**2)
+        # where S0=sum(w), Sx=sum(w*x), Sxx=sum(w*x^2), Sy=sum(w*y), Sxy=sum(w*x*y).
+        # Each of these sums-over-the-window is itself a (true, non-flipping) correlation with the
+        # appropriate kernel -- using convolve1d here instead would silently flip the (antisymmetric)
+        # offsets kernel and invert the sign of the result.
+        conv = lambda arr, kernel: scipy.ndimage.correlate1d(arr, kernel, axis=1, mode='nearest')
+        S0 = conv(w, ones_kernel)
+        Sx = conv(w, offsets)
+        Sxx = conv(w, offsets ** 2)
+        Sy = conv(w * y, ones_kernel)
+        Sxy = conv(w * y, offsets)
+
+        denom = S0 * Sxx - Sx ** 2
+        with np.errstate(invalid='ignore', divide='ignore'):
+            slope_per_bin = (S0 * Sxy - Sx * Sy) / denom  # degrees per range bin
+
+        # Require a reasonable number of valid, well-spread bins in the window before trusting the slope
+        # (denom collapses towards 0 when almost all weight sits at a single offset, i.e. too few points).
+        min_valid_bins = win_bins + 1  # at least half the full window
+        invalid_window = (S0 < min_valid_bins) | (np.abs(denom) < 1e-6)
+
+        # KDP = half the slope of PHIDP with range (in km): divide the per-bin slope by the bin size (km)
+        # to get degrees/km, then halve, per the standard definition of specific differential phase.
+        kdp = (slope_per_bin / radial_res) / 2.
+        kdp[invalid_window] = np.nan
+
+        # Range-only smoothing still leaves the field visibly speckled/streaky along each radial compared
+        # to KNMI's native KDP. Averaging over nearby azimuths as well (wrapping around at 0/360 degrees)
+        # rounds this out into coherent cores instead of radial streaks -- but a visual comparison against
+        # real KNMI KDP (19 June 2026 storm) showed this can look artificially smooth/unrealistic, so it's
+        # disabled by default (KDP_AZIMUTHAL_SMOOTH_KM = 0). The number of rays averaged, when enabled, is
+        # chosen per range bin so the *physical* (arc-length) width stays approximately constant -- a fixed
+        # number of rays would cover a much larger physical distance far from the radar than close to it
+        # (arc length = range * angle), over-smoothing distant echoes.
+        if self.KDP_AZIMUTHAL_SMOOTH_KM > 0:
+            n_azi, n_bins = kdp.shape
+            azi_res_deg = 360. / n_azi
+            kdp_valid = np.isfinite(kdp)
+            kdp_filled = np.where(kdp_valid, kdp, 0.)
+            kdp_smoothed = np.full_like(kdp, np.nan)
+            for i in range(n_bins):
+                r_km = max((i + 0.5) * radial_res, radial_res)  # bin-center range; avoid dividing by 0 at r=0
+                angle_deg = np.degrees(self.KDP_AZIMUTHAL_SMOOTH_KM / r_km)
+                n_rays = int(round(angle_deg / azi_res_deg / 2.))
+                n_rays = max(0, min(n_rays, n_azi // 4))  # cap so close-in bins don't smooth over half the circle
+                if n_rays == 0:
+                    kdp_smoothed[:, i] = kdp[:, i]
+                    continue
+                azi_kernel = np.ones(2 * n_rays + 1)
+                col_sum = scipy.ndimage.correlate1d(kdp_filled[:, i], azi_kernel, mode='wrap')
+                col_weight = scipy.ndimage.correlate1d(kdp_valid[:, i].astype('float64'), azi_kernel, mode='wrap')
+                with np.errstate(invalid='ignore', divide='ignore'):
+                    col_smoothed = col_sum / col_weight
+                col_smoothed[col_weight < (n_rays + 1)] = np.nan  # require at least half the window valid
+                kdp_smoothed[:, i] = col_smoothed
+            kdp = kdp_smoothed
+
+        return kdp.astype('float32')
     
     def dealias_velocity(self, data, data_mask, scan, vn_first_azimuth, combi=False):
         vn_l = self.dsg.low_nyquist_velocities_all_mps[scan]
@@ -1681,12 +1954,15 @@ class DWD_odimh5():
         vn_l, vn_h, vn_first_azimuth, window_detection, window_correction, n_it = n_it)
             
 
-    def get_data(self,filepaths, j): #j is the panel
-        product, i_p = self.crd.products[j], gv.i_p[self.crd.products[j]]
+    def get_data(self,filepaths, j, product_override=None): #j is the panel
+        product = product_override if product_override is not None else self.crd.products[j]
+        i_p = gv.i_p[product]
         scan = self.crd.scans[j]
-                                    
+
         self.dsg.data[j], data_mask, self.dsg.scantimes[j] = self.read_data(filepaths, product, scan, self.crd.apply_dealiasing[j])
-        self.dsg.data[j][data_mask]=self.pb.mask_values[product] 
+        # Voor uv gebruiken we dezelfde mask-value/schaal als velocity.
+        mask_product = product if product in self.pb.mask_values else gv.i_p[product]
+        self.dsg.data[j][data_mask]=self.pb.mask_values[mask_product]
 
     def get_data_multiple_scans(self,filepaths,product,scans,productunfiltered=False,polarization='H',apply_dealiasing=True,max_range=None):
         """apply_dealiasing can be either a bool or a dictionary that specifies per scan whether dealiasing should be applied.

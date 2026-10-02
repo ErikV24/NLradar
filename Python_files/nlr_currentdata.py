@@ -402,7 +402,21 @@ class CurrentData(QObject):
                         if not newest_datetimes[1] is None:
                             newest_datetimes = sorted(newest_datetimes, reverse=True)
                     
-                if index == 1 and ((download_file and n_downloads % mod_base == 0) or j == len(self.savenames[index])-1):
+                # Normaal wordt alleen bij automatisch downloaden (index==1) een plot_signal verstuurd, zodat
+                # nieuwe data direct getoond wordt. De handmatige Download-knop (DownloadOlderData, index==2)
+                # deed dit nooit, ook niet wanneer die -- net als automatisch downloaden -- gewoon met
+                # datum/tijd 'c'/'c' ('huidige data') werd gestart. Gevolg: na zo'n download bleef het beeld
+                # leeg totdat je zelf datum+tijd intypte en op Enter drukte (dat gaat via
+                # crd.process_datetimeinput, dat de tekstvakjes vers uitleest) -- Z/spatie (crd.process_
+                # keyboardinput) gebruiken namelijk crd.date/crd.time, de datum/tijd van de laatst geplotte
+                # data, die door deze download nooit werd bijgewerkt. Bewust NIET uitgebreid naar elke
+                # index==2-download: bij een langere historische tijdrange (allowed_datetimerange, bv. de
+                # download-tijdrange-instelling) zou tussentijds plotten van elk gedownload bestand storend
+                # zijn. date/time zijn hier de oorspronkelijk aan run() meegegeven argumenten (nooit
+                # overschreven, in tegenstelling tot self.date[index]/self.time[index] hierboven), dus dit
+                # onderscheidt betrouwbaar een 'c'/'c'-download van een historische-range-download.
+                if (index == 1 or (index == 2 and date == 'c' and time == 'c')) and \
+                ((download_file and n_downloads % mod_base == 0) or j == len(self.savenames[index])-1):
                     # When currently showing the most recent scans or when not having plot any data yet,
                     # a new file is automatically plotted after it is downloaded.
                     if not self.pb.firstplot_performed:
@@ -610,12 +624,14 @@ class CurrentData_DatasourceSpecific():
         self.source_Geosphere=Source_Geosphere(gui_class=self.gui, cds_class=self)
         self.source_SHMI=Source_SHMI(gui_class=self.gui, cds_class=self)
         self.source_NWS=Source_NWS(gui_class=self.gui, cds_class=self)
+        self.source_MeteoGate=Source_MeteoGate(gui_class=self.gui, cds_class=self)
         self.source_classes={'KNMI':self.source_KNMI,'DWD':self.source_DWD,'IMGW':self.source_IMGW,'SHMU':self.source_SHMU,
                              'DHMZ':self.source_DHMZ,'DMI':self.source_DMI,'Météo-France':self.source_MeteoFrance,
                              'CHMI':self.source_CHMI,'Microstep-MIS':self.source_CHMI,'FMI':self.source_FMI,
                              'ESTEA':self.source_ESTEA,'Meteo Romania':self.source_MeteoRomania,
                              'Geosphere Austria':self.source_Geosphere,'SHMI':self.source_SHMI,
-                             'NWS':self.source_NWS}
+                             'NWS':self.source_NWS,'KMI':self.source_MeteoGate,'skeyes':self.source_MeteoGate,
+                             'VMM':self.source_MeteoGate}
         self.sources_with_partial_last_file = ['NWS']
 
     def source_with_partial_last_file(self, radar):
@@ -1388,6 +1404,288 @@ class Source_FMI():
         download_directory = self.dsg.get_download_directory(self.cd.radar)
         self.cd.download_savenames[index] += [download_directory+'/'+filename]
 
+
+
+
+
+class Source_MeteoGate():
+    """Downloads current KMI/skeyes/VMM radar volumes (Wideumont, Jabbeke, Zaventem, Helchteren) via the
+    EUMETNET MeteoGate Open Radar Data (ORD) API, which republishes these Belgian radars' single-site OPERA
+    volumes as ODIM HDF5 files in a public, unauthenticated S3 bucket (the MeteoGate API itself, used only to
+    discover which files exist for a given station, DOES require an API key -- see self.gui.api_keys['MeteoGate']
+    ['radardata'], set via Settings/Download -- but the actual file download from the S3 bucket needs no
+    authentication at all).
+
+    The S3 bucket layout (confirmed by inspecting the MeteoGate API's own responses for 0-56-0-bewid and
+    0-56-0-bejab) is: https://s3.waw3-1.cloudferro.com/openradar-24h/{YYYY}/{MM}/{DD}/BE/{stationcode}/PVOL/
+    {stationcode}@{YYYYMMDD}T{HHMM}@{tilt1_tilt2_..._tiltN}@{PRODUCT}.h5 -- one file per timestep (5-minute
+    interval) per product GROUP, where DBZH and TH (filtered/unfiltered reflectivity) are bundled together in
+    one file, and VRAD (velocity) is a separate file, each containing ALL elevations (a full volume) rather
+    than one file per scan -- simpler than e.g. DWD, which needs a separate file per scan per elevation.
+
+    Station codes (the 'stationcode' segment above, and the WIGOS platform id's local-identifier part used to
+    query the MeteoGate API as 0-56-0-{stationcode}) are confirmed for Wideumont ('bewid') and Jabbeke
+    ('bejab'); Helchteren ('behel', matching the station abbreviation already seen elsewhere, e.g. in
+    third-party radar apps) and Zaventem are assumed to follow the same convention but not independently
+    confirmed -- see self.station_codes, which maps each radar name to its station code.
+
+    Jabbeke short/long range
+    ------------------------
+    Jabbeke is the only one of these stations (confirmed; not observed for Wideumont/Helchteren, see above)
+    for which MeteoGate publishes TWO separate DBZH files per timestep: one starting at a lower elevation
+    (0.3 degrees), with a correspondingly longer slant range (~299 km), and one starting higher (0.5 degrees),
+    with a shorter range (~150 km). BOTH are always downloaded (see update_downloadlist and
+    get_urls_and_savenames_downloadfile below) into their own separate directory -- the normal 'Jabbeke_Z'
+    for long-range, and 'Jabbeke_Z_short' for short-range (configured as a second directory string for
+    'Jabbeke_Z' in nlr.py, alongside the normal first one). Which of the two is displayed is controlled by
+    NLradar's existing multi-directory mechanism (self.gui.radardata_dirs_indices['Jabbeke_Z'], switched with
+    the existing CTRL+D shortcut / self.crd.change_dir_index in nlr_changedata.py) -- the exact same
+    mechanism already used for any other radar/dataset with more than one configured directory. An earlier
+    approach used a single directory plus a Settings toggle (self.gui.jabbeke_range_setting) to pick which
+    one got downloaded; that toggle had to be read, consistently, by several independent places at the right
+    moment (the downloader, the file-picking logic, the title bar) and turned out to be prone to going out of
+    sync after quick navigation. Splitting into 2 separate, always-populated directories removes the need
+    for any of that: which range is showing is simply a property of which directory is currently selected,
+    exactly like Z vs. V already is.
+    """
+    def __init__(self,gui_class,cds_class,parent=None):
+        self.gui=gui_class
+        self.dsg=self.gui.dsg
+        self.cds=cds_class
+
+        self.api_base = 'https://api.meteogate.eu/eu-eumetnet-weather-radar'
+        self.s3_base = 'https://s3.waw3-1.cloudferro.com/openradar-24h'
+        # The shared module-level 's3' client (see the top of this file) is configured for AWS's own S3
+        # endpoint, which the FMI/NEXRAD sources elsewhere in this file rely on -- but MeteoGate's bucket is
+        # hosted on a different, S3-compatible storage provider (CloudFerro), reachable only via its own
+        # endpoint_url. boto3 only accepts endpoint_url at client-creation time, not as a per-call argument, so
+        # a separate client specific to this endpoint is created here rather than passing some 'Endpoint'
+        # keyword to list_objects (which isn't a real boto3 parameter and would just raise an error).
+        self.s3_meteogate = boto3.client('s3', endpoint_url='https://s3.waw3-1.cloudferro.com',
+                                          config=Config(signature_version=UNSIGNED))
+        # Cache of the most recently discovered filename per (radar, product group), to avoid re-listing the
+        # S3 bucket on every single download attempt within the same update_downloadlist call -- see
+        # update_downloadlist, which fills this in, and get_urls_and_savenames_downloadfile, which reads it.
+        self.files={j:{} for j in gv.radars['KMI']+gv.radars['skeyes']+gv.radars['VMM']}
+        # Maps each radar name to its MeteoGate/OPERA station code (the 'bewid' part of the WIGOS id
+        # 0-56-0-bewid, and of the S3 filenames bewid@...). Confirmed by directly querying the MeteoGate API
+        # for 'Wideumont' and 'Jabbeke'; 'Helchteren' is inferred from the same 'be'+4-letter-station-code
+        # convention (matching the abbreviation already seen in third-party radar apps), and 'Zaventem' is a
+        # guess following the same pattern -- both are NOT independently confirmed. If either turns out wrong,
+        # update_downloadlist will simply find no files for that radar (a 204/empty response), which is safe
+        # (no crash, just an informative 'no files present' message) -- rather than silently downloading the
+        # wrong station's data.
+        self.station_codes = {'Wideumont': 'bewid', 'Jabbeke': 'bejab', 'Helchteren': 'behel', 'Zaventem': 'bezav'}
+
+    def wigos_id(self, radar):
+        """Builds the full WIGOS id MeteoGate expects (country code 56 = Belgium) from this radar's station
+        code -- see self.station_codes above for which codes are confirmed vs. inferred."""
+        return '0-56-0-'+self.station_codes[radar]
+
+    def update_downloadlist(self,index):
+        self.cd.emit_info(self.cd.cd_message_updating_downloadlist,'Progress_info')
+
+        if not (self.cd.date[index] == 'c' or self.cd.time[index] == 'c'):
+            startdatetime = ft.next_datetime(self.cd.date[index]+self.cd.time[index], -720)
+            enddatetime = self.cd.date[index]+self.cd.time[index]
+        else:
+            startdatetime = ft.next_datetime(self.cd.currentdate+self.cd.currenttime, -1440)
+            enddatetime = self.cd.currentdate+self.cd.currenttime
+        dates = np.unique([startdatetime[:8], enddatetime[:8]])
+
+        radar = self.cd.radar
+        stationcode = self.station_codes[radar]
+        self.files[radar][index] = {} # {datetime12: {'DBZH': key, 'DBZH_short': key, 'VRAD': key}}, filled in below
+        error_received = False
+        for date in dates:
+            prefix = f'{date[:4]}/{date[4:6]}/{date[6:8]}/BE/{stationcode}/PVOL/'
+            try:
+                out = self.s3_meteogate.list_objects(Bucket='openradar-24h', Prefix=prefix)
+            except Exception as error:
+                self.cd.show_error_info(str(error)+',update_downloadlist')
+                error_received = True
+                continue
+            for item in out.get('Contents', []):
+                filename = os.path.basename(item['Key'])
+                # Filename format: {stationcode}@{YYYYMMDD}T{HHMM}@{tilts}@{PRODUCT}.h5
+                try:
+                    parts = filename[:-len('.h5')].split('@')
+                    datetime12 = parts[1].replace('T', '')
+                    product_group = parts[3] # 'DBZH' (bundled with TH) or 'VRAD'
+                    first_tilt = float(parts[2].split('_')[0])
+                except (IndexError, ValueError):
+                    continue # Unexpected filename format -- skip rather than crash on a single bad entry.
+                # Some stations (confirmed for Jabbeke; not observed for Wideumont/Helchteren, where a single
+                # file already bundles all elevations) publish a SECOND DBZH (and, it turns out, a second TH
+                # -- see below) file for the same timestep, with a lower starting elevation angle and a
+                # correspondingly longer slant range (e.g. Jabbeke's confirmed via the MeteoGate API: 0.3
+                # degrees / ~299 km, vs. the 0.5 degrees / ~150 km file). A lower starting tilt has
+                # consistently meant a longer range across all 3 stations checked. BOTH variants are kept
+                # here (under separate dict keys, e.g. DBZH for long-range and DBZH_short for short-range)
+                # and both get downloaded unconditionally in get_urls_and_savenames_downloadfile below, into
+                # 2 separate directories -- see the class docstring for why (in short: a single download
+                # choice driven by a setting turned out to be prone to going out of sync with what's
+                # actually displayed after quick navigation; always downloading both and letting the
+                # existing multi-directory display mechanism pick removes that whole class of problem). For
+                # Wideumont/Helchteren there is only ever 1 variant of each product, so this distinction is
+                # a no-op there -- it only matters for radar == 'Jabbeke'.
+                product_key = product_group
+                if radar == 'Jabbeke' and product_group in ('DBZH', 'TH') and first_tilt >= 0.5:
+                    product_key = product_group+'_short'
+                existing_key = self.files[radar][index].get(datetime12, {}).get(product_key)
+                if existing_key is not None:
+                    # Already have an entry for this exact (datetime12, product_key) -- this shouldn't
+                    # normally happen (would mean MeteoGate published 2 files for what we're treating as the
+                    # very same range variant), but if it does, keep the first one found rather than letting
+                    # a later, possibly-incomplete entry silently overwrite it.
+                    continue
+                self.files[radar][index].setdefault(datetime12, {})[product_key] = item['Key']
+
+        if self.files[radar][index]:
+            # Only keep timesteps where BOTH a Z product (DBZH) and a V product (VRAD/VRADH) are present.
+            #
+            # Why this matters: NLradar's own change-data logic (determine_list_filedatetimes /
+            # get_filedatetimes in nlr_changedata.py) automatically switches self.selected_dataset from Z to V
+            # (or vice versa) when no files are available for the currently selected dataset at a given
+            # timestep -- but it only re-points self.directory at the new dataset's folder when date/time were
+            # passed explicitly into that call chain. In several call paths they aren't, so self.directory can
+            # keep pointing at the OLD dataset's folder even after self.selected_dataset has switched. This is
+            # a pre-existing NLradar mechanism, not something introduced by this downloader -- but the MeteoGate
+            # S3 bucket can have one product's file appear a few minutes before the other for the same
+            # timestep, creating exactly the kind of single-dataset gap that triggers this edge case (verified
+            # via temporary debug prints in Source_KMI.filepath: self.crd.directory stayed on the Wideumont_V
+            # folder while product 'z' was being requested, after a brief earlier gap in Z availability caused
+            # the automatic dataset switch without an accompanying directory switch).
+            #
+            # Rather than touch that shared, multi-source change-data logic, the safest fix is to never offer a
+            # timestep here unless both datasets are complete -- this prevents the gap that triggers the edge
+            # case from ever occurring in the first place, without risking side effects on other radar sources.
+            complete_datetimes = [dt for dt, products in self.files[radar][index].items()
+                                  if 'DBZH' in products and ('VRAD' in products or 'VRADH' in products)]
+            if radar == 'Helchteren' and not complete_datetimes and self.files[radar][index]:
+                # Helchteren-specifiek: VRADH is (sinds eind augustus 2026) niet meer beschikbaar via
+                # MeteoGate/ORD voor dit station (bevestigd door Lukas). De eis hierboven -- zowel Z als V
+                # aanwezig, om de race condition uit de comment hierboven te vermijden -- zorgt er daardoor
+                # voor dat complete_datetimes hier NOOIT meer iets bevat, ook al is DBZH/TH gewoon aanwezig.
+                # Gevolg: update_downloadlist geeft altijd False terug (self.cd_message_run_nofilespresent) en
+                # er wordt helemaal niets meer gedownload voor Helchteren, DBZH/TH incluis. Alleen in dat geval
+                # (geen enkel tijdstip met V gevonden, terwijl er wel data is) hier terugvallen op alleen DBZH
+                # vereisen; voor tijdstippen van vóór de uitval, waar VRADH nog wel aanwezig is, blijft de
+                # normale eis hierboven gewoon gelden (complete_datetimes bevat die dan al).
+                complete_datetimes = [dt for dt, products in self.files[radar][index].items() if 'DBZH' in products]
+            if complete_datetimes:
+                datetimes = np.array(sorted(complete_datetimes))
+                absolutetimes = ft.get_absolutetimes_from_datetimes(datetimes)
+                self.cd.datetimes_downloadlist[index]=[datetimes.astype('uint64'), absolutetimes]
+                self.cd.emit_info(None,None)
+                return True
+            else:
+                self.cd.show_error_info(self.cd.cd_message_run_nofilespresent)
+                return False
+        else:
+            if not error_received:
+                self.cd.show_error_info(self.cd.cd_message_run_nofilespresent)
+            return False
+
+    def get_urls_and_savenames_downloadfile(self,index):
+        """Obtain the urls and names under which the files will be saved. Unlike most other sources here, this
+        can add MULTIPLE entries per timestep -- one for the DBZH+TH file, one for the VRAD file (MeteoGate
+        bundles them into separate files rather than one combined volume), and for Jabbeke specifically, also
+        a second DBZH entry for the short-range variant when available -- see the class docstring. The
+        downloaded files are renamed to a 26-character filename (12-digit datetime + a fixed 4-character
+        station-derived tag + product name + '.vol' + the original '.h5' extension) that matches what
+        Source_KMI.correct_filename (in nlr_datasourcespecific.py) already expects for '.h5'-extension KMI
+        files -- this way, no changes are needed to the existing, working read-side code; the downloaded data
+        just looks, from that code's perspective, like any other KMI '.h5' file already would.
+        """
+        date, time = self.cd.date[index], self.cd.time[index]
+        datetime12 = date+time
+        radar = self.cd.radar
+        entry = self.files[radar][index].get(datetime12, {})
+        if not entry:
+            return # Nothing known for this exact timestep (e.g. update_downloadlist wasn't called for it).
+
+        # 4-character tag inserted between the datetime and the product name, so the final filename's
+        # structure matches what Source_KMI.correct_filename expects (see that function: for '.h5' files it
+        # checks that filename[16:-3] equals the product name + '.vol' -- 12 digits of datetime + this 4-char
+        # tag = 16 characters before the product name starts). The tag's exact content doesn't matter to that
+        # check (it only looks at what comes after), so the first 4 characters of the station code (uppercased)
+        # are used here just to keep the filename informative/distinguishable, e.g. when looking at a directory
+        # listing by eye. Unlike an earlier version of this function, the tag is now always the same
+        # (station-derived) value regardless of range -- Jabbeke's 2 DBZH range variants are told apart by
+        # which DIRECTORY they're saved into (see dir_index below and the class docstring), not by the
+        # filename, so there's no longer any need for a separate tag per range, nor any risk of a stale tag
+        # surviving a setting change (there's no setting to change anymore).
+        base_tag = self.station_codes[radar][:4].upper()
+
+        for product_key, key in entry.items():
+            if product_key in ('DBZH', 'DBZH_short'):
+                pname, dataset = 'dBZ', 'Z' # Matches gv.productnames_KMI['h5']['z'] == 'dBZ'
+                # dir_index selects which of the (possibly multiple) configured directory strings for this
+                # radar_dataset to use -- see dirstring_to_dirlist in nlr_background.py and
+                # self.gui.radardata_dirs['Jabbeke_Z'] in nlr.py, which configures a second directory string
+                # specifically for this. 0 is always the first (normal/long-range) directory; 1 is only
+                # meaningful for Jabbeke's short-range variant, and is harmless for every other radar (where
+                # there's only ever 1 directory string, so index 0 is the only one that's ever used anyway --
+                # this branch with dir_index=1 is only reached when product_key ends with '_short', which is
+                # only ever set for radar == 'Jabbeke', see update_downloadlist above).
+                dir_index = 1 if product_key == 'DBZH_short' else 0
+            elif product_key in ('TH', 'TH_short'):
+                # TH is the UNFILTERED counterpart of DBZH ('total power', i.e. without the clutter filter
+                # that DBZH has already had applied) -- confirmed to exist as its OWN separate S3 key
+                # (verified via the full-day S3 listing AND the MeteoGate API: TH never showed up bundled
+                # inside the DBZH file's data, despite that having been assumed in an earlier version of this
+                # comment). It maps to pname 'dBuZ', matching gv.productnames_KMI['h5']['uz'] == 'dBuZ' --
+                # the existing, already-wired-up "unfiltered product" mechanism (SHIFT+U, see
+                # Source_KMI.filepath in nlr_datasourcespecific.py: product='u'+product when
+                # productunfiltered is True) picks this up automatically, with no further changes needed
+                # there. Saved into the same 'Z' dataset/directory as DBZH (TH is a reflectivity variant, not
+                # a separate dataset like V) -- and, for Jabbeke, the same long/short dir_index logic is
+                # applied here on the assumption that TH follows the same 2-variant publishing pattern as
+                # DBZH (both being reflectivity-type products from the same scan program). This has NOT been
+                # independently re-verified against TH specifically (only confirmed that TH exists as its own
+                # S3 key, and that DBZH itself has the 2-variant pattern) -- if TH turns out to only ever have
+                # 1 variant for Jabbeke, this degrades safely: the first_tilt-based split in
+                # update_downloadlist would then simply never produce a 'TH_short' key, so the dir_index=1
+                # branch here would just never be reached for TH.
+                pname, dataset = 'dBuZ', 'Z' # Matches gv.productnames_KMI['h5']['uz'] == 'dBuZ'
+                dir_index = 1 if product_key == 'TH_short' else 0
+            elif product_key in ('VRAD', 'VRADH'):
+                # Confirmed that different KMI/VMM stations can use slightly different velocity parameter
+                # names within the same MeteoGate API: Wideumont and Jabbeke use 'VRAD', while Helchteren uses
+                # 'VRADH' -- both refer to the same quantity (horizontal radial velocity), just named
+                # differently by whoever published that station's data. Both are recognized here.
+                pname, dataset = 'V', 'V' # Matches gv.productnames_KMI['h5']['v'] == 'V'
+                dir_index = 0
+            else:
+                continue # An unrecognized product key -- shouldn't normally occur, skip defensively.
+            # The dataset ('Z' or 'V') is passed explicitly here, rather than relying on get_directory's
+            # dataset=None default -- that default falls back to whatever dataset happens to be selected in
+            # the GUI at the moment of the call, which is NOT necessarily the dataset this particular file
+            # belongs to (e.g. while downloading the VRAD file, the GUI might still have 'Z' selected from a
+            # moment ago). Passing the correct dataset explicitly ensures both the DBZH+TH file and the VRAD
+            # file always end up in their own correct directory (e.g. Wideumont_Z vs. Wideumont_V),
+            # independent of GUI state. (Radars not in gv.radars_with_datasets, e.g. Helchteren/VMM, get no
+            # such suffix on the directory either way -- see get_radar_dataset in nlr_datasourcegeneral.py --
+            # so this works the same for both KMI and VMM radars.)
+            directory = self.dsg.get_directory(date, time, radar, dataset, dir_index=dir_index)
+            download_directory = self.dsg.get_download_directory(radar, dataset)
+            filename = f'{datetime12}{base_tag}{pname}.vol.h5'
+            # get_download_directory always resolves to the directory for dir_index=0 (see that function's
+            # own docstring/comment in nlr_datasourcegeneral.py: "If multiple dir_strings are provided, then
+            # for downloading always the 1st ... is used") -- a single, SHARED staging location regardless
+            # of which of Jabbeke_Z's 2 directories a file is ultimately destined for. Since both the
+            # long-range and short-range DBZH downloads for the same timestep would otherwise produce the
+            # exact same download_filename here, they'd overwrite each other while both sit in that shared
+            # staging directory at once (e.g. if both downloads happen to be in flight around the same
+            # time). Giving the short-range one a distinguishable download_filename (only -- the final
+            # savename below, in its own separate directory, keeps the plain/normal filename) avoids that
+            # collision; nothing reads this distinguishing mark back out, it only needs to be unique here.
+            download_filename = filename if dir_index == 0 else f'{datetime12}{base_tag}{pname}_short.vol.h5'
+            self.cd.datetimes[index] += [datetime12]
+            self.cd.urls[index] += [self.s3_base+'/'+key]
+            self.cd.savenames[index] += [directory+'/'+filename]
+            self.cd.download_savenames[index] += [download_directory+'/'+download_filename]
 
 
 

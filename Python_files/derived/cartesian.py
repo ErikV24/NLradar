@@ -230,6 +230,10 @@ class Cartesian():
                 flattened = flattened[sort_indices]
                 
                 indices_unique_orig, flattened_indices_orig, counts = np.unique(indices, return_index=True, return_counts=True)
+                if counts.size == 0:
+                    # FIX 31 juli 2026: zie identieke toelichting in derived/polar.py - een volledig lege
+                    # scan/duplicate (bv. schone-lucht, geen echo) crashte hier voorheen. Overslaan i.p.v. crashen.
+                    continue
                 count_max = counts.max()
 
                 k = 0

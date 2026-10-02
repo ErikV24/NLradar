@@ -96,7 +96,14 @@ class PlottingVWP(QObject):
         color1, color2 = [1,1,0], [0,1,0]
         self.cm_streamwise_vorticity_sign = color.Colormap([color1,color1,color2,color2], controls=[0,0.5,0.5,1], interpolation='linear')
         cbar_height = 0.02
-        self.cbarcenter_ypos = cbar_height/2+0.045
+        # cbarcenter_ypos vergroot (was 0.055): er moet boven de balk zowel de
+        # "Streamwise component..."-regel (y=0, ~1 regelhoogte) als de
+        # tick-labels (-,+,25,100, nog een regelhoogte) passen. Met de oude
+        # waarde was daar in totaal maar 0.045 voor beschikbaar - te weinig
+        # voor zelfs 1 regel, laat staan 2. Alles wat hieronder hangt
+        # (self.ytop en alle tabellen/tekst) schuift hierdoor gelijkmatig mee
+        # naar beneden - de onderlinge afstanden daartussen blijven ongewijzigd.
+        self.cbarcenter_ypos = 0.13
         self.cbartop_ypos, self.cbarbottom_ypos = self.cbarcenter_ypos+np.array([-1,1])*cbar_height/2
         self.visuals['cbar_streamwise_vorticity_sign'] = visuals.ColorBarVisual(pos=[0.25,self.cbarcenter_ypos],size=[0.36,cbar_height],cmap=self.cm_streamwise_vorticity_sign,orientation='top',clim=[0,1],label_color=(0,0,0,0))
         self.visuals['cbar_filled_sectors'] = visuals.ColorBarVisual(pos=[0.75,self.cbarcenter_ypos],size=[0.36,cbar_height],cmap=self.cm_filled_sectors,orientation='top',clim=[0,1],label_color=(0,0,0,0))
@@ -223,6 +230,9 @@ class PlottingVWP(QObject):
     def plot_title(self):
         self.visuals['title'].text = 'Radar VWP ('+self.pb.productunits['v']+')'+'      '+self.volume_starttime+'-'+self.volume_endtime+'Z'
         self.visuals['title'].pos = [(1-0.5*self.pb.vwp_relxdim)*self.pb.size[0],self.pb.wpos['top'][0,1]+1]
+        print(f"[VWP-DEBUG-TITLE] text={self.visuals['title'].text!r}, pos={self.visuals['title'].pos}, "
+              f"font_size={self.visuals['title'].font_size}, visible={self.visuals['title'].visible}, "
+              f"transform={self.visuals['title'].transform}")
         
     def plot_hodo_circles(self):
         abs_values = np.abs([[self.xmin, self.xmax], [self.ymin, self.ymax]])
@@ -282,7 +292,7 @@ class PlottingVWP(QObject):
         if not plot_line:
             return
             
-        legend_ypos = self.ymin+0.03*self.plotrange if self.ymin+0.1*self.plotrange < 0 else 0.03*self.plotrange
+        legend_ypos = self.ymin+0.08*self.plotrange if self.ymin+0.1*self.plotrange < 0 else 0.08*self.plotrange
         side = np.sign(self.xmin+0.5*self.plotrange) if not -self.xmin == self.xmax else 1
         Vx_far_side = (self.V[:, 0]-self.xmin if side == -1 else self.xmax-self.V[:, 0]) < 0.4*self.plotrange
         Vy_low = self.V[:, 1] < legend_ypos+0.06*self.plotrange
@@ -376,9 +386,18 @@ class PlottingVWP(QObject):
             marker_colors = self.cm_filled_sectors.map(self.filled_sectors/36-self.vvp_min_frac_sectors_filled)
             self.visuals['hodo_points'].set_data(pos=self.V, symbol='o', size=self.pb.scale_pixelsize(5.75),
                                                        face_color=marker_colors, edge_color=None, edge_width=0)
-            marker_colors[:, 3] = 0.034
-            self.visuals['hodo_sigmacircles'].set_data(pos=self.V, symbol='o', size=2*self.sigma, scaling=True,
+            marker_colors[:, 3] = 0.15
+            # FIX (22 juli): 'scaling' is in de geinstalleerde vispy-versie (0.14.1) geen argument meer van
+            # MarkersVisual.set_data() (gaf TypeError: "unexpected keyword argument 'scaling'"), maar een
+            # los instelbaar attribuut van de visual zelf. True komt overeen met scaling-mode "scene" (marker
+            # schaalt mee bij in-/uitzoomen), zie vispy/visuals/markers.py's scaling-setter.
+            self.visuals['hodo_sigmacircles'].scaling = True
+            self.visuals['hodo_sigmacircles'].set_data(pos=self.V, symbol='o', size=2*self.sigma,
                                                        face_color=marker_colors, edge_color=None)
+            print(f"[VWP-DEBUG-SIGMA] sigma min/max/mean={self.sigma.min():.3f}/{self.sigma.max():.3f}/{self.sigma.mean():.3f}, "
+                  f"size(=2*sigma) min/max={2*self.sigma.min():.3f}/{2*self.sigma.max():.3f}, "
+                  f"alpha={marker_colors[0,3]}, hodo_sttransform.scale={self.hodo_sttransform.scale}, "
+                  f"visible={self.visuals['hodo_sigmacircles'].visible}")
             
     def plot_hodo_hlabels(self):
         if len(self.h_layers) > 0:
@@ -420,10 +439,10 @@ class PlottingVWP(QObject):
         self.general_text_left_text += ['Streamwise component of vorticity (\u03c9) for '+sm]
         self.general_text_left_pos += [[0.01, 0]]
         self.general_text_right_text += ['% of 36 azimuthal sectors that passed data check']
-        self.general_text_right_pos += [[0.99, self.cbarbottom_ypos+0.01]]
+        self.general_text_right_pos += [[0.99, self.cbarbottom_ypos+0.041]]
         self.general_text_center_text += ['-','+',str(int(self.vvp_min_frac_sectors_filled*100)),'100']
-        self.general_text_center_pos += [[0.035, self.cbartop_ypos-0.0045],[0.465, self.cbartop_ypos-0.0045],
-                                         [0.535, self.cbartop_ypos-0.0045],[0.965, self.cbartop_ypos-0.0045]]
+        self.general_text_center_pos += [[0.035, self.cbartop_ypos-0.041],[0.465, self.cbartop_ypos-0.041],
+                                         [0.535, self.cbartop_ypos-0.041],[0.965, self.cbartop_ypos-0.041]]
                                 
     def plot_height_list(self):
         n = min(len(self.h_layers), 5)
@@ -441,16 +460,22 @@ class PlottingVWP(QObject):
             text += '...'
         if text == 'h (km AGL) = ':
             text += '--'
-            
+
+        # Losse regels i.p.v. 1 string met \n erin - een gecombineerde multi-line
+        # string in 1 general_text-item rendert niet betrouwbaar op de juiste
+        # positie (zie ook plot_sm_text/plot_vwp_legend/plot_sfcobs_legend).
+        lines = [text]
         if n > 0 and self.h_layers[0] == 0.:
-            text += f"\nSurface elevation: {self.sfcobs['station_elev']} m"
-        text += f'\nRadar elevation: {gv.radar_elevations[self.crd.radar]} m'
-        
-        self.general_text_left_text += [text]
-        self.general_text_left_pos += [[0.01, self.ytop]]
+            lines += [f"Surface elevation: {self.sfcobs['station_elev']} m"]
+        lines += [f'Radar elevation: {gv.radar_elevations[self.crd.radar]} m']
+
+        for i, line in enumerate(lines):
+            self.general_text_left_text += [line]
+            self.general_text_left_pos += [[0.01, self.ytop + i*0.041]]
         
     def display_parameters(self):
         if len(self.V) < 2:
+            self.params_table_bottom_y = self.ytop + 0.155  # geen tabel getekend; veilige terugval
             return
         units = self.pb.productunits['v']
         y0 = y1 = self.ytop+0.155
@@ -478,6 +503,7 @@ class PlottingVWP(QObject):
         pos += [[0.01, y1]]
         text += ['h (km)']+list(self.srh)[::-1]
         pos += [[0.01, y1+dy]] + [[0.16+0.115*i, y1+dy] for i in range(len(self.srh))]
+        n_srh_rows = 0
         for i, sm in enumerate(list(self.srh)[::-1]):
             for j, layer in enumerate(self.srh[sm]):
                 if i == 0:
@@ -485,9 +511,14 @@ class PlottingVWP(QObject):
                     pos += [[0.01, y1+(2+j)*dy]]
                 text += [f'{self.srh[sm][layer]:0.0f}' if not self.srh[sm][layer] is None else '--']
                 pos += [[0.16+0.115*i, y1+(2+j)*dy]]
+            n_srh_rows = max(n_srh_rows, len(self.srh[sm]))
             
         self.general_text_left_text += text
         self.general_text_left_pos += pos
+        # Exacte positie van de onderkant van de tabel (i.p.v. een geschatte
+        # (12-n_params)-vuistregel) - gebruikt door plot_vwp_legend/plot_sfcobs_legend
+        # om daar altijd precies onder te beginnen, ongeacht de tabelgrootte.
+        self.params_table_bottom_y = y1 + (1+n_srh_rows)*dy
             
     def format_h(self, numbers):
         return ft.format_nums(numbers, dec=1, separator="-")
@@ -586,26 +617,31 @@ class PlottingVWP(QObject):
             ydim_sm_text = (n_SMs+1)*0.04125 #Relative y-dimension of the sm text
             n = int(round((b-t-ydim_sm_text)/2/0.04125)) #Number of white lines between the VWP legend and the sm text
             n_white = self.n_params - n_SMs - n
-            text1 = ' \n'*n_white+'Storm motions\n'; text2 = ' \n'*n_white+' \n'
+
+            # Losse regels i.p.v. 1 multi-line string per kolom (zie toelichting bij
+            # plot_height_list) - de padding (n_white) komt nu direct in de
+            # startpositie terecht in plaats van als lege tekstregels.
+            base_y = self.ytop + 0.1 + n_white*0.041
+            self.general_text_left_text += ['Storm motions']
+            self.general_text_left_pos += [[0.66, base_y]]
             for i in range(n_SMs):
-                text1 += self.sms_display[i]+':'
-                text2 += (SMs[i][0]+u'\u00b0'+SMs[i][1]+' '+units) if isinstance(SMs[i], list) else SMs[i]
-                if i != n_SMs-1:
-                    text1 += '\n'; text2 += '\n'
-            
-            self.general_text_left_text += [text1, text2]
-            self.general_text_left_pos += [[0.66, self.ytop+0.1], [0.77, self.ytop+0.1]]
+                row_y = base_y + (i+1)*0.041
+                value_text = (SMs[i][0]+u'\u00b0'+SMs[i][1]+' '+units) if isinstance(SMs[i], list) else SMs[i]
+                self.general_text_left_text += [self.sms_display[i]+':', value_text]
+                self.general_text_left_pos += [[0.66, row_y], [0.77, row_y]]
             
     def is_SM_defined(self):
         return self.gui.stormmotion[1] != 0.
     
     def plot_vwp_legend(self):
-        text = 'VWP retrieval method: VVP'
+        line1 = 'VWP retrieval method: VVP'
         if not self.gui.vwp_sigmamax_mps is None:
-            text += ',  \u03C3max: '+format(self.scale_velocity(self.gui.vwp_sigmamax_mps), '.1f')+' '+self.pb.productunits['v']
-        text += '\nVVP horizontal data range: '+str(self.gui.vvp_range_limits[0])+'-'+str(self.gui.vvp_range_limits[1])+' km,  vmin: '+format(self.scale_velocity(self.gui.vvp_vmin_mps), '.1f')+' '+self.pb.productunits['v']
-        self.general_text_center_text += [text]
-        self.general_text_center_pos += [[0.5, self.ytop+0.66 - (12-self.n_params)*0.04125]]
+            line1 += ',  \u03C3max: '+format(self.scale_velocity(self.gui.vwp_sigmamax_mps), '.1f')+' '+self.pb.productunits['v']
+        line2 = 'VVP horizontal data range: '+str(self.gui.vvp_range_limits[0])+'-'+str(self.gui.vvp_range_limits[1])+' km,  vmin: '+format(self.scale_velocity(self.gui.vvp_vmin_mps), '.1f')+' '+self.pb.productunits['v']
+        base_y = self.params_table_bottom_y + 0.041  # direct onder de tabel, i.p.v. een geschatte vaste offset
+        self.general_text_center_text += [line1, line2]
+        self.general_text_center_pos += [[0.5, base_y], [0.5, base_y+0.041]]
+        self.vwp_legend_bottom_y = base_y + 0.041
         
     def plot_sfcobs_legend(self):
         relative_pos = ft.aeqd(gv.radarcoords[self.crd.radar], self.sfcobs['station_coords'])
@@ -626,8 +662,9 @@ class PlottingVWP(QObject):
                    (T_string+',  p' if 'T' in self.sfcobs else 'P')+\
                    'osition: ('+format(relative_pos[0], '.1f')+', '+format(relative_pos[1], '.1f')+') km']
                 
-        self.general_text_center_text += ['\n'.join(text)]
-        self.general_text_center_pos += [[0.5, self.ytop+0.765 - (12-self.n_params)*0.04125]]
+        base_y = self.vwp_legend_bottom_y + 0.041
+        self.general_text_center_text += [text[0], text[1]]
+        self.general_text_center_pos += [[0.5, base_y], [0.5, base_y+0.041]]
     
     
     def import_sfc_obs(self):
@@ -750,7 +787,15 @@ class PlottingVWP(QObject):
         self.plot_cbar_legends()
         self.ytop = self.cbarbottom_ypos+0.0725
         self.plot_height_list()
-        self.n_params = 12 # this has to be set in order to prevent errors in other functions.
+        if len(self.V) > 1:
+            # Aantal rijen dat display_parameters() werkelijk tekent:
+            # - shear-blok: altijd 2 rijen (h (km)-rij + BWD-rij, ongeacht aantal lagen - die zijn kolommen)
+            # - vorticiteit-blok: 1 header-rij + evenveel datarijen als er avg_sr_windspeed-lagen zijn
+            # - SRH-blok: 1 titelrij + 1 header-rij + evenveel datarijen als er SRH-lagen zijn
+            n_srh_rows = len(next(iter(self.srh.values()))) if self.srh else 0
+            self.n_params = 2 + (1 + len(self.avg_sr_windspeed)) + (2 + n_srh_rows)
+        else:
+            self.n_params = 12  # geen data om te tellen; oude vaste waarde als veilige terugval
         self.display_parameters()
         self.plot_legend()
         self.plot_sm_text()

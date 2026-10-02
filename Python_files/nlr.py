@@ -1,6 +1,12 @@
 # Copyright (C) 2016-2024 Bram van 't Veen, bramvtveen94@hotmail.com
 # Distributed under the GNU General Public License version 3, see <https://www.gnu.org/licenses/>.
 
+# Installeerbare versie: werkmap meteen op Python_files zetten, vóór alle andere imports (Brams code leest
+# Tables/_data/gifsicle relatief t.o.v. de werkmap). Bij 'python nlr.py' verandert hier niets.
+import sys as _sys, os as _os
+if getattr(_sys, 'frozen', False):
+    _os.chdir(_os.path.join(_os.path.dirname(_sys.executable), 'Python_files'))
+
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
 from PyQt5.QtWidgets import *
@@ -12,6 +18,7 @@ from vispy import gloo
 
 import sys
 import numpy as np
+import traceback
 from numpy import array, float32 # For use of eval
 import os
 # os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1" #I haven't yet seen this doing anything
@@ -35,6 +42,7 @@ from VWP.nlr_vwp import GUI_VWP
 import nlr_background as bg
 import nlr_functions as ft
 import nlr_globalvars as gv
+import nlr_meltinglevels as nlr_ml
 
 
 
@@ -73,9 +81,9 @@ radardata_dirs={}
 radardata_dirs_indices={}
 derivedproducts_dir=gv.derivedproducts_dir_Default
 colortables_dirs_filenames={}
-savefig_filename=gv.programdir+'/'
+savefig_filename=gv.userdir+'/'
 savefig_include_menubar = False
-animation_filename=gv.programdir+'/'
+animation_filename=gv.userdir+'/'
 ani_delay_ref = 'frame'
 ani_delay = 25
 ani_delay_end = 50
@@ -117,6 +125,22 @@ apply_dealiasing = {j:True for j in range(10)}
 dealiasing_setting = gv.velocity_dealiasing_settings[-1]
 dealiasing_max_nyquist_vel = 100/gv.scale_factors_velocities['kts']
 dealiasing_dualprf_n_it = 50
+# MESH-kalibratie-instelling (24 juli, zie select_mesh_calibration_settings/change_mesh_calibration_setting
+# hieronder) - zelfde opslag-/laadpatroon als dealiasing_setting hierboven (module-level default, wordt
+# bij het laden van stored_settings.pkl overschreven via variables_names_raw/exec, zie hoger in dit bestand).
+mesh_calibration_setting = gv.mesh_calibration_settings[0]
+# Handmatige stationskeuze voor het Wyoming-sounding-archief (25 juli, op Eriks verzoek) -
+# terugvaloptie naast de automatische, dichtstbijzijnde-tijd-keuze in nlr_meltinglevels.py
+# (_get_melting_levels_from_wyoming). Zelfde opslag-/laadpatroon als mesh_calibration_setting
+# hierboven. melting_levels_manual_date is een string 'YYYY-MM-DD' (leeg = nog niet ingevuld).
+melting_levels_manual_override = False
+melting_levels_manual_station = list(nlr_ml.WYOMING_STATIONS.keys())[0]
+melting_levels_manual_date = ''
+melting_levels_manual_hour = 0
+# ZPHI-verzwakkingscorrectie aan/uit (28 juli 2026, op Eriks verzoek, zie select_attenuation_correction_settings/
+# change_attenuation_correction_enabled hieronder) - zelfde opslag-/laadpatroon als mesh_calibration_setting/
+# melting_levels_manual_override hierboven. Standaard AAN.
+attenuation_correction_enabled = True
 cartesian_product_res = 1.
 cartesian_product_maxrange = 200.
 scans=[1,2,3,4,5,1,2,3,4,5]
@@ -134,6 +158,9 @@ api_keys = {} # Default values are assigned below when necessary
 pos_markers_latlons = []
 pos_markers_positions = []
 pos_markers_latlons_save = []
+# Optionele tekst-labels bij positiemarkers (7 juli 2026), bv. voor gebruik als "waar bevind ik mij"-markering
+# in de 3D volume-viewer. Losse, parallelle lijst t.o.v. pos_markers_latlons/positions (zelfde index=zelfde marker).
+pos_markers_labels = []
 stormmotion_save = {}
 use_storm_following_view = False
 view_nearest_radar = False
@@ -160,6 +187,39 @@ for p in gv.products_all:
         cmaps_minvalues[p] = -20
 cmaps_maxvalues={j:'' for j in gv.products_all}
 
+# Default parameters for the polarimetric RGB composite (product 'g'). See DataSource_General._calculate_polrgb
+# for how these are used. Exposed in Settings -> PolRGB so they can be tuned without editing code.
+polrgb_params_default = {
+    'Z_MIN':-10.0, 'Z_MAX':60.0,
+    'CC_MIN':70.0, 'CC_MAX':100.0,
+    'ZDR_MIN':0.0, 'ZDR_MAX':3.0,
+    'Z_FADE_LO':-15.0, 'Z_FADE_HI':10.0,
+    'ALPHA_GAMMA':0.6,
+    'CC_FALLBACK':97.0, 'ZDR_FALLBACK':0.5,
+    'Z_GAMMA':2.0,  # >1: lage dBZ blijft donker, hoge dBZ snel rood (ESSL-stijl). 1.0=lineair (origineel).
+    'ESSL_MODE':False,  # True: vaste (instelbare, zie hieronder) ESSL-tabel i.p.v. bovenstaande doorlopende
+    # passthrough-parameters -- die worden dan genegeerd (zie DataSource_General._calculate_polrgb/
+    # _essl_polrgb_channels). Uit = exact het oude, doorlopende gedrag.
+    # ESSL-tabel zelf (16 september 2026, op Eriks verzoek instelbaar gemaakt -- Bram blijkt deze getallen
+    # per publicatie/sessie te varieren, zie de posterbijlage vs. de conferentie-abstract vs. de live ESSL-
+    # viewer). Standaardwaarden zijn EXPLICIET de posterbijlage (Van 't Veen/Groenemeijer/Pucik, ECSS 2025
+    # Utrecht) -- ook wat je terugkrijgt bij 'Reset to defaults', per Eriks expliciete eis.
+    'ESSL_Z_MIN':30.0, 'ESSL_Z_MAX':60.0,
+    'ESSL_CC_MIN':70.0, 'ESSL_CC_MAX':100.0,
+    'ESSL_ZDR_MIN':0.0, 'ESSL_ZDR_MAX':4.0,
+    # 11-punts piecewise-lineaire alpha(Z)-curve, rechtstreeks uit de posterbijlage. Twee losse lijsten
+    # (i.p.v. lijst van paren) zodat elke lijst zich als 1 los "veld" laat behandelen in de UI-tabel
+    # hieronder -- Z moet strikt oplopend blijven (np.interp-eis), zie change_polrgb_essl_alpha.
+    'ESSL_ALPHA_Z':[-10.0, 0.0, 10.0, 15.0, 20.0, 24.0, 28.0, 31.0, 34.0, 37.0, 40.0],
+    'ESSL_ALPHA_V':[0.05, 0.12, 0.22, 0.29, 0.39, 0.48, 0.58, 0.67, 0.77, 0.88, 1.00],
+}
+polrgb_params = dict(polrgb_params_default)
+polrgb_cc_hide_above=None # 2D PolRGB (product 'g'): pixels met CC BOVEN deze grens (%) worden helemaal niet
+#getekend (volledig doorzichtig), ongeacht Z/ZDR (15 augustus 2026, op Eriks verzoek: hetzelfde als het al
+#bestaande 3D-only CC-filter (volume3d_polrgb_cc_max), nu ook voor de gewone 2D-weergave). Los van/
+#onafhankelijk van de CC_MIN/CC_MAX-kleurschaalinstellingen hierboven (die bepalen alleen HOE fel het groene
+#kanaal kleurt, niet OF een pixel getekend wordt). None/leeg = geen grens (oorspronkelijk gedrag).
+
 PP_parameter_values={}
 PP_parameter_values['e']={1:18.5,2:30.,3:40.,4:50.}
 PP_parameter_values['a']={1:0.3,2:0.5,3:1.5,4:3.}
@@ -170,6 +230,115 @@ PP_parameters_panels={j:1 for j in range(10)}
 
 max_radardata_in_memory_GBs=2
 sleeptime_after_plotting=0.01
+
+# Multiplier applied to the cross-section raster's base size (150 distance bins x 80 height bins, see
+# show_cross_section in nlr_plotting.py) -- e.g. 2.0 gives a 300x160 raster. Exposed in Settings ->
+# Miscellaneous (see settings_tabmiscellaneous) so it can be tuned live, without editing code, the same way
+# polrgb_params is. 3.0 (450x240) was chosen as the shipped default: with the current 2000 line-samples per
+# elevation scan (see get_cross_section in nlr_datasourcegeneral.py), that keeps a comfortable fill fraction
+# even for radars with relatively few elevation scans -- going noticeably higher risks approaching the very
+# sparse, speckled-looking raster that caused the original "stray horizontal dashes" bug (see the comment at
+# the top of show_cross_section's raster-binning step for that history).
+cross_section_resolution_factor=3.0
+
+# Interpolation mode for the cross-section's ImageVisual (see nlr_plotting.py __init__, where visuals['cross_
+# section'][i] is created) -- how the raster's individual bins get blended together when stretched up to the
+# on-screen image size. 'bicubic' (the shipped default) looks the smoothest, at the cost of a small risk of a
+# faint light/dark "overshoot" fringe right at hard edges (e.g. the boundary between real data and empty
+# space); 'bilinear' is a safer, slightly less smooth middle ground; 'nearest' shows the raw raster bins as
+# hard-edged squares (vispy's own default, and what this cross-section originally shipped with). Exposed in
+# Settings -> Miscellaneous, same live-tunable pattern as cross_section_resolution_factor above.
+cross_section_interpolation_mode='bicubic'
+
+# Number of evenly-spaced sample points taken along the A/B line for EACH elevation scan (see get_cross_section
+# in nlr_datasourcegeneral.py, called from show_cross_section in nlr_plotting.py). More samples fill a given
+# raster more densely -- relevant mainly if cross_section_resolution_factor above is increased -- at the cost
+# of a bit more time spent recomputing the cross-section. Exposed in Settings -> Miscellaneous, same live-
+# tunable pattern as the other cross_section_* settings.
+cross_section_n_samples=2000
+
+# Extra vertical headroom above the 99th-percentile echo top, as a percentage, when picking the cross-section's
+# vertical scale (see max_height_km in show_cross_section: a flat percentage margin gives a tall storm's
+# overshooting top some empty space above it, rather than the top few rows of the raster). 15 means the scale's
+# top sits 15% higher than that percentile height (with an unconditional floor of 8 km either way -- see
+# show_cross_section). Higher shows more empty sky above the echo (more "zoomed out" vertically); lower zooms
+# in more tightly on the echo itself. Exposed in Settings -> Miscellaneous, same live-tunable pattern.
+cross_section_height_headroom_percent=15.0
+
+# Shipped defaults for the 4 tunable cross-section settings above, kept together in one place so the
+# Settings -> Miscellaneous "Reset to defaults" button (see reset_cross_section_settings) has a single source
+# of truth to reset to, the same "defaults dict alongside the live values" pattern used for polrgb_params.
+cross_section_settings_default = {
+    'cross_section_resolution_factor': 3.0,
+    'cross_section_interpolation_mode': 'bicubic',
+    'cross_section_n_samples': 2000,
+    'cross_section_height_headroom_percent': 15.0,
+}
+
+# Tunable settings for the 3D volume viewer (CTRL+SHIFT+4, show_volume_3d_viewer), same live-tunable
+# pattern as the cross_section_* settings above -- exposed in Settings -> Miscellaneous. Unlike the
+# cross-section (which is a persistent visual within the main app and re-renders immediately on change),
+# the 3D viewer is a standalone window opened fresh each time, so these take effect the NEXT time it's
+# opened rather than on any already-open window.
+volume3d_grid_res_km=0.5 # Horizontal grid resolution (get_volume_grid) -- finer shows more detail but is
+#slower to compute and render; coarser is quicker but blockier (partly offset by volume3d_smoothing_sigma).
+volume3d_z_max_km=15.0 # Maximum height (km) included in the reconstructed grid.
+volume3d_z_res_km=0.25 # Vertical grid resolution (km).
+volume3d_vertical_exaggeration=5.0 # How many times taller the height axis is stretched on screen, since a
+#storm's real height (a few km) would otherwise look almost flat next to its horizontal extent (tens of km).
+volume3d_smoothing_sigma=1.2 # Strength of the horizontal (x/y) smoothing between neighbouring grid columns
+#that turns the raw, blocky ("Minecraft") reconstruction into a smoother cloud shape -- see
+#_smooth_volume_grid_horizontally in nlr_datasourcegeneral.py. 0 disables smoothing entirely (raw/blocky).
+volume3d_tick_interval_km=10.0 # Spacing (km) between the ruler tick marks along the 4 base edges of the
+#reference box.
+volume3d_height_tick_interval_km=2.0 # Spacing (km, REAL height, before the exaggeration above) between the
+#ruler tick marks on the vertical height ruler.
+volume3d_gamma=1.0 # Gamma-correctie op de kleur-intensiteit van de 3D-volumedata (7 juli 2026, op Eriks
+#verzoek voor een visueel "dieper"/contrastrijker beeld). 1.0 = geen aanpassing (oorspronkelijk gedrag).
+#Lager dan 1 maakt middenwaarden feller/contrastrijker, hoger dan 1 dooft alles behalve de hoogste waarden.
+#Puur een visuele kleurintensiteit-vertaalslag; de onderliggende data/waarden blijven ongewijzigd.
+volume3d_pointcloud_stride=3 # Puntenwolk-weergave (8 juli 2026, op Eriks verzoek: "een dichte pixelweergave
+#waar ik doorheen kan kijken", i.p.v. MIP/translucent die last hebben van opstapelende
+#(on)doorzichtigheid). In plaats van een aaneengesloten oppervlak worden alleen losse roosterpunten
+#getekend, met LEGE ruimte ertussen -- dat maakt echt "erdoorheen kijken" mogelijk. Deze waarde bepaalt
+#de dichtheid: 1 = elk roosterpunt (dicht, traag), hoger = every-Nth-punt in elke richting (ijler, sneller).
+volume3d_pointcloud_point_size=4.0 # Grootte (in beeldschermpixels) van elk punt in de puntenwolk-weergave.
+volume3d_min_value=None # 3D-viewer: waarden ONDER deze grens worden helemaal niet getekend (in geen enkele
+#weergavemodus -- MIP, translucent, of puntenwolk), i.p.v. alleen anders gekleurd (8 juli 2026, op Eriks
+#verzoek: "de 3D weergave heeft duidelijk last van de lage dBZ waarden", net als de bestaande 2D-instelling
+#voor kleurtabel-minimum/maximum). None/leeg = geen grens (oorspronkelijk gedrag). Eenheid is dezelfde als
+#het product dat je bekijkt (bv. dBZ voor Z, m/s voor V).
+volume3d_circular_area=False # 3D-viewer: als aangevinkt, wordt het gebied binnen de getekende rechthoek
+#(CTRL+SHIFT+slepen) behandeld als een ELLIPS die precies in die rechthoek past (middelpunt = midden van de
+#rechthoek, halve-assen = halve breedte/hoogte), i.p.v. de volle rechthoek zelf -- data buiten die ellips
+#wordt weggemaskeerd (8 juli 2026, op Eriks verzoek: "zou dat ook een cirkel kunnen zijn"). Zowel de 2D-
+#voorvertoning (de getekende rechthoek op de kaart zelf) als de 3D-data volgen deze instelling, zodat je
+#vooraf al ziet welk gebied je krijgt. Het kader/de assen/tick-streepjes in 3D blijven altijd de volle,
+#rechthoekige omvang tonen -- alleen de gekleurde data zelf wordt rond weggesneden.
+volume3d_polrgb_cc_max=None # PolRGB-specifiek (15 augustus 2026, op Eriks verzoek: "dat groen van de regen
+#wil ik kwijt" -- gewone regen heeft een hoge CC, ongeacht Z, dus volume3d_min_value (dat op Z filtert) helpt
+#daar niet tegen): voxels met CC BOVEN deze grens (%) worden helemaal niet getekend, in GEEN enkele
+#PolRGB-3D-weergavemodus (RGB-MIP of puntenwolk) -- ongeacht hun Z/ZDR. Omdat hagel per definitie een lagere
+#CC heeft dan gewone regen, blijft het hagelgebied hierdoor onaangeroerd terwijl "zeker gewone regen"
+#verdwijnt. Los van/onafhankelijk van volume3d_min_value hierboven (dat blijft op Z filteren, voor élk
+#product incl. PolRGB). None/leeg = geen grens (oorspronkelijk gedrag). Alleen van toepassing op PolRGB
+#('g'); voor elk ander product zonder effect.
+
+volume3d_settings_default = {
+    'volume3d_grid_res_km': 0.5,
+    'volume3d_z_max_km': 15.0,
+    'volume3d_z_res_km': 0.25,
+    'volume3d_vertical_exaggeration': 5.0,
+    'volume3d_smoothing_sigma': 1.2,
+    'volume3d_tick_interval_km': 10.0,
+    'volume3d_height_tick_interval_km': 2.0,
+    'volume3d_gamma': 1.0,
+    'volume3d_pointcloud_stride': 3,
+    'volume3d_pointcloud_point_size': 4.0,
+    'volume3d_min_value': None,
+    'volume3d_circular_area': False,
+    'volume3d_polrgb_cc_max': None,
+}
 """All variables that represent the state of a QCheckbox should take on values 0 or 2, where a state of 2 means checked! 
 """
 use_scissor=2
@@ -182,7 +351,16 @@ panelbdscolor=np.array([75,75,75])
 bgmapcolor=np.array([0,0,0])
 mapvisibility=False
 mapcolorfilter=(1.0,1.0,1.0,0.975) #Color display can differ per OS
+radardata_colorfilter=(1.0,1.0,1.0,1.0) #Color filter applied to the radar data itself (not the basemap). The
+#alpha component lets the basemap (streets/place names) show through the radar data, e.g. for product 'g' or
+#any other product, uniformly regardless of echo intensity.
 maptiles_update_time = 0.1 #In seconds
+basemap_source = 'Local' #'Local' (the bundled, pre-rendered satellite-like tiles) or 'MapTiler' (live, scrollable
+#vector-rendered-to-raster basemap, requires a free MapTiler API key, see Settings -> Download -> API keys)
+basemap_source_maptiler_style = 'dataviz-v4-dark' #MapTiler map ID/style, see https://cloud.maptiler.com/maps/
+basemap_source_maptiler_provider = 'esri' #Which live tile provider to use when basemap_source == 'MapTiler':
+#'esri' (Esri Dark Gray Canvas, publicly accessible, no API key needed) or 'stadia' (Stadia Maps Alidade
+#Smooth Dark, requires a free API key, see Settings -> Download -> API keys)
 radar_markersize=7.5
 radar_colors={'Default':np.array([0,255,255]),'Selected':np.array([255,0,0]),'Automatic download':np.array([255,255,0]),'Automatic download + selected':np.array([255,128,0])}
 lines_names=['countries','provinces','rivers','grid','heightrings']
@@ -203,8 +381,8 @@ reset_volume_attributes = True #Gets set to False in nlr_datasourcegeneral.py
 
 
 
-variables_names_raw=['variables_resettodefault_version','reset_volume_attributes','radar_basedir','radarsources_dirs','radardirs_additional','radardata_dirs','radardata_dirs_indices','derivedproducts_dir','derivedproducts_filename_version','radardata_product_versions','selected_product_versions_ordered','movefiles_parameters','radar','scan_selection_mode','date','time','current_case_list_name','current_case','cases_offset_minutes','cases_looping_speed','cases_animation_window','cases_use_case_zoom','cases_loop_subset','cases_loop_subset_ncases','animation_duration','animation_speed_minpsec','animation_hold_lastframe','desired_timestep_minutes','max_timestep_minutes','maxspeed_minpsec','dataset','products','productunfiltered','polarization','apply_dealiasing','dealiasing_setting','dealiasing_max_nyquist_vel','dealiasing_dualprf_n_it','cartesian_product_res','cartesian_product_maxrange','scans','plot_mode','savefig_filename','savefig_include_menubar','animation_filename','ani_delay_ref','ani_delay','ani_delay_end','ani_sort_files','ani_group_datasets','ani_quality','networktimeout','minimum_downloadspeed','api_keys','stormmotion_save','pos_markers_latlons','pos_markers_latlons_save','use_storm_following_view','view_nearest_radar','radar_bands_view_nearest_radar','data_selected_startazimuth','show_vwp','include_sfcobs_vwp','vwp_manual_sfcobs','vwp_manual_axlim','vvp_range_limits','vvp_height_limits','vvp_vmin_mps','vwp_sigmamax_mps','vwp_shear_layers','vwp_vorticity_layers','vwp_srh_layers','vwp_sm_display','base_url_obs','cmaps_minvalues','cmaps_maxvalues','PP_parameter_values','PP_parameters_panels','max_radardata_in_memory_GBs','sleeptime_after_plotting','use_scissor','colortables_dirs_filenames','dimensions_main','fontsizes_main','bgcolor','panelbdscolor','bgmapcolor','mapvisibility','mapcolorfilter','maptiles_update_time','radar_markersize','radar_colors','lines_colors','lines_show','lines_width','lines_antialias','ghtext_show','grid_showtext','show_heightrings_derivedproducts','showgridheightrings_panzoom','showgridheightrings_panzoom_time','gridheightrings_fontcolor','gridheightrings_fontsize','grid_showtext']
-variables_names_withclassreference=['variables_resettodefault_version','self.reset_volume_attributes','self.radar_basedir','self.radarsources_dirs','self.radardirs_additional','self.radardata_dirs','self.radardata_dirs_indices','self.derivedproducts_dir','self.derivedproducts_filename_version','self.radardata_product_versions','self.selected_product_versions_ordered','self.movefiles_parameters','self.crd.radar','self.crd.scan_selection_mode','self.crd.date','self.crd.time','self.current_case_list_name','self.current_case','self.cases_offset_minutes','self.cases_looping_speed','self.cases_animation_window','self.cases_use_case_zoom','self.cases_loop_subset','self.cases_loop_subset_ncases','self.animation_duration','self.animation_speed_minpsec','self.animation_hold_lastframe','self.desired_timestep_minutes','self.max_timestep_minutes','self.maxspeed_minpsec','self.crd.dataset','self.crd.products','self.crd.productunfiltered','self.crd.polarization','self.crd.apply_dealiasing','self.dealiasing_setting','self.dealiasing_max_nyquist_vel','self.dealiasing_dualprf_n_it','self.cartesian_product_res','self.cartesian_product_maxrange','self.crd.scans','self.crd.plot_mode','self.savefig_filename','self.savefig_include_menubar','self.animation_filename','self.ani_delay_ref','self.ani_delay','self.ani_delay_end','self.ani_sort_files','self.ani_group_datasets','self.ani_quality','self.networktimeout','self.minimum_downloadspeed','self.api_keys','self.stormmotion_save','self.pos_markers_latlons','self.pos_markers_latlons_save','self.use_storm_following_view','self.view_nearest_radar','self.radar_bands_view_nearest_radar','self.data_selected_startazimuth','self.show_vwp','self.include_sfcobs_vwp','self.vwp_manual_sfcobs','self.vwp_manual_axlim','self.vvp_range_limits','self.vvp_height_limits','self.vvp_vmin_mps','self.vwp_sigmamax_mps','self.vwp_shear_layers','self.vwp_vorticity_layers','self.vwp_srh_layers','self.vwp_sm_display','self.base_url_obs','self.cmaps_minvalues','self.cmaps_maxvalues','self.PP_parameter_values','self.PP_parameters_panels','self.max_radardata_in_memory_GBs','self.sleeptime_after_plotting','self.use_scissor','self.colortables_dirs_filenames','self.dimensions_main','self.fontsizes_main','self.bgcolor','self.panelbdscolor','self.bgmapcolor','self.mapvisibility','self.mapcolorfilter','self.maptiles_update_time','self.radar_markersize','self.radar_colors','self.lines_colors','self.lines_show','self.lines_width','self.lines_antialias','self.ghtext_show','self.grid_showtext','self.show_heightrings_derivedproducts','self.showgridheightrings_panzoom','self.showgridheightrings_panzoom_time','self.gridheightrings_fontcolor','self.gridheightrings_fontsize','self.grid_showtext']
+variables_names_raw=['variables_resettodefault_version','reset_volume_attributes','radar_basedir','radarsources_dirs','radardirs_additional','radardata_dirs','radardata_dirs_indices','derivedproducts_dir','derivedproducts_filename_version','radardata_product_versions','selected_product_versions_ordered','movefiles_parameters','radar','scan_selection_mode','date','time','current_case_list_name','current_case','cases_offset_minutes','cases_looping_speed','cases_animation_window','cases_use_case_zoom','cases_loop_subset','cases_loop_subset_ncases','animation_duration','animation_speed_minpsec','animation_hold_lastframe','desired_timestep_minutes','max_timestep_minutes','maxspeed_minpsec','dataset','products','productunfiltered','polarization','apply_dealiasing','dealiasing_setting','dealiasing_max_nyquist_vel','dealiasing_dualprf_n_it','mesh_calibration_setting','melting_levels_manual_override','melting_levels_manual_station','melting_levels_manual_date','melting_levels_manual_hour','attenuation_correction_enabled','cartesian_product_res','cartesian_product_maxrange','scans','plot_mode','savefig_filename','savefig_include_menubar','animation_filename','ani_delay_ref','ani_delay','ani_delay_end','ani_sort_files','ani_group_datasets','ani_quality','networktimeout','minimum_downloadspeed','api_keys','stormmotion_save','pos_markers_latlons','pos_markers_labels','pos_markers_latlons_save','use_storm_following_view','view_nearest_radar','radar_bands_view_nearest_radar','data_selected_startazimuth','show_vwp','include_sfcobs_vwp','vwp_manual_sfcobs','vwp_manual_axlim','vvp_range_limits','vvp_height_limits','vvp_vmin_mps','vwp_sigmamax_mps','vwp_shear_layers','vwp_vorticity_layers','vwp_srh_layers','vwp_sm_display','base_url_obs','cmaps_minvalues','cmaps_maxvalues','polrgb_params','polrgb_cc_hide_above','PP_parameter_values','PP_parameters_panels','max_radardata_in_memory_GBs','sleeptime_after_plotting','cross_section_resolution_factor','cross_section_interpolation_mode','cross_section_n_samples','cross_section_height_headroom_percent','volume3d_grid_res_km','volume3d_z_max_km','volume3d_z_res_km','volume3d_vertical_exaggeration','volume3d_smoothing_sigma','volume3d_tick_interval_km','volume3d_height_tick_interval_km','volume3d_gamma','volume3d_pointcloud_stride','volume3d_pointcloud_point_size','volume3d_min_value','volume3d_circular_area','volume3d_polrgb_cc_max','use_scissor','colortables_dirs_filenames','dimensions_main','fontsizes_main','bgcolor','panelbdscolor','bgmapcolor','mapvisibility','mapcolorfilter','radardata_colorfilter','maptiles_update_time','basemap_source','basemap_source_maptiler_style','basemap_source_maptiler_provider','radar_markersize','radar_colors','lines_colors','lines_show','lines_width','lines_antialias','ghtext_show','grid_showtext','show_heightrings_derivedproducts','showgridheightrings_panzoom','showgridheightrings_panzoom_time','gridheightrings_fontcolor','gridheightrings_fontsize','grid_showtext']
+variables_names_withclassreference=['variables_resettodefault_version','self.reset_volume_attributes','self.radar_basedir','self.radarsources_dirs','self.radardirs_additional','self.radardata_dirs','self.radardata_dirs_indices','self.derivedproducts_dir','self.derivedproducts_filename_version','self.radardata_product_versions','self.selected_product_versions_ordered','self.movefiles_parameters','self.crd.radar','self.crd.scan_selection_mode','self.crd.date','self.crd.time','self.current_case_list_name','self.current_case','self.cases_offset_minutes','self.cases_looping_speed','self.cases_animation_window','self.cases_use_case_zoom','self.cases_loop_subset','self.cases_loop_subset_ncases','self.animation_duration','self.animation_speed_minpsec','self.animation_hold_lastframe','self.desired_timestep_minutes','self.max_timestep_minutes','self.maxspeed_minpsec','self.crd.dataset','self.crd.products','self.crd.productunfiltered','self.crd.polarization','self.crd.apply_dealiasing','self.dealiasing_setting','self.dealiasing_max_nyquist_vel','self.dealiasing_dualprf_n_it','self.mesh_calibration_setting','self.melting_levels_manual_override','self.melting_levels_manual_station','self.melting_levels_manual_date','self.melting_levels_manual_hour','self.attenuation_correction_enabled','self.cartesian_product_res','self.cartesian_product_maxrange','self.crd.scans','self.crd.plot_mode','self.savefig_filename','self.savefig_include_menubar','self.animation_filename','self.ani_delay_ref','self.ani_delay','self.ani_delay_end','self.ani_sort_files','self.ani_group_datasets','self.ani_quality','self.networktimeout','self.minimum_downloadspeed','self.api_keys','self.stormmotion_save','self.pos_markers_latlons','self.pos_markers_labels','self.pos_markers_latlons_save','self.use_storm_following_view','self.view_nearest_radar','self.radar_bands_view_nearest_radar','self.data_selected_startazimuth','self.show_vwp','self.include_sfcobs_vwp','self.vwp_manual_sfcobs','self.vwp_manual_axlim','self.vvp_range_limits','self.vvp_height_limits','self.vvp_vmin_mps','self.vwp_sigmamax_mps','self.vwp_shear_layers','self.vwp_vorticity_layers','self.vwp_srh_layers','self.vwp_sm_display','self.base_url_obs','self.cmaps_minvalues','self.cmaps_maxvalues','self.polrgb_params','self.polrgb_cc_hide_above','self.PP_parameter_values','self.PP_parameters_panels','self.max_radardata_in_memory_GBs','self.sleeptime_after_plotting','self.cross_section_resolution_factor','self.cross_section_interpolation_mode','self.cross_section_n_samples','self.cross_section_height_headroom_percent','self.volume3d_grid_res_km','self.volume3d_z_max_km','self.volume3d_z_res_km','self.volume3d_vertical_exaggeration','self.volume3d_smoothing_sigma','self.volume3d_tick_interval_km','self.volume3d_height_tick_interval_km','self.volume3d_gamma','self.volume3d_pointcloud_stride','self.volume3d_pointcloud_point_size','self.volume3d_min_value','self.volume3d_circular_area','self.volume3d_polrgb_cc_max','self.use_scissor','self.colortables_dirs_filenames','self.dimensions_main','self.fontsizes_main','self.bgcolor','self.panelbdscolor','self.bgmapcolor','self.mapvisibility','self.mapcolorfilter','self.radardata_colorfilter','self.maptiles_update_time','self.basemap_source','self.basemap_source_maptiler_style','self.basemap_source_maptiler_provider','self.radar_markersize','self.radar_colors','self.lines_colors','self.lines_show','self.lines_width','self.lines_antialias','self.ghtext_show','self.grid_showtext','self.show_heightrings_derivedproducts','self.showgridheightrings_panzoom','self.showgridheightrings_panzoom_time','self.gridheightrings_fontcolor','self.gridheightrings_fontsize','self.grid_showtext']
 
 #Variables that are reset to their default for the next update. Needs to be updated before every new update, 
 #and 'variables_resettodefault_version' should always be included!!!!! reset_volume_attributes maybe too.
@@ -213,10 +391,15 @@ variables_resettodefault_version = 10 #Version for variables_resettodefault_foru
 
 try:
     #pickle.load appears to be incompatible with changes in pyqt version, i.e. when the file is saved while using pyqt5, then it also needs pyqt5 for loading the file.
-    settings_filename=opa(os.path.join(gv.programdir+'/Generated_files','stored_settings.pkl'))
+    settings_filename=opa(os.path.join(gv.userdir+'/Generated_files','stored_settings.pkl'))
     if os.path.exists(settings_filename):
         with open(settings_filename,'rb') as f:
             settings=pickle.load(f)
+    elif os.path.exists(opa(gv.programdir+'/Input_files/shared_default_settings.txt')):
+        # Gedeelde versie, eerste start: Eriks weergave-instellingen (layout, lijnen, kleuren, PolRGB, 3D, VWP...)
+        # als startwaarden, zonder keys/paden. Tekstformaat i.p.v. pickle, zodat er geen key in mee kan liften.
+        with open(opa(gv.programdir+'/Input_files/shared_default_settings.txt'), encoding='utf-8') as f:
+            settings = eval(f.read(), {'__builtins__': {}, 'A': lambda l, dt: np.array(l, dtype=dt)})
     else: settings={}
     
     # Deal with some variable name changings
@@ -236,6 +419,34 @@ try:
                 exec(name+"=settings[name]")
         except Exception:
             pass
+
+    # Fill in any keys missing from an older stored settings file (e.g. after adding a new tunable parameter)
+    # with their current defaults, rather than risking a KeyError later when that key is looked up.
+    for key, default_value in polrgb_params_default.items():
+        if key not in polrgb_params:
+            polrgb_params[key] = default_value
+
+    # BUGFIX (23 juli 2026, na Eriks crash bij Settings -> Map): show_heightrings_derivedproducts is net als
+    # polrgb_params hierboven een dict die per product wordt opgeslagen/geladen (zie variables_names_raw) - een
+    # ouder stored_settings.pkl (van voor MESH's toevoeging, 22 juli) mist dus de sleutel 'o', wat een KeyError
+    # gaf in settings_tabmap zodra die dict werd doorgelopen. Zelfde oplossing als bij polrgb_params: ontbrekende
+    # sleutels aanvullen met de actuele standaardwaarde (dezelfde formule als de oorspronkelijke definitie
+    # hierboven), in plaats van te vertrouwen op wat er toevallig in het oude, opgeslagen bestand stond.
+    for _product in gv.plain_products:
+        if _product not in show_heightrings_derivedproducts:
+            show_heightrings_derivedproducts[_product] = not _product in gv.plain_products_show_max_elevations
+
+    # BUGFIX (27 juli 2026, na Eriks crash bij opstarten): een opgeslagen 'products'-lijst (welk
+    # product elk paneel toont, zie variables_names_raw) kan een productcode bevatten die inmiddels
+    # niet meer bestaat - bv. 'hd' (HDR), dat deze sessie weer is verwijderd nadat Erik het al had
+    # bekeken/actief had staan in een paneel. Zonder deze check crasht de opstart met een KeyError
+    # zodra nlr_plotting.py voor zo'n paneel een kleurenschaal probeert op te bouwen (self.cm1['hd']
+    # bestaat dan niet meer). Zelfde soort vangnet als hierboven voor show_heightrings_derivedproducts:
+    # een ongeldige/verwijderde code wordt stilzwijgend vervangen door 'z' (Reflectivity), i.p.v. te
+    # crashen op een productcode die niet meer geregistreerd is.
+    for _panel_idx in range(len(products)):
+        if products[_panel_idx] not in gv.products_all:
+            products[_panel_idx] = 'z'
 except Exception:
     pass
 
@@ -259,6 +470,39 @@ for source in gv.radars:
                 radardata_dirs[radar_dataset] = radarsources_dirs[source_dataset]
                 radardata_dirs_indices[radar_dataset] = 0
                 radardata_product_versions[radar_dataset] = None
+
+# Jabbeke (KMI, via MeteoGate) is the only radar for which 2 separate DBZH volumes are published per
+# timestep -- a long-range one (starts at elevation 0.3 degrees, ~299 km) and a short-range one (starts at
+# 0.5 degrees, ~150 km); see Source_MeteoGate in nlr_currentdata.py for the full explanation. Rather than
+# using a single directory plus a Settings toggle to pick which one gets downloaded/displayed (an earlier
+# approach that turned out to be prone to timing/race issues -- the displayed range could end up out of
+# sync with the setting after quick navigation), 'Jabbeke_Z' is given TWO directory strings here, separated
+# by ';' -- the existing multi-directory mechanism that NLradar already has for e.g. user-added alternative
+# data locations (see dirstring_to_dirlist in nlr_background.py, and self.gui.radardata_dirs_indices, which
+# tracks which of the 2 is currently selected for display). Both directories get downloaded into
+# unconditionally (see Source_MeteoGate.get_urls_and_savenames_downloadfile in nlr_currentdata.py, which
+# saves the long-range file under the normal 'Jabbeke_Z' directory and the short-range file -- when
+# available -- under 'Jabbeke_Z_short'), and the EXISTING, already wired up CTRL+D shortcut
+# (self.crd.change_dir_index) switches which of the 2 is displayed -- exactly the same mechanism already
+# used for any other radar/dataset with multiple configured directories, so no new settings, shortcuts, or
+# per-read range comparisons are needed at all.
+#
+# 'radardata_dirs' was already loaded from stored_settings.pkl (see the try-block near the top of this
+# file) by the time we get here, so 'Jabbeke_Z' may already hold a value from a PREVIOUS session/version --
+# possibly one that differs from the pure, freshly-computed default above (e.g. because an earlier version
+# of this feature, or a manual edit, set something slightly different). Comparing against the default with
+# '==' would then incorrectly conclude "the user customized this, leave it alone" and skip adding the short
+# directory -- which is exactly what happened in practice. So instead, just check whether the short
+# directory is ALREADY one of the configured directory strings (via dirstring_to_dirlist, the same parser
+# used everywhere else for this), and append it if it's missing -- regardless of what else is in there. This
+# still never discards or overwrites anything the user (or an earlier version of this feature) already
+# configured; it only ever adds the short directory if it's not already present.
+if 'Jabbeke_Z' in radardata_dirs:
+    _jabbeke_z_short_dirstring = radarsources_dirs.get('KMI_Z', gv.radarsources_dirs_Default.get('KMI_Z', ''))+'_short'
+    _jabbeke_z_existing_dirlist = bg.dirstring_to_dirlist(radardata_dirs['Jabbeke_Z'])
+    if _jabbeke_z_short_dirstring not in _jabbeke_z_existing_dirlist:
+        radardata_dirs['Jabbeke_Z'] = radardata_dirs['Jabbeke_Z'].rstrip().rstrip(';')+'; '+_jabbeke_z_short_dirstring
+    del _jabbeke_z_short_dirstring, _jabbeke_z_existing_dirlist
                   
                         
 for i in gv.radars_all:                              
@@ -283,6 +527,15 @@ for datasource in gv.api_keys:
     for key in gv.api_keys[datasource]:
         if not key in api_keys[datasource]:
             api_keys[datasource][key] = ''
+# Installeerbare (gedeelde) versie: geen achtergrondkaarten die een API-key vereisen (MapTiler/Stadia).
+# Alleen de meegeleverde lokale kaart en de key-loze Esri-kaarten blijven beschikbaar.
+if gv.frozen:
+    api_keys.pop('MapTiler', None)
+    if basemap_source_maptiler_provider == 'stadia':
+        basemap_source_maptiler_provider = 'esri'
+# Gedeelde versie (installer/GitHub, 1 okt 2026): ALLEEN de meegeleverde lokale kaart. Live kaarten (Esri, Stadia,
+# MapTiler) zijn verwijderd: Esri's voorwaarden vereisen een abonnement/Esri-software, Stadia/MapTiler een key.
+basemap_source = 'Local'
             
             
 for j in gv.colortables_dirs_filenames_Default:
@@ -300,7 +553,7 @@ for j in gv.products_all:
 
 
 
-cases_lists_filename = opa(os.path.join(gv.programdir+'/Generated_files','cases_lists.pkl'))
+cases_lists_filename = opa(os.path.join(gv.userdir+'/Generated_files','cases_lists.pkl'))
 if os.path.exists(cases_lists_filename):
     with open(cases_lists_filename, 'rb') as f:
         cases_lists=pickle.load(f)
@@ -388,6 +641,12 @@ class GUI(QWidget):
         self.dealiasing_setting = dealiasing_setting
         self.dealiasing_max_nyquist_vel = dealiasing_max_nyquist_vel
         self.dealiasing_dualprf_n_it = dealiasing_dualprf_n_it
+        self.mesh_calibration_setting = mesh_calibration_setting
+        self.melting_levels_manual_override = melting_levels_manual_override
+        self.melting_levels_manual_station = melting_levels_manual_station
+        self.melting_levels_manual_date = melting_levels_manual_date
+        self.melting_levels_manual_hour = melting_levels_manual_hour
+        self.attenuation_correction_enabled = attenuation_correction_enabled
         self.cartesian_product_res = cartesian_product_res
         self.cartesian_product_maxrange = cartesian_product_maxrange
         self.networktimeout=networktimeout
@@ -395,6 +654,7 @@ class GUI(QWidget):
         self.api_keys = api_keys
         self.pos_markers_latlons = pos_markers_latlons
         self.pos_markers_latlons_save = pos_markers_latlons_save
+        self.pos_markers_labels = pos_markers_labels
         self.stormmotion_save = stormmotion_save
         self.stormmotion = np.array([0,0], dtype='float32') #Don't use the saved storm motion vector, always start with no storm motion.
         self.use_storm_following_view = False
@@ -416,10 +676,29 @@ class GUI(QWidget):
         self.base_url_obs = base_url_obs
         self.cmaps_minvalues=cmaps_minvalues
         self.cmaps_maxvalues=cmaps_maxvalues
+        self.polrgb_params=polrgb_params
+        self.polrgb_cc_hide_above=polrgb_cc_hide_above
         self.PP_parameter_values=PP_parameter_values
         self.PP_parameters_panels=PP_parameters_panels
         self.max_radardata_in_memory_GBs=max_radardata_in_memory_GBs
         self.sleeptime_after_plotting=sleeptime_after_plotting
+        self.cross_section_resolution_factor=cross_section_resolution_factor
+        self.cross_section_interpolation_mode=cross_section_interpolation_mode
+        self.cross_section_n_samples=cross_section_n_samples
+        self.cross_section_height_headroom_percent=cross_section_height_headroom_percent
+        self.volume3d_grid_res_km=volume3d_grid_res_km
+        self.volume3d_z_max_km=volume3d_z_max_km
+        self.volume3d_z_res_km=volume3d_z_res_km
+        self.volume3d_vertical_exaggeration=volume3d_vertical_exaggeration
+        self.volume3d_smoothing_sigma=volume3d_smoothing_sigma
+        self.volume3d_tick_interval_km=volume3d_tick_interval_km
+        self.volume3d_height_tick_interval_km=volume3d_height_tick_interval_km
+        self.volume3d_gamma=volume3d_gamma
+        self.volume3d_pointcloud_stride=volume3d_pointcloud_stride
+        self.volume3d_pointcloud_point_size=volume3d_pointcloud_point_size
+        self.volume3d_min_value=volume3d_min_value
+        self.volume3d_circular_area=volume3d_circular_area
+        self.volume3d_polrgb_cc_max=volume3d_polrgb_cc_max
         self.use_scissor=use_scissor
         self.colortables_dirs_filenames=colortables_dirs_filenames
         self.dimensions_main=dimensions_main
@@ -429,7 +708,11 @@ class GUI(QWidget):
         self.bgmapcolor=bgmapcolor
         self.mapvisibility=mapvisibility
         self.mapcolorfilter=mapcolorfilter
+        self.radardata_colorfilter=radardata_colorfilter
         self.maptiles_update_time = maptiles_update_time
+        self.basemap_source = basemap_source
+        self.basemap_source_maptiler_style = basemap_source_maptiler_style
+        self.basemap_source_maptiler_provider = basemap_source_maptiler_provider
         self.radar_markersize=radar_markersize
         self.radar_colors=radar_colors
         self.lines_names=lines_names
@@ -568,7 +851,11 @@ class GUI(QWidget):
         hbox.addWidget(self.desired_timestep_minutesw,4)
         hbox.addWidget(self.max_timestep_minutesw,4)
         hbox.addWidget(self.maxspeed_minpsecw,4)
-        hbox.addWidget(self.textbar,75)
+        # De 0C/-20C-melting-level-balk is verwijderd (22 juli, op Eriks verzoek): die toonde alleen 1
+        # vast punt (de radarlocatie zelf), terwijl de HCLASS-tooltip inmiddels al de nauwkeurigere
+        # per-pixel-roosterwaarde toont (zie set_hclass_legend/update_data_readout in nlr_plotting.py).
+        # textbar krijgt de vrijgekomen ruimte terug (63+18=81, was voor de balk werd toegevoegd 75).
+        hbox.addWidget(self.textbar,81)
         hbox.addWidget(self.hodow,5)
         hbox.addWidget(self.casesw,5)
         hbox.addStretch(12)
@@ -638,14 +925,59 @@ class GUI(QWidget):
         QShortcut(QKeySequence('SHIFT+HOME'),self,lambda: self.pb.reset_panel_view(False))
         QShortcut(QKeySequence('CTRL+HOME'),self,lambda: self.pb.reset_panel_view(True, False))
         QShortcut(QKeySequence('F'),self,self.change_use_storm_following_view)
+        QShortcut(QKeySequence('F2'),self,lambda: self.pb.toggle_cross_sections_for_ab_line())
+        QShortcut(QKeySequence('CTRL+SHIFT+4'),self,self.show_volume_3d_viewer)
+        QShortcut(QKeySequence('Delete'),self,lambda: self.pb.clear_ab_line())
+        QShortcut(QKeySequence('CTRL+SHIFT+Delete'),self,lambda: self.pb.clear_volume3d_rect())
         
-        for product in gv.products_all:        
-            QShortcut(QKeySequence(product.upper()),self,lambda product=product: self.crd.process_keyboardinput(0,0,0,product,None,False))
+        for product in gv.products_all:
+            # Echo base ('eb', 24 juli) bewust overslaan hier: 'e' EN 'b' zijn beide al zelfstandige
+            # 1-letter-sneltoetsen (ETH resp. POSH), dus een automatische 'E,B'-tweestapsreeks zou daarmee
+            # kunnen interfereren. 'eb' is daarom alleen bereikbaar via de losse ALT+E-QShortcut verderop.
+            if product in gv.products_alt_only_shortcuts:
+                continue
+            # BUGFIX (24 juli, na Eriks melding "dat kan dus niet, dan krijg ik CMH"): voor een
+            # productcode van meer dan 1 teken (zoals 'uv', 'uh') gaf QKeySequence(product.upper())
+            # -- dus bv. QKeySequence('UH') zonder komma -- GEEN geldige twee-staps-toetsreeks. Qt
+            # parseert 'UH' als EEN ongeldige toets (lege/nooit-matchende QKeySequence), niet als
+            # "eerst U, dan H". Empirisch geverifieerd (PyQt5, QT_QPA_PLATFORM=offscreen):
+            # QKeySequence('UH').toString() geeft '' (0 stappen die ooit matchen), terwijl
+            # QKeySequence('U,H').toString() echt 'U, H' geeft (2 stappen, werkt wel). Dit trof dus
+            # OOK al 'uv' (unfiltered velocity) - die sneltoets deed vermoedelijk ook al nooit iets.
+            # Fix: voor elk teken in de productcode een aparte, komma-gescheiden stap opbouwen.
+            key_sequence = ','.join(list(product.upper()))
+            QShortcut(QKeySequence(key_sequence),self,lambda product=product: self.crd.process_keyboardinput(0,0,0,product,None,False))
         
         QShortcut(QKeySequence('SHIFT+U'),self,self.crd.change_productunfiltered)
         QShortcut(QKeySequence('SHIFT+P'),self,self.crd.change_polarization)
         QShortcut(QKeySequence('SHIFT+V'),self,self.crd.change_apply_dealiasing)
         QShortcut(QKeySequence('Alt+V'),self,self.select_dealiasing_settings)
+        # ALT+M (24 juli, op Eriks verzoek na het zien van iRadar's MESH-kalibratie-dropdown): M staat
+        # hier vrij als ALT-combinatie (ALT+A/F1/N/P/V zijn al bezet, zie hierboven; M zelf is als LOSSE
+        # letter al MESH's eigen product-sneltoets, maar dat is een andere combinatie dan ALT+M).
+        QShortcut(QKeySequence('Alt+M'),self,self.select_mesh_calibration_settings)
+        # ALT+W (25 juli, op Eriks verzoek): handmatige terugvaloptie voor de 0C/-20C-temperatuurbron
+        # bij het Wyoming-sounding-archief (oude cases), naast de automatische stationskeuze.
+        QShortcut(QKeySequence('Alt+W'),self,self.select_melting_levels_override)
+        QShortcut(QKeySequence('Alt+C'),self,self.select_attenuation_correction_settings)
+        # ALT+E (24 juli 2026, op Eriks verzoek - "Echo top is nu E, kun je ALT+E niet ook doen?" voor
+        # Echo base): in tegenstelling tot ALT+V/ALT+M hierboven (die een INSTELLINGEN-dialoog openen voor
+        # het huidige product) selecteert dit een heel ANDER, apart product ('eb') - Erik gaf aan niet te
+        # geven om die inconsistentie met het bestaande ALT-patroon, simpelweg omdat er geen losse letters
+        # meer over zijn (zie products_alt_only_shortcuts in nlr_globalvars.py).
+        QShortcut(QKeySequence('Alt+E'),self,lambda: self.crd.process_keyboardinput(0,0,0,'eb',None,False))
+        # ALT+L (24 juli 2026, op Eriks verzoek voor VILD = VIL/ETH): zelfde soort uitzondering als ALT+E
+        # hierboven - selecteert een heel ANDER product ('vd'), i.p.v. een instellingen-dialoog voor het
+        # huidige product. Erik gaf al eerder aan niet te geven om die inconsistentie met het ALT-patroon.
+        QShortcut(QKeySequence('Alt+L'),self,lambda: self.crd.process_keyboardinput(0,0,0,'vd',None,False))
+        # ALT+S (27 juli 2026, SHI): zelfde soort uitzondering als ALT+E/ALT+L hierboven - 'S' kan niet
+        # via de automatische letter-sneltoetsenlus (product 'si' staat daarom in
+        # gv.products_alt_only_shortcuts), omdat 'S' zelf al een losse 1-letter-sneltoets is (SRV) en
+        # dat exact de Qt-shortcut-ambiguiteit zou geven die ook 'eb' (E+B) al uitsloot van die lus.
+        QShortcut(QKeySequence('Alt+S'),self,lambda: self.crd.process_keyboardinput(0,0,0,'si',None,False))
+        # ALT+Z (27 juli 2026, ZDR-kolomdiepte): zelfde soort uitzondering - 'Z' is al een losse
+        # 1-letter-sneltoets (Reflectivity), dus 'Z,C' zou dezelfde Qt-shortcut-ambiguiteit geven.
+        QShortcut(QKeySequence('Alt+Z'),self,lambda: self.crd.process_keyboardinput(0,0,0,'zc',None,False))
         QShortcut(QKeySequence('SHIFT+Q'),self,self.change_plainproducts_parameters)
         QShortcut(QKeySequence('SHIFT+I'),self,self.pb.change_interpolation)
         QShortcut(QKeySequence('SHIFT+Z'),self,self.pb.change_radarimage_visibility)
@@ -905,7 +1237,217 @@ class GUI(QWidget):
             self.dealiasing_max_nyquist_vel = number/self.pb.scale_factors['v']
         else:
             self.dealiasing_max_nyquist_velw.setText(str(ft.rifdot0(ft.r1dec(self.dealiasing_max_nyquist_vel*self.pb.scale_factors['v']))))
-                    
+
+    def select_mesh_calibration_settings(self):
+        """Kalibratie-keuzevenster voor MESH (product 'o'), analoog aan select_dealiasing_settings
+        hierboven. Kiest tussen Witt (1998, de standaard) en de twee Murillo & Homeyer (2019)-hertijkingen
+        (P75/P95) - zie nlr_mesh.py voor de volledige formules/bronvermelding. Verandert alleen MESH zelf;
+        POSH ('b'), SHI ('si', 27 juli 2026) en POH ('uh') blijven ongemoeid: POSH/SHI gebruiken altijd
+        Witt's eigen (C-band-gecorrigeerde) SHI-opbouw (Murillo & Homeyer herzagen geen POSH/SHI-
+        equivalent), en POH is een compleet andere, niet-SHI-gebaseerde berekening (Waldvogel/Holleman).
+        """
+        self.select_mesh_calibration_settings = QWidget()
+        self.select_mesh_calibration_settings.setWindowTitle('Select MESH calibration')
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel('Calibration used for MESH (Maximum Estimated Size of Hail)'))
+
+        self.mesh_calibration_settingsw = {}
+        group = QButtonGroup()
+        vbox = QVBoxLayout()
+        for j in gv.mesh_calibration_settings:
+            self.mesh_calibration_settingsw[j] = QRadioButton(j)
+            self.mesh_calibration_settingsw[j].setChecked(j == self.mesh_calibration_setting)
+            self.mesh_calibration_settingsw[j].toggled.connect(lambda state, j=j: self.change_mesh_calibration_setting(j))
+            group.addButton(self.mesh_calibration_settingsw[j])
+            vbox.addWidget(self.mesh_calibration_settingsw[j])
+        layout.addLayout(vbox)
+
+        self.select_mesh_calibration_settings.setLayout(layout)
+        self.select_mesh_calibration_settings.resize(self.select_mesh_calibration_settings.sizeHint())
+        self.select_mesh_calibration_settings.show()
+
+    def change_mesh_calibration_setting(self, setting):
+        self.mesh_calibration_setting = setting
+
+        # GEFIXT (24 juli): MESH's schijf-cache-sleutel bevat nu de kalibratienaam (zie
+        # get_dataset_name in nlr_derived_plain.py) - elke kalibratie krijgt zijn eigen cache-slot,
+        # dus wisselen van kalibratie kan geen verouderd resultaat van een ANDERE kalibratie meer
+        # tonen. set_newdata hieronder forceert de hertekening/herberekening voor de zichtbare
+        # MESH-panelen.
+        if self.pb.firstplot_performed:
+            panels_update = [j for j in self.pb.panellist if self.crd.products[j] == 'o']
+            self.pb.set_newdata(panels_update)
+
+    def select_melting_levels_override(self):
+        """Handmatige terugvaloptie (25 juli, op Eriks verzoek) voor de 0C/-20C-temperatuurbron
+        bij oude cases die buiten Open-Meteo's venster vallen en dus op het University of
+        Wyoming radiosonde-archief terugvallen (zie nlr_meltinglevels.py). Analoog aan
+        select_mesh_calibration_settings hierboven qua opzet (QWidget met QRadioButtons/checkbox).
+
+        LET OP - status (25 juli): dit venster laat je zelf station+datum+uur kiezen en direct
+        testen (via de 'Test ophalen'-knop hieronder, die nlr_meltinglevels.get_melting_levels_wyoming_manual
+        rechtstreeks aanroept), maar de eigenlijke HCLASS/MESH/POSH/POH-berekening in
+        nlr_derived_plain.py gebruikt deze instelling nog NIET - dat vergt een aanpassing in dat
+        bestand zelf (nog niet aangeleverd door Erik), die zou moeten controleren of
+        self.gui.melting_levels_manual_override aan staat en zo ja get_melting_levels_wyoming_manual
+        met deze 3 instellingen aanroepen i.p.v. de automatische keuze.
+        """
+        self.select_melting_levels_override = QWidget()
+        self.select_melting_levels_override.setWindowTitle('Select melting level source (Wyoming archive)')
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel('Handmatige stationskeuze voor het Wyoming-sounding-archief (oude cases)'))
+        layout.addWidget(QLabel('Terugvaloptie naast de automatische, dichtstbijzijnde-tijd-keuze - alleen actief als onderstaand vakje is aangevinkt.'))
+
+        self.melting_levels_manual_overridew = QCheckBox('Gebruik handmatige keuze i.p.v. automatische keuze')
+        self.melting_levels_manual_overridew.setChecked(self.melting_levels_manual_override)
+        self.melting_levels_manual_overridew.toggled.connect(self.change_melting_levels_manual_override)
+        layout.addWidget(self.melting_levels_manual_overridew)
+
+        hbox_station = QHBoxLayout()
+        hbox_station.addWidget(QLabel('Station:'))
+        self.melting_levels_manual_stationw = QComboBox()
+        self.melting_levels_manual_stationw.addItems(list(nlr_ml.WYOMING_STATIONS.keys()))
+        self.melting_levels_manual_stationw.setCurrentText(self.melting_levels_manual_station)
+        self.melting_levels_manual_stationw.currentTextChanged.connect(self.change_melting_levels_manual_station)
+        hbox_station.addWidget(self.melting_levels_manual_stationw)
+        layout.addLayout(hbox_station)
+
+        hbox_datetime = QHBoxLayout()
+        hbox_datetime.addWidget(QLabel('Datum (JJJJ-MM-DD):'))
+        self.melting_levels_manual_datew = QLineEdit(self.melting_levels_manual_date)
+        self.melting_levels_manual_datew.editingFinished.connect(self.change_melting_levels_manual_date)
+        hbox_datetime.addWidget(self.melting_levels_manual_datew)
+        hbox_datetime.addWidget(QLabel('Uur (UTC):'))
+        self.melting_levels_manual_hourw = QComboBox()
+        self.melting_levels_manual_hourw.addItems(['0', '12'])
+        self.melting_levels_manual_hourw.setCurrentText(str(self.melting_levels_manual_hour))
+        self.melting_levels_manual_hourw.currentTextChanged.connect(self.change_melting_levels_manual_hour)
+        hbox_datetime.addWidget(self.melting_levels_manual_hourw)
+        layout.addLayout(hbox_datetime)
+        layout.addWidget(QLabel('De Bilt lanceert alleen om 0 UTC; Meppen/Essen/Norderney om 0 en 12 UTC.'))
+
+        self.melting_levels_manual_testbutton = QPushButton('Test ophalen')
+        self.melting_levels_manual_testbutton.clicked.connect(self.test_melting_levels_manual_fetch)
+        layout.addWidget(self.melting_levels_manual_testbutton)
+        self.melting_levels_manual_resultw = QLabel('')
+        layout.addWidget(self.melting_levels_manual_resultw)
+
+        self.select_melting_levels_override.setLayout(layout)
+        self.select_melting_levels_override.resize(self.select_melting_levels_override.sizeHint())
+        self.select_melting_levels_override.show()
+
+    def change_melting_levels_manual_override(self, state):
+        self.melting_levels_manual_override = state
+        self._redraw_melting_level_dependent_panels()
+
+    def change_melting_levels_manual_station(self, station):
+        self.melting_levels_manual_station = station
+        self._redraw_melting_level_dependent_panels()
+
+    def change_melting_levels_manual_date(self):
+        self.melting_levels_manual_date = self.melting_levels_manual_datew.text().strip()
+        self._redraw_melting_level_dependent_panels()
+
+    def change_melting_levels_manual_hour(self, hour_text):
+        self.melting_levels_manual_hour = int(hour_text)
+        self._redraw_melting_level_dependent_panels()
+
+    def _redraw_melting_level_dependent_panels(self):
+        """Forceert herberekening van de zichtbare panelen die van het gedeelde temperatuurrooster
+        afhangen (HCLASS 'j', MESH 'o', POSH 'b', POH 'uh', en sinds 27 juli 2026 ook SHI 'si' zelf)
+        - analoog aan change_mesh_calibration_setting hierboven, maar voor alle producten die
+        ensure_melting_level_grid_current gebruiken i.p.v. alleen MESH. Nodig zodat aan/uitzetten van
+        de handmatige stationskeuze, of het station/datum/uur daarvan wijzigen, meteen zichtbaar wordt
+        i.p.v. pas bij een toevallige volgende herberekening - de cache-sleutel in
+        ensure_melting_level_grid_current (nlr_datasourcegeneral.py) neemt de override-instellingen al
+        mee, dus deze aanroep hoeft alleen de herberekening zelf te triggeren.
+
+        BUGFIX (25 juli, na Eriks melding dat het radarbeeld waarop hij de stationswissel deed werd
+        overgeslagen): deze functie wordt aangeroepen vanuit 4 losse widget-signalen (checkbox +
+        3 dropdowns/invoerveld), die kort na elkaar kunnen vuren. self.pb.set_newdata is niet
+        re-entrant-veilig (het deelt muterende status zoals self.data_attr_before/self.scans_before
+        tussen aanroepen) - ELKE andere plek in de code die op vergelijkbare wijze een instelling
+        wijzigt en set_newdata handmatig aanroept (change_polarization/change_apply_dealiasing/
+        change_productunfiltered in nlr_changedata.py) beschermt zich hiertegen met een tijdslot via
+        self.crd.end_time/self.sleeptime_after_plotting - die guard ontbrak hier, wat overlappende
+        aanroepen kon toelaten. Nu hetzelfde patroon toegepast.
+        """
+        if pytime.time() - self.crd.end_time < self.sleeptime_after_plotting:
+            return
+        if self.pb.firstplot_performed:
+            panels_update = [j for j in self.pb.panellist if self.crd.products[j] in ('j', 'o', 'b', 'uh', 'si', 'zc')]
+            if panels_update:
+                self.pb.set_newdata(panels_update)
+        self.crd.end_time = pytime.time()
+
+    def select_attenuation_correction_settings(self):
+        """Aan/uit-instelling (28 juli 2026, op Eriks verzoek na de ZPHI-implementatie) voor de
+        C-band-verzwakkingscorrectie (nlr_attenuation.py) op MESH/POSH/POH/SHI/HCLASS. Standaard AAN.
+        Analoog aan select_melting_levels_override hierboven qua opzet - 1 checkbox, direct effect
+        op de zichtbare panelen via _redraw_hail_attenuation_dependent_panels hieronder. Bedoeld om
+        oud (uit) en nieuw (aan) gedrag naast elkaar te kunnen vergelijken, i.p.v. alleen de eerdere
+        cijfers uit een vorige sessie erbij te moeten pakken.
+        """
+        self.select_attenuation_correction_settings = QWidget()
+        self.select_attenuation_correction_settings.setWindowTitle('ZPHI attenuation correction')
+
+        layout = QVBoxLayout()
+        layout.addWidget(QLabel('C-band-verzwakkingscorrectie (ZPHI, Bringi 2001/Gou 2019)'))
+        layout.addWidget(QLabel('Geldt voor HCLASS/MESH/POSH/POH/SHI. Uit = exact het oude, ongecorrigeerde gedrag.'))
+
+        self.attenuation_correction_enabledw = QCheckBox('Verzwakkingscorrectie toepassen')
+        self.attenuation_correction_enabledw.setChecked(self.attenuation_correction_enabled)
+        self.attenuation_correction_enabledw.toggled.connect(self.change_attenuation_correction_enabled)
+        layout.addWidget(self.attenuation_correction_enabledw)
+
+        self.select_attenuation_correction_settings.setLayout(layout)
+        self.select_attenuation_correction_settings.resize(self.select_attenuation_correction_settings.sizeHint())
+        self.select_attenuation_correction_settings.show()
+
+    def change_attenuation_correction_enabled(self, state):
+        self.attenuation_correction_enabled = state
+        print(f"change_attenuation_correction_enabled: state={state}")
+        self._redraw_hail_attenuation_dependent_panels()
+
+    def _redraw_hail_attenuation_dependent_panels(self):
+        """Forceert herberekening van de zichtbare HCLASS/MESH/POSH/POH/SHI-panelen na het aan/uit
+        zetten van de verzwakkingscorrectie - zelfde opzet (incl. dezelfde debounce-guard) als
+        _redraw_melting_level_dependent_panels hierboven. LET OP: 'zc' (ZDR-kolomdiepte) hoort hier
+        NIET bij, in tegenstelling tot bij de temperatuurrooster-variant hierboven - zc gebruikt geen
+        gecorrigeerde Z/ZDR (zie nlr_attenuation.py/get_hail_corrected_data_all: scope is uitdrukkelijk
+        beperkt tot j/o/b/uh/si).
+        """
+        if pytime.time() - self.crd.end_time < self.sleeptime_after_plotting:
+            return
+        if self.pb.firstplot_performed:
+            panels_update = [j for j in self.pb.panellist if self.crd.products[j] in ('j', 'o', 'b', 'uh', 'si')]
+            if panels_update:
+                self.pb.set_newdata(panels_update)
+                self.pb.set_draw_action('plotting')
+                self.pb.update()
+        self.crd.end_time = pytime.time()
+
+    def test_melting_levels_manual_fetch(self):
+        """Haalt direct de sounding op voor de op dit moment ingestelde station+datum+uur-combinatie
+        en toont het resultaat (of de foutmelding) in het label onder de knop - zo kun je een
+        station+tijdstip controleren zonder dat de HCLASS/MESH/POSH/POH-berekening zelf al aan
+        deze instelling gekoppeld hoeft te zijn (zie kanttekening bovenaan select_melting_levels_override)."""
+        try:
+            year, month, day = (int(x) for x in self.melting_levels_manual_date.split('-'))
+        except (ValueError, AttributeError):
+            self.melting_levels_manual_resultw.setText('Ongeldige datum - gebruik JJJJ-MM-DD')
+            return
+        try:
+            result = nlr_ml.get_melting_levels_wyoming_manual(
+                self.melting_levels_manual_station, year, month, day, self.melting_levels_manual_hour)
+            self.melting_levels_manual_resultw.setText(
+                'OK - 0C: {} m, -20C: {} m (sounding: {})'.format(
+                    result['h0_m'], result['h_minus20_m'], result['datetime_used']))
+        except (ValueError, nlr_ml.MeltingLevelError) as e:
+            self.melting_levels_manual_resultw.setText('Fout: {}'.format(e))
+
     def change_dualprfdealiasing_n_it(self):
         number = ft.to_number(self.dualprfdealiasing_n_itw.text())
         if not number is None and number > 0:
@@ -1510,6 +2052,20 @@ class GUI(QWidget):
         menu.popup(self.mapToGlobal(pos))
         
     def showrightclickMenu(self, pos):
+        # FIX (23 juli, op Eriks verzoek): een rechtsklik moet het achtergebleven puntje van de
+        # laatste HCLASS/MESH-pop-up-klik (self.pb.visuals['click_marker'], zie nlr_plotting.py)
+        # verbergen ZONDER tegelijk het rechtsklikmenu te tonen. Een eerdere poging deed dit in
+        # nlr_plotting.py's on_mouse_release, maar deze functie hier wordt OOK rechtstreeks
+        # aangeroepen door Qt's eigen customContextMenuRequested-signaal (zie __init__,
+        # self.customContextMenuRequested.connect(self.showrightclickMenu)) - op Windows (Eriks
+        # platform, zie de docstring/opmerking hieronder) gebeurt dat zelfs NA de expliciete
+        # aanroep vanuit on_mouse_release, dus die eerdere fix werd domweg overschreven. Door de
+        # check hier, helemaal bovenaan, te zetten - vóór alle andere logica - werkt het nu
+        # ongeacht welk van de twee paden deze functie als eerste/laatste aanroept.
+        if self.pb.visuals['click_marker'].visible:
+            self.pb.visuals['click_marker'].visible = False
+            self.pb.update()
+            return
         self.rightmouseclick_Qpos = pos
                 
         """The order in which events are handled differs among different PC's (different for Linux and Windows at least). For Windows, showing the right-click menu 
@@ -1704,22 +2260,41 @@ class GUI(QWidget):
         formlayout = QFormLayout()
         
         self.pos_markers_latlonsw = {}
+        self.pos_markers_labelsw = {}
         n = len(self.pos_markers_latlons)
         for j in range(max([10, n+1])):
             self.pos_markers_latlonsw[j] = QLineEdit()
             if j < n:
                 self.pos_markers_latlonsw[j].setText(', '.join(format(i, '.6f') for i in self.pos_markers_latlons[j]))
-            formlayout.addRow(QLabel(f'{j+1}'), self.pos_markers_latlonsw[j])
+            self.pos_markers_labelsw[j] = QLineEdit()
+            self.pos_markers_labelsw[j].setPlaceholderText('optioneel label')
+            if j < len(self.pos_markers_labels):
+                self.pos_markers_labelsw[j].setText(self.pos_markers_labels[j])
+            hbox = QHBoxLayout()
+            hbox.addWidget(self.pos_markers_latlonsw[j], 5); hbox.addWidget(self.pos_markers_labelsw[j], 3)
+            formlayout.addRow(QLabel(f'{j+1}'), hbox)
             self.pos_markers_latlonsw[j].editingFinished.connect(lambda j=j: self.set_pos_markers_properties('Coordinates', j))
+            self.pos_markers_labelsw[j].editingFinished.connect(lambda j=j: self.set_pos_marker_label(j))
         
         layout.addWidget(QLabel('Input can be either in decimal or DMS format, and a - sign or the suffix N/S/E/W'))
         layout.addWidget(QLabel('is allowed. Supported formats are at least those of Google Maps, ESWD, Wikipedia,'))
         layout.addWidget(QLabel('SPC storm reports and Tornado Archive.'))
         layout.addWidget(QLabel("Input should be specified in the format 'latitude, longitude'."))
+        layout.addWidget(QLabel("Het optionele label wordt getoond in de 3D volume-viewer (Ctrl+Shift+4), bij de"))
+        layout.addWidget(QLabel("verticale lijn die op de positie van deze marker wordt getekend."))
         layout.addLayout(formlayout)
         self.marker_coordinates_widget.setLayout(layout)
         self.marker_coordinates_widget.resize(self.marker_coordinates_widget.sizeHint())
         self.marker_coordinates_widget.show()
+    
+    def set_pos_marker_label(self, index):
+        # Los van set_pos_markers_properties, omdat een label ook zonder geldige coordinaten-invoer op deze regel
+        # ingesteld moet kunnen worden (bv. eerst coordinaten intypen en pas daarna, in een aparte stap, het label).
+        if index >= len(self.pos_markers_latlons):
+            return # Geen zin om een label te zetten zonder dat er al een geldige marker op deze regel bestaat.
+        while len(self.pos_markers_labels) <= index:
+            self.pos_markers_labels.append('')
+        self.pos_markers_labels[index] = self.pos_markers_labelsw[index].text().strip()
                 
     def set_pos_markers_properties(self, input_type, index=None):
         n = len(self.pos_markers_positions)
@@ -1741,6 +2316,7 @@ class GUI(QWidget):
         if n <= list_index:
             self.pos_markers_positions.append([])
             self.pos_markers_latlons.append([])
+            self.pos_markers_labels.append('')
         self.pos_markers_positions[list_index] = np.array([x, y])
         self.pos_markers_latlons[list_index] = np.array([lat, lon])
         self.update_pos_marker_widgets()
@@ -1755,6 +2331,10 @@ class GUI(QWidget):
                     self.pos_markers_latlonsw[j].setText(', '.join(format(i, '.6f') for i in self.pos_markers_latlons[j]))
                 else:
                     self.pos_markers_latlonsw[j].clear()
+                if j < len(self.pos_markers_labels):
+                    self.pos_markers_labelsw[j].setText(self.pos_markers_labels[j])
+                else:
+                    self.pos_markers_labelsw[j].clear()
         except Exception:
             # Should only occur when the widgets don't exist
             pass
@@ -1780,8 +2360,10 @@ class GUI(QWidget):
                 index = self.pb.marker_mouse_selected_index
             del self.pos_markers_positions[index]
             del self.pos_markers_latlons[index]
+            if index < len(self.pos_markers_labels):
+                del self.pos_markers_labels[index]
         elif mode == 'all':
-            self.pos_markers_positions, self.pos_markers_latlons = [], []        
+            self.pos_markers_positions, self.pos_markers_latlons, self.pos_markers_labels = [], [], []        
             
         self.update_pos_marker_widgets()
         self.pb.set_sm_pos_markers()
@@ -2121,7 +2703,7 @@ class GUI(QWidget):
     def import_choices(self):
         try:
             try:
-                with open(opa(os.path.join(gv.programdir+'/Generated_files/','saved_choices.pkl')),'rb') as f:
+                with open(opa(os.path.join(gv.userdir+'/Generated_files/','saved_choices.pkl')),'rb') as f:
                     choices = pickle.load(f)
             except Exception: 
                 with open(opa(os.path.join(gv.programdir+'/Input_files/','saved_choices_default.pkl')),'rb') as f:
@@ -2140,7 +2722,7 @@ class GUI(QWidget):
             selected_scanangles = {i:j for i,j in self.dsg.selected_scanangles.items() if self.crd.products[i] in gv.products_with_tilts}
             choices[choice_ID] = {'panels':self.pb.panels, 'products':self.crd.products, 'selected_scanangles':selected_scanangles, 
                                   'selected_heights':selected_heights, 'range_nyquistvelocity_scanpairs_indices':self.dsg.range_nyquistvelocity_scanpairs_indices}
-            with open(gv.programdir+'/Generated_files/saved_choices.pkl', 'wb') as f:
+            with open(gv.userdir+'/Generated_files/saved_choices.pkl', 'wb') as f:
                 pickle.dump(choices, f, protocol=2)
 
     def set_choice(self,choice_ID): 
@@ -2156,7 +2738,9 @@ class GUI(QWidget):
         panels_new = choice['panels']
         new_panellist = [self.pb.plotnumber_to_panelnumber[panels_new][j] for j in range(panels_new)]
         for j in new_panellist:
-            self.crd.products[j] = choice['products'][j]
+            # BUGFIX (27 juli 2026): zelfde vangnet als bij de opstart-productlijst - een opgeslagen
+            # F-toets-preset kan een inmiddels verwijderde productcode bevatten (bv. 'hd'/HDR).
+            self.crd.products[j] = choice['products'][j] if choice['products'][j] in gv.products_all else 'z'
             if self.crd.scan_selection_mode in ('scan', 'scanangle') and j in choice['selected_scanangles']:
                 self.dsg.selected_scanangles[j] = choice['selected_scanangles'][j]
             if j in choice['range_nyquistvelocity_scanpairs_indices']:
@@ -2324,7 +2908,7 @@ class GUI(QWidget):
         choices = self.import_choices()
         key = 'selected_scanangles' if j == 'angle' else 'selected_heights'
         choices[i].update({'panels':panels, 'products':products, key:values})
-        with open(opa(os.path.join(gv.programdir+'/Generated_files','saved_choices.pkl')),'wb') as f:
+        with open(opa(os.path.join(gv.userdir+'/Generated_files','saved_choices.pkl')),'wb') as f:
             pickle.dump(choices,f,protocol=2)
             
 
@@ -2638,7 +3222,1335 @@ class GUI(QWidget):
     
     def change_savefig_include_menubar(self, state):
         self.savefig_include_menubar = state == 2
-        
+
+    def show_volume_3d_viewer(self):
+        """Sneltoets CTRL+SHIFT+4: opent een apart, interactief vispy-venster met een echte GPU volume-
+        rendering (TurntableCamera: slepen=draaien/kantelen, scrollen=in-/uitzoomen) van het product in het
+        huidige paneel, gereconstrueerd met get_volume_grid over een zelf met CTRL+SHIFT+slepen getekende
+        rechthoek. Onthoudt het gebruikte product/gebied (self._volume3d_rect_params) zodat instellingen-
+        wijzigingen (Settings -> Miscellaneous) het venster live kunnen verversen zonder opnieuw op
+        CTRL+SHIFT+4 te moeten drukken -- zie _live_refresh_volume_3d en _render_volume_3d_scene.
+        """
+        if self.pb.volume3d_rect_a is None or self.pb.volume3d_rect_b is None:
+            self.set_textbar('Teken eerst een gebied: CTRL+SHIFT+links-klik-en-slepen op de kaart.', 'red', 2)
+            return
+
+        j = self.pb.panel
+        # BUGFIX (15 augustus 2026): gv.i_p zet elk afgeleid product terug naar zijn onderliggende scan-
+        # product (nodig omdat scanangles_all alleen voor de echte, direct ingelezen producten gevuld is --
+        # zie get_volume_grid). Voor PolRGB ('g') betekende dit dat de 3D-viewer altijd stilletjes 'z' liet
+        # zien, ongeacht welk product er in het paneel stond -- get_volume_grid_polrgb heeft deze omweg
+        # niet nodig (haalt zelf Z/CC/ZDR op), dus 'g' blijft hier voortaan gewoon 'g'. Andere afgeleide
+        # producten (HCLASS/MESH/etc.) vallen nog wel terug op 'z' zoals voorheen -- dat is een apart,
+        # groter punt (die hebben geen eigen get_volume_grid_X-tegenhanger) en dus bewust ongewijzigd
+        # gelaten, niet aangepakt binnen deze PolRGB-wijziging.
+        product = self.crd.products[j]
+        if product != 'g':
+            product = gv.i_p[product]
+        # Scan-datum/tijd vastgelegd op DIT moment (7 juli 2026, op Eriks verzoek: "datum en tijd van de scan
+        # mis ik in de 3D-weergave") -- net als product/x_range/y_range hierboven, zodat een latere live-
+        # refresh (bv. door een Settings-wijziging) niet per ongeluk het datum/tijd van een ANDER, inmiddels
+        # geselecteerd paneel/moment gaat tonen.
+        scandatetime = self.pb.data_attr['scandatetime'].get(j)
+        x1, y1 = self.pb.volume3d_rect_a
+        x2, y2 = self.pb.volume3d_rect_b
+        # De met CTRL+SHIFT+slepen getekende rechthoek (zie nlr_plotting.py: volume3d_rect_a/b) als exact
+        # het gewenste gebied, met een kleine marge zodat de rand niet precies op de aangeklikte hoek valt.
+        margin_km = 1.
+        x_range = (min(x1, x2)-margin_km, max(x1, x2)+margin_km)
+        y_range = (min(y1, y2)-margin_km, max(y1, y2)+margin_km)
+        self._volume3d_rect_params = (product, x_range, y_range, scandatetime)
+        # force_new_window=True: een expliciete CTRL+SHIFT+4-druk maakt altijd een vers venster met de
+        # HUIDIGE rechthoek (die kan intussen veranderd zijn) -- alleen instellingen-wijzigingen (zie
+        # _live_refresh_volume_3d) hertekenen het BESTAANDE venster in place.
+        self._render_volume_3d_scene(force_new_window=True)
+
+    def _live_refresh_volume_3d(self):
+        """Wordt aangeroepen door elke change_volume3d_*-instellingsfunctie (Settings -> Miscellaneous): als
+        er al een 3D-venster open staat, wordt dat venster in place opnieuw getekend met de nieuwe
+        instelling(en) en hetzelfde product/gebied als de vorige keer, met behoud van de camerastand -- op
+        Eriks verzoek (5 juli 2026: 'kan dat niet live'), net zoals show_cross_section al live doet bij
+        wijzigingen aan de cross-section-instellingen. Doet niets als er nog geen venster open staat (dan
+        gelden de nieuwe instellingen simpelweg de volgende keer dat CTRL+SHIFT+4 wordt gebruikt).
+
+        Gebruikt een korte debounce (zie _volume3d_refresh_timer): de daadwerkelijke hertekening (relatief
+        traag, met name door de tientallen tekst-labels die vispy telkens opnieuw moet aanmaken) wordt pas
+        400ms na de LAATSTE wijziging uitgevoerd, zodat het snel na elkaar aanpassen van meerdere velden
+        (Settings -> Miscellaneous) niet elk apart een volledige, dure heropbouw triggert -- op Eriks
+        feedback (5 juli 2026: 'het gaat uiterst traag') dat de live-refresh zonder dit merkbaar hapert."""
+        if getattr(self, '_volume_3d_canvas', None) is None or getattr(self, '_volume3d_rect_params', None) is None:
+            return
+        if not hasattr(self, '_volume3d_refresh_timer'):
+            self._volume3d_refresh_timer = QTimer()
+            self._volume3d_refresh_timer.setSingleShot(True)
+            self._volume3d_refresh_timer.timeout.connect(self._live_refresh_volume_3d_now)
+        self._volume3d_refresh_timer.start(400)
+
+    def _live_refresh_volume_3d_now(self):
+        """Doet de daadwerkelijke hertekening -- zie _live_refresh_volume_3d hierboven voor de debounce die
+        hiernaartoe leidt."""
+        try:
+            self._render_volume_3d_scene(force_new_window=False)
+        except Exception as e:
+            print(f"[3D viewer] Live update mislukt: {e}"); print(traceback.format_exc())
+
+    def _render_volume_3d_scene(self, force_new_window):
+        """Doet het eigenlijke werk voor show_volume_3d_viewer/_live_refresh_volume_3d: herberekent het grid
+        via get_volume_grid met de huidige instellingen en het onthouden product/gebied
+        (self._volume3d_rect_params), en (her)bouwt daarmee de volume/kader/streepjes/labels -- ofwel in een
+        gloednieuw venster (force_new_window=True, of als er nog geen venster open staat), ofwel BINNEN het
+        al openstaande venster, met behoud van de camerastand (force_new_window=False).
+
+        DIT IS HET MINST GEVALIDEERDE ONDERDEEL VAN HET HELE PROJECT: er is hier geen GPU/vispy beschikbaar
+        om dit te testen (zie eerdere gesprek met Claude, juli 2026), dus dit is gebaseerd op vispy's
+        documentatie en het al bewezen werkende reconstructie-principe.
+        """
+        # AXIS_LABEL_FONT_SIZE (23 juli, op Eriks verzoek): grootte van ALLE tekst die rechtstreeks in de
+        # 3D-scene zelf hangt (aslabels/cijfers, "Noord 40 km"-randlabels, hoogte-liniaal-cijfers,
+        # positiemarker-labels) - was overal los op 2400 gezet (5 plekken verderop), nu 1 instelbare
+        # constante zodat verder finetunen niet weer 5 plekken hoeft. Deze tekst hangt in de 3D-
+        # wereldcoordinaten van de scene zelf (parent=view.scene), niet in schermpixels zoals de meeste
+        # andere tekst in NLradar - vandaar de heel andere orde van grootte t.o.v. een normale font_size
+        # van bv. 10-14. LET OP: net als de rest van deze functie kon dit niet visueel getest worden (zie
+        # docstring hierboven) - de exacte, prettige waarde hangt af van de camera-afstand/het kader-formaat
+        # dat Erik gebruikt, dus dit is een eerste redelijke schatting (gehalveerd t.o.v. de oude 2400),
+        # niet een gegarandeerd perfecte waarde.
+        AXIS_LABEL_FONT_SIZE = 1200
+
+        product, x_range, y_range, scandatetime = self._volume3d_rect_params
+        # PolRGB (product 'g') heeft geen kleurentabel (RGBA-passthrough, R=Z/G=CC/B=ZDR -- zie
+        # DataSource_General._calculate_polrgb) en kan daarom niet als scalair rooster+colormap worden
+        # gereconstrueerd zoals elk ander product. get_volume_grid_polrgb haalt Z/CC/ZDR apart op en
+        # combineert ze per voxel tot echte RGBA-kleuren -- zie hieronder (is_polrgb) voor hoe dat verder
+        # door deze functie heen verwerkt wordt.
+        is_polrgb = product == 'g'
+
+        self.set_textbar(f"3D-grid reconstructie voor product '{product}' wordt berekend...", 'orange', 1)
+        try:
+            if is_polrgb:
+                result = self.dsg.get_volume_grid_polrgb(
+                    x_range, y_range, grid_res_km=self.volume3d_grid_res_km, z_max_km=self.volume3d_z_max_km,
+                    z_res_km=self.volume3d_z_res_km, smoothing_sigma_cells=self.volume3d_smoothing_sigma)
+            else:
+                result = self.dsg.get_volume_grid(product, x_range, y_range, grid_res_km=self.volume3d_grid_res_km,
+                                                   z_max_km=self.volume3d_z_max_km, z_res_km=self.volume3d_z_res_km,
+                                                   smoothing_sigma_cells=self.volume3d_smoothing_sigma)
+        except Exception as e:
+            self.set_textbar(f"get_volume_grid gaf een fout: {e}", 'red', 3)
+            print('_render_volume_3d_scene error:'); print(traceback.format_exc())
+            return
+        if result is None:
+            self.set_textbar(f"Geen (niet-birdbath) scans beschikbaar voor product '{product}'.", 'red', 2)
+            return
+
+        try:
+            from vispy import scene
+            from vispy import color
+        except ImportError as e:
+            self.set_textbar(f"vispy.scene niet beschikbaar: {e}", 'red', 3)
+            return
+
+        if is_polrgb:
+            rgba_full, x_axis, y_axis, z_axis = result['rgba'], result['x'], result['y'], result['z']
+            grid = None
+        else:
+            grid, x_axis, y_axis, z_axis = result['grid'], result['x'], result['y'], result['z']
+        # TERUGGEZET 7 juli 2026: de wijzigingen hierboven (data_values_colors i.p.v. cmaps_maxrange_masked
+        # gebruiken voor vmin/vmax) raakten NIET alleen de nieuwe legenda, maar ook de daadwerkelijke
+        # kleuren van de 3D-stormvorm zelf -- die werkte al goed en had hier niet aangeraakt moeten worden.
+        # vmin/vmax voor de VOLUMEDATA ZELF dus weer terug naar de oorspronkelijke, bevestigd werkende bron
+        # van 5 juli 2026. De legenda hieronder gebruikt voortaan zijn EIGEN, apart benoemde variabelen
+        # (_legend_vmin/_legend_vmax), die niets meer met de volumedata's eigen clim te maken hebben -- zodat
+        # verder puzzelen aan de legenda de 3D-vorm zelf nooit meer kan beinvloeden.
+        # gv.cmaps_maxrange_masked['g'] is slechts een RGBA-uint8-placeholder (0-255), niet een echt
+        # dBZ/%/dB-bereik -- voor PolRGB is er sowieso geen enkele scalaire clim zinvol (zie is_polrgb
+        # hieronder), dus dan gewoon niet opzoeken.
+        vmin, vmax = (0., 1.) if is_polrgb else gv.cmaps_maxrange_masked[product]
+
+
+
+        # OMSLAG 5 juli 2026, 2e keer: Erik liet een voorbeeld van Brams eigen 3D-weergave zien (een zachte,
+        # gloeiende, kleurrijke wolk waar je gaten/structuur doorheen kunt zien, bijv. een duidelijk
+        # "oog"/gat in het midden). Dat is het klassieke uiterlijk van MIP (Maximum Intensity Projection)
+        # volume-rendering: voor elke kijkstraal wordt alleen de HOOGSTE waarde langs die straal getoond, in
+        # plaats van doorzichtigheid op te stapelen (dat laatste, method='translucent', was de vorige
+        # poging, en blokkeerde alles ondanks lagere alpha -- zie Eriks feedback "ALLE data ontneemt het
+        # zicht"). Met MIP kun je vanzelf "erdoorheen kijken": data blokkeert nooit iets anders, er wordt
+        # alleen de sterkste waarde per straal getoond. De eerder geprobeerde puntenwolk (Markers) wordt
+        # hiermee vervangen -- dit sluit dichter aan bij hoe Bram het doet.
+        vertical_exaggeration = self.volume3d_vertical_exaggeration # Instelbaar via Settings -> Miscellaneous.
+
+        # OMSLAG 5 juli 2026, 3e keer: Erik meldde een felle, gekleurde rand rondom de HELE vorm ("loopt er
+        # helemaal omheen"), bevestigd als renderartefact (geen echte data). Vermoedelijke oorzaak: de
+        # eerdere sentinelwaarde-truc (een kunstmatige "net iets te lage" waarde + een aangepaste colormap
+        # met een doorzichtige zone) creeerde een harde kleurovergang die de textuur-interpolatie van vispy
+        # bij elke rand van de vorm liet oplichten. Nieuwe, eenvoudigere aanpak: ECHTE NaN-waarden in de
+        # data, met de GEWONE kleurentabel (self.pb.cm1[product]) direct, zonder aanpassingen. Bij MIP zou
+        # dit vanzelf moeten werken: een vergelijking met NaN is altijd onwaar, dus een NaN-cel kan nooit als
+        # "hoogste waarde langs de straal" gekozen worden -- in tegenstelling tot method='translucent'
+        # (eerder geprobeerd, toen bleek dat NaN daar NIET als doorzichtig werd behandeld), kan MIP hier
+        # heel anders mee omgaan. Nog niet eerder getest sinds we destijds meteen naar de sentinel-truc
+        # overstapten; als dit een verkeerd-gekleurd blok oplevert i.p.v. de rand op te lossen, weten we dat
+        # NaN ook bij MIP niet vanzelf wordt overgeslagen en moet de sentinel-truc met een andere overgang
+        # terugkomen.
+        # self.pb.cm1['g'] is (net als de colortable-CSV hierboven) slechts een placeholder -- PolRGB
+        # gebruikt sowieso geen scalaire kleurentabel (zie is_polrgb). volume_data wordt voor PolRGB niet
+        # gebruikt voor de daadwerkelijke kleuren (dat gebeurt rechtstreeks via rgba_full, zie de
+        # puntenwolk-opbouw verderop), alleen als kleurloze plaatshouder voor de (bij PolRGB altijd
+        # verborgen) Volume/MIP-visual -- zie hieronder waarom een echte MIP/translucent PolRGB-weergave
+        # niet mogelijk is.
+        if is_polrgb:
+            volume_cmap = 'grays'
+            volume_data = rgba_full[..., 0].astype('float32') # Alleen Z-kanaal (genormaliseerd), puur als
+            #ongebruikte plaatshouder-textuur -- zie hierboven.
+        else:
+            volume_cmap = self.pb.cm1[product] # Dezelfde kleurentabel als de normale 2D-panelen, ongewijzigd.
+            volume_data = grid.astype('float32') # Blijft NaN waar geen data is -- geen sentinelwaarde meer.
+        if not is_polrgb and self.volume3d_min_value is not None:
+            # Minimumwaarde-filter (8 juli 2026, op Eriks verzoek: "de 3D weergave heeft duidelijk last van
+            # de lage dBZ waarden") -- waarden onder de grens worden hier al op NaN gezet, VOORDAT de Volume-
+            # en puntenwolk-visuals worden opgebouwd. Daardoor werkt dit automatisch voor alle drie de
+            # weergavemodi (MIP, translucent, puntenwolk) tegelijk, met dezelfde "NaN kan nooit de hoogste
+            # waarde langs een straal zijn"-redenering als hierboven al gebruikt wordt voor de buitenrand.
+            #
+            # BIJGESTELD (8 juli 2026, Erik: "bij V ga je van -60 naar +60, dus moet je vanaf 0 filteren, naar
+            # boven EN naar beneden"): voor een symmetrisch/tweezijdig product zoals V (waar negatief=naar de
+            # radar toe en positief=van de radar af BEIDE fysiek betekenisvol zijn) is "alles onder de grens
+            # weg" verkeerd -- dat zou alle inkomende (negatieve) waarden wegfilteren! In plaats daarvan moet
+            # daar gefilterd worden op de ABSOLUTE waarde (dicht bij nul = zwak, ver van nul in beide
+            # richtingen = sterk). Voor een eenzijdig product zoals Z (-20 tot 80, overwegend positief) blijft
+            # de simpele "onder de grens" aanpak wel correct. Onderscheid gemaakt via een simpele heuristiek
+            # op het kleurbereik zelf (vmin/vmax), i.p.v. hardgecodeerde productletters: als het bereik
+            # ongeveer symmetrisch rond nul ligt, behandel het als tweezijdig.
+            if vmin < 0 < vmax and abs(vmin+vmax) < 0.5*(vmax-vmin):
+                volume_data[np.abs(volume_data) < self.volume3d_min_value] = np.nan
+            else:
+                volume_data[volume_data < self.volume3d_min_value] = np.nan
+        elif is_polrgb and self.volume3d_min_value is not None:
+            # PolRGB-equivalent van het minimumwaarde-filter hierboven: Z is bij PolRGB altijd eenzijdig
+            # (net als bij een gewoon Z-paneel), dus geen symmetrie-heuristiek nodig. Werkt rechtstreeks op
+            # de ruwe (ongevulde) Z-reconstructie -- niet op het al genormaliseerde R-kanaal, dat immers
+            # gamma-gecorrigeerd is (Z_GAMMA) en dus geen lineaire dBZ-schaal meer heeft. Cellen onder de
+            # grens worden onzichtbaar gemaakt (alpha=0) i.p.v. verwijderd, zodat de puntenwolk hieronder ze
+            # vanzelf overslaat (zie de alpha>0-selectie verderop) net als bij "geen data".
+            rgba_full[..., 3][result['z_raw'] < self.volume3d_min_value] = 0.
+
+        if is_polrgb and self.volume3d_polrgb_cc_max is not None:
+            # CC-zichtbaarheidsfilter (15 augustus 2026, op Eriks verzoek: "dat groen van de regen wil ik
+            # kwijt" -- gewone regen heeft een hoge CC ONGEACHT Z, dus het Z-filter hierboven helpt daar niet
+            # tegen). Volledig LOS van/onafhankelijk van volume3d_min_value: dit filtert op de ruwe CC-
+            # reconstructie (result['cc_raw'], %), niet op Z. Voxels met CC BOVEN de grens worden onzichtbaar
+            # (alpha=0) -- hagel heeft per definitie een lagere CC dan gewone regen, dus het hagelgebied blijft
+            # hierdoor onaangeroerd. NaN in cc_raw (geen CC-data op die plek) telt hier niet mee als "boven de
+            # grens" (een NaN-vergelijking is altijd onwaar), dus zulke voxels blijven ongemoeid door dit
+            # filter -- alleen aantoonbaar hoge CC wordt weggefilterd.
+            rgba_full[..., 3][result['cc_raw'] > self.volume3d_polrgb_cc_max] = 0.
+
+        if self.volume3d_circular_area:
+            # Cirkelvormig (eigenlijk: ellipsvormig) gebied (8 juli 2026, op Eriks verzoek: "zou dat ook een
+            # cirkel kunnen zijn"): maskeert data BUITEN de ellips die precies in de getekende rechthoek past
+            # (middelpunt = midden van x_range/y_range, halve-assen = halve breedte/hoogte) -- het kader/de
+            # assen/tick-streepjes verderop blijven gewoon de VOLLE rechthoekige omvang tonen (x_axis/y_axis
+            # zelf worden hier niet aangepast), alleen de gekleurde data zelf wordt rond weggesneden. Dezelfde
+            # "NaN kan nooit de hoogste waarde langs een straal zijn"-redenering als bij het minimumwaarde-
+            # filter hierboven zorgt dat dit automatisch voor alle drie de weergavemodi werkt.
+            _cx, _cy = (x_range[0]+x_range[1])/2., (y_range[0]+y_range[1])/2.
+            _a, _b = (x_range[1]-x_range[0])/2., (y_range[1]-y_range[0])/2.
+            _xx, _yy = np.meshgrid(x_axis, y_axis) # Vorm (n_y, n_x), zelfde als een enkele z-laag van volume_data.
+            _outside_ellipse = ((_xx-_cx)/_a)**2 + ((_yy-_cy)/_b)**2 > 1.
+            if is_polrgb:
+                rgba_full[:, _outside_ellipse, 3] = 0.
+            else:
+                volume_data[:, _outside_ellipse] = np.nan
+
+        # Geografische context berekenen (afstand + windrichting vanaf de radar) -- dit gaat straks in de
+        # venstertitel/statusbalk i.p.v. in de 3D-scene zelf, want scene.visuals.Text bleek op Eriks systeem
+        # niet te renderen (waarschijnlijk ontbrekende freetype-py; zie gesprek 5 juli 2026) en verder
+        # lapwerk daaraan bracht geen vooruitgang. Titelbalk/statusbalk/console zijn Qt-tekst, dus die werken
+        # sowieso, ongeacht wat er met vispy's eigen tekst-rendering aan de hand is.
+        box_center_x = (x_axis[0]+x_axis[-1])/2.
+        box_center_y = (y_axis[0]+y_axis[-1])/2.
+        distance_from_radar_km = float(np.hypot(box_center_x, box_center_y))
+        bearing_deg = (90.-np.degrees(np.arctan2(box_center_y, box_center_x))) % 360. # Zelfde conventie als
+        #get_volume_grid/get_cross_section: positieve y=noord (azimuth 0), positieve x=oost (azimuth 90).
+        compass_16 = ['N', 'NNO', 'NO', 'ONO', 'O', 'OZO', 'ZO', 'ZZO',
+                      'Z', 'ZZW', 'ZW', 'WZW', 'W', 'WNW', 'NW', 'NNW']
+        bearing_label = compass_16[int((bearing_deg+11.25)//22.5) % 16]
+        width_km, height_km = x_axis[-1]-x_axis[0], y_axis[-1]-y_axis[0]
+
+        # Datum/tijd van de scan leesbaar opmaken (7 juli 2026) -- defensief geschreven omdat niet met
+        # zekerheid bekend is of scandatetime hier altijd een cijfer-string YYYYMMDDHHMM(SS) is; bij twijfel
+        # gewoon de ruwe waarde tonen in plaats van een foutmelding te riskeren.
+        try:
+            _sdt = str(scandatetime)
+            if len(_sdt) >= 12 and _sdt.isdigit():
+                scandatetime_str = f"{_sdt[:4]}-{_sdt[4:6]}-{_sdt[6:8]} {_sdt[8:10]}:{_sdt[10:12]}"
+                if len(_sdt) >= 14:
+                    scandatetime_str += f":{_sdt[12:14]}"
+            else:
+                scandatetime_str = _sdt
+        except Exception:
+            scandatetime_str = str(scandatetime)
+
+        # Ingekort (7 juli 2026): de toetsen-uitleg (T/M/R) stond eerst ook hier, maar deze Windows-titelbalk
+        # heeft een beperkte breedte en knipte de tekst af zodra er meer sneltoetsen bijkwamen. Die uitleg
+        # staat nu in plaats daarvan in het vaste titel-paneel BINNENIN het 3D-venster zelf (zie
+        # title_view.scene hierboven bij canvas/view), waar geen afkap-risico bestaat.
+        # Ingekort (8 juli 2026, op Eriks verzoek): de kompas-/liniaal-uitleg is verwijderd omdat die al
+        # rechtstreeks in de 3D-scene zelf staat (elke as heeft al zijn eigen kleur+naam, en de hoogte-liniaal
+        # heeft al een "hoogte X km"-label) -- dubbelop. [MIP] is hier het startpunt (elke render begint
+        # altijd met method='mip', zie de Volume-aanmaak verderop), en wordt LIVE bijgewerkt door de M/P-
+        # toetsen (canvas.title wordt daar direct aangepast, zie toggle_3d_render_method/toggle_3d_pointcloud).
+        # PolRGB start meteen in [RGB-MIP] (de nieuwe additieve 3-kanaals MIP-weergave, zie hierboven) --
+        # elk ander product start zoals voorheen in [MIP].
+        _start_mode = 'RGB-MIP' if is_polrgb else 'MIP'
+        window_title = (f"NLradar 3D - '{product}' {scandatetime_str} | kader {width_km:.0f}x{height_km:.0f} km, "
+                         f"{distance_from_radar_km:.0f} km {bearing_label} van radar | "
+                         f"{vertical_exaggeration:.0f}x overdreven | [{_start_mode}] | (H voor toetsen)")
+
+        # reuse=True: het al openstaande venster wordt in place hertekend (Settings-wijziging) i.p.v. een
+        # nieuw venster te openen -- op Eriks verzoek (5 juli 2026: 'kan dat niet live'). Camera/venster/
+        # canvas blijven dan ongewijzigd; alleen de daadwerkelijke 3D-inhoud (volume/kader/streepjes/labels)
+        # wordt vervangen.
+        reuse = (not force_new_window) and getattr(self, '_volume_3d_canvas', None) is not None
+        if reuse:
+            canvas = self._volume_3d_canvas
+            view = self._volume_3d_view
+            legend_view = self._volume_3d_legend_view
+            title_view = self._volume_3d_title_view
+            try:
+                canvas.title = window_title
+            except Exception:
+                pass
+            # BUGFIX (10 juli 2026, gevonden tijdens testen van de nieuwe J-video-export): deze lus verwijderde
+            # voorheen OOK view.camera zelf als kind van view.scene (vispy plaatst de TurntableCamera daar
+            # intern bij 'view.camera = "turntable"'), waardoor de camera na een live-refresh een "wees" werd.
+            # Dat viel niet eerder op omdat er tot nu toe niemand na een live-refresh nog programmatisch aan
+            # camera.azimuth/elevation zat -- de nieuwe video-export (self._run_volume_3d_export) doet dat
+            # wel, en liep daardoor op de 2e tijdstap vast met "RuntimeError: ... is not a child of ...".
+            # Nu wordt de camera expliciet overgeslagen zodat 'ie gewoon in de scenegraph blijft zitten.
+            for child in list(view.scene.children): # Oude volume/kader/streepjes/labels verwijderen voordat
+                if child is not view.camera:          #de nieuwe versie erin komt (camera zelf blijft staan).
+                    child.parent = None
+            for child in list(legend_view.scene.children): # Zelfde voor de kleurschaal-legenda.
+                if child is not legend_view.camera:
+                    child.parent = None
+            for child in list(title_view.scene.children): # Zelfde voor de titel.
+                if child is not title_view.camera:
+                    child.parent = None
+        else:
+            # keys='interactive' deliberately omitted (crashte eerder met een RuntimeError in vispy's eigen
+            # _set_keys, zie 5 juli 2026) -- regelt alleen toetsenbord-shortcuts, niet de muisbediening.
+            # config=dict(alpha_size=0): dwingt af dat de OpenGL-framebuffer GEEN alpha-kanaal heeft.
+            # Vermoede echte oorzaak van "ik kijk bij lage dBZ nog steeds op mn bureaublad" (5 juli 2026):
+            # donkere pixels (lage dBZ, dicht bij zwart) kregen kennelijk een laag alpha-kanaal mee in de
+            # framebuffer, waardoor Windows' vensterbeheer ze als doorzichtig behandelde -- de eerdere
+            # Qt-widget-attributen pakten dit niet aan omdat het probleem op het niveau van de GL-context
+            # zelf zit, niet de Qt-widget eromheen.
+            try:
+                canvas = scene.SceneCanvas(size=(900, 700), show=False, bgcolor=(0, 0, 0, 1),
+                                            title=window_title, config=dict(alpha_size=0))
+            except Exception as e:
+                print(f"[3D viewer] config=alpha_size=0 niet ondersteund ({e}), val terug zonder die instelling.")
+                canvas = scene.SceneCanvas(size=(900, 700), show=False, bgcolor=(0, 0, 0, 1), title=window_title)
+            try:
+                canvas.native.setAttribute(Qt.WA_TranslucentBackground, False)
+                canvas.native.setAutoFillBackground(True)
+                canvas.native.setAttribute(Qt.WA_OpaquePaintEvent, True)
+            except Exception as e:
+                print(f"[3D viewer] Kon transparantie-attribuut niet zetten ({e}).")
+            canvas.show()
+            # Grid met 2 rijen (7 juli 2026, uitgebreid): bovenaan een SMAL, VAST 2D-paneel over de volle
+            # breedte voor een witte titel (scan-datum/tijd) die -- net als de legenda -- altijd blijft staan,
+            # ongeacht hoe je de 3D-weergave zelf draait/kantelt/zoomt. Daaronder, net als voorheen: links de
+            # hoofd-3D-weergave, rechts een smal, vast 2D-paneel voor de kleurschaal-legenda.
+            grid = canvas.central_widget.add_grid()
+            title_view = grid.add_view(row=0, col=0, col_span=2)
+            # Teruggezet naar 1 regel (8 juli 2026, op Eriks verzoek: "geen tekst meer in de 3D-weergave zelf,
+            # behalve de titel met datum/tijd -- de rest in een apart schermpje"). De toetsen-uitleg staat nu
+            # in een echt, los Qt-popupvenster (zie show_volume_3d_help(), opgeroepen met de H-toets), niet
+            # meer als tekst binnen de vispy-scene zelf.
+            title_view.height_max = 36
+            title_view.camera = 'panzoom'
+            title_view.camera.interactive = False
+            title_view.camera.rect = (0, 0, 600, 36) # Willekeurige, vaste lokale eenheden -- PanZoomCamera
+            #rekt dit vanzelf uit naar de werkelijke, actuele pixelbreedte van de rij, ongeacht vensterformaat.
+            self._volume_3d_title_view = title_view
+
+            view = grid.add_view(row=1, col=0)
+            legend_view = grid.add_view(row=1, col=1)
+            legend_view.width_max = 130 # Vaste, smalle breedte in pixels voor de legenda-kolom.
+            legend_view.camera = 'panzoom'
+            legend_view.camera.interactive = False # Voorkomt dat een muisklik in dit paneel per ongeluk
+            #gaat slepen/zoomen; de legenda-inhoud wordt hieronder zelf op maat gepositioneerd.
+            self._volume_3d_legend_view = legend_view
+            # Set up via the string shorthand ('turntable') rather than instantiating
+            # scene.cameras.TurntableCamera directly -- on the test on 5 July 2026, dragging with the
+            # directly-instantiated camera moved/panned the whole shape across the screen instead of
+            # orbiting around it. The string form is the officially documented/most-used way to attach a
+            # camera in vispy's own examples, and going through ViewBox.camera's setter this way is more
+            # likely to correctly register the camera's mouse-event handlers than assigning an
+            # already-constructed instance.
+            view.camera = 'turntable'
+            view.camera.fov = 45
+            # Start recht van bovenaf (net als de normale platte kaart) i.p.v. schuin -- bij een schuine
+            # startpositie oogden noord/oost meteen "verkeerd"/gespiegeld t.o.v. de platte kaart waar Erik
+            # aan gewend is (zie feedback 5 juli 2026), ook al klopt de onderliggende richtingsformule.
+            # Vanuit deze bovenaanzicht kan hij zelf kantelen (slepen) om de hoogte-structuur te zien.
+            view.camera.azimuth = 0
+            # 65 i.p.v. bijna-verticale 85: dicht bij recht-van-bovenaf (nog steeds "bovenaanzicht"-gevoel),
+            # maar niet zo dicht bij de 90 graden pool dat verticaal slepen (kantelen) nauwelijks effect
+            # lijkt te hebben -- zie Eriks feedback (5 juli 2026: "verticaal doet ie niet"), vergelijkbaar
+            # met hoe een kompas raar aanvoelt vlak bij de Noordpool.
+            view.camera.elevation = 65
+            # Sluiten van het venster (kruisje) moet de referentie opruimen, anders denkt een latere
+            # live-refresh nog dat dit (gesloten) venster bruikbaar is.
+            def _on_3d_canvas_close(ev):
+                self._volume_3d_canvas = None
+                self._volume3d_following = False  # Voorkomt dat de A-meeloop-keten doortikt tegen een gesloten canvas.
+            canvas.events.close.connect(_on_3d_canvas_close)
+            self._volume_3d_canvas = canvas
+            self._volume_3d_view = view
+
+        horizontal_extent = max(x_axis[-1]-x_axis[0], y_axis[-1]-y_axis[0])
+
+        # method='mip' (zie toelichting hierboven). Kort geexperimenteerd met een instelbare
+        # mip/additive-keuze (5 juli 2026), maar 'additive' bleek te crashen zonder Python-foutmelding
+        # (waarschijnlijk GPU-driver-niveau) -- die optie is weer volledig verwijderd, 'mip' is nu weer
+        # gewoon hardcoded zoals voorheen. interpolation='linear' als CONSTRUCTOR-argument gaf eerder een
+        # TypeError op de oude vispy-versie (0.14.x, geen 'interpolation' kwarg op VolumeVisual). Vanaf
+        # vispy 0.16.2 (upgrade juli 2026, samen met Python 3.8 -> 3.11) is 'interpolation' wel een geldig
+        # constructor-argument -- zie vispy.visuals.volume.VolumeVisual signature. Nu ingeschakeld om de
+        # rand-overshoot hieronder te verhelpen.
+        volume = scene.visuals.Volume(volume_data, clim=(vmin, vmax), cmap=volume_cmap, gamma=self.volume3d_gamma,
+                                       method='mip', interpolation='linear', parent=view.scene)
+        # self._volume_3d_visual wordt bij ELKE (her)tekening vervangen door het nieuwste volume-object, om
+        # dezelfde reden als bij self._volume_3d_text_visuals hierboven: de M-toets-koppeling (zie verderop,
+        # translucent/MIP omschakelen) moet ook na een live-refresh het JUISTE, actuele volume-object pakken.
+        self._volume_3d_visual = volume
+        volume.visible = not is_polrgb # Zie de toelichting bij pointcloud.visible hierboven: bij PolRGB is
+        #de Volume/MIP-visual altijd verborgen (kleurloze plaatshouder-textuur, geen echte data).
+        # VOORHEEN BEKENDE BEPERKING (opgelost door vispy-upgrade naar 0.16.2, juli 2026):
+        # rondom ELKE rand van de vorm was een dun, fel gekleurd randje te zien (met name opvallend bij V).
+        # Grondig gediagnosticeerd en bevestigd: dit was een interpolatie-"overshoot" op harde randen tussen
+        # data en leegte -- exact hetzelfde mechanisme als de gedocumenteerde bicubic-overshoot bij de
+        # F2-cross-section (zie cross_section_interpolation_mode hierboven). GEEN data-fout, GEEN
+        # kleurbereik-fout (destijds al expliciet uitgesloten via diagnostiek). Met interpolation='linear'
+        # i.p.v. de vaste 'nearest'/bicubic-only rendering van de oude vispy-versie zou deze rand nu weg
+        # moeten zijn -- test dit bij de volgende V-weergave in de 3D-viewer.
+        #
+        # De regel hieronder (`volume.interpolation = 'nearest'`) is de voor de hand liggende fix (net als
+        # bij de cross-section), maar bleek GEEN effect te hebben op de 3D volume-rendering: Erik zag exact
+        # dezelfde rand met en zonder deze regel. Conclusie: scene.visuals.Volume ondersteunt het wijzigen
+        # van de textuur-interpolatie op deze vispy-versie niet echt (de instelling wordt geaccepteerd
+        # zonder foutmelding, maar heeft geen effect op de daadwerkelijke rendering) -- dit is dus een
+        # beperking van vispy's Volume-visual hier, niet van onze data of aanpak.
+        #
+        # BESLISSING (Erik, 5 juli 2026): MIP-rendering behouden, deze rand accepteren als bekende
+        # beperking. Enige alternatief (een puntenwolk i.p.v. Volume/MIP) heeft dit probleem niet, maar
+        # oogt minder zacht/gloeiend -- bewust niet gekozen. Niet opnieuw aan gaan sleutelen zonder nieuwe
+        # concrete aanwijzingen.
+        try:
+            volume.interpolation = 'nearest' # Zonder effect (zie hierboven), maar onschadelijk om te laten staan.
+        except Exception:
+            pass
+        grid_res_km = x_axis[1]-x_axis[0] if len(x_axis) > 1 else 1.
+        z_res_km = z_axis[1]-z_axis[0] if len(z_axis) > 1 else 1.
+        volume.transform = scene.STTransform(
+            translate=(x_axis[0], y_axis[0], z_axis[0]),
+            scale=(grid_res_km, grid_res_km, z_res_km*vertical_exaggeration))
+
+        # PolRGB "MIP-achtige" weergave (15 augustus 2026, op Eriks verzoek na de puntenwolk-versie: "gruwelijk
+        # jammer dat we geen wolk hebben"): 3 LOSSE Volume-visuals (1 per kanaal: R=Z, G=CC, B=ZDR), elk met
+        # een ZUIVERE zwart->kanaalkleur-colormap en method='mip', over elkaar heen getekend met ADDITIEVE
+        # GL-blending (set_gl_state('additive', depth_test=False) i.p.v. de standaard 'translucent' die de
+        # gewone Volume-visual hierboven gebruikt) -- een bekende vispy-techniek voor multikanaals volume-
+        # rendering (vergelijkbaar met hoe microscopie-composietbeelden vaak worden opgebouwd). Dit is NIET
+        # hetzelfde als de eerder geprobeerde en verwijderde method='additive' RAY-ACCUMULATIEMODUS (die
+        # crashte, zie de toelichting hierboven bij "method='mip'") -- dit is de GL-BLENDMODUS tussen 3 losse,
+        # elk voor zich heel gewoon MIP-renderende visuals, een andere laag van vispy's rendering-pijplijn.
+        #
+        # BELANGRIJKE, BEWUSTE BEPERKING (net als bij de eerdere additieve 3-MIP-optie besproken): elk kanaal
+        # kiest voor elke kijkstraal ONAFHANKELIJK zijn eigen hoogste waarde -- de plek waar Z het hoogst is,
+        # hoeft niet dezelfde te zijn als waar CC of ZDR het hoogst is. De resulterende kleur per pixel is dus
+        # een BENADERING, geen geometrisch exact samengestelde PolRGB-kleur (die garantie geeft alleen de
+        # puntenwolk hierboven, nog steeds beschikbaar via de P-toets). Bij scherpe overgangen (bijv. de rand
+        # van een hagelkern) kan dit er daardoor net "verkeerd gemengd" uit laten zien -- geen bug, inherent
+        # aan deze benadering.
+        #
+        # NOG NIET GETEST (zelfde reden als de rest van deze functie, zie docstring bovenaan): additieve
+        # GL-blending over 3 overlappende Volume-visuals is in vispy's eigen voorbeelden een bekend werkende
+        # aanpak, maar niet eerder in NLradar zelf gebruikt/gezien renderen.
+        self._volume_3d_polrgb_visuals = []
+        if is_polrgb:
+            # FIX (16 september 2026, na Eriks melding "veel blauw en wit, herken het plaatje niet t.o.v.
+            # 2D"): tot nu toe werd rgba_full[...,3] (alpha/zichtbaarheid) ALLEEN gebruikt om een voxel
+            # volledig uit te sluiten (alpha<=0 -> NaN) -- de GELEIDELIJKE vervaging die alpha in 2D en in
+            # de puntenwolk hieronder wel geeft (of dat nu de oude 2-punts ALPHA_GAMMA-fade is, of de
+            # nieuwe ESSL 11-punts-curve) had in de RGB-MIP GEEN effect: een voxel met alpha=0.1 rendert
+            # dan met exact dezelfde volle R/G/B-helderheid als alpha=1.0, zodra hij niet volledig is
+            # uitgesloten. Gecombineerd met de al bekende, bewuste "elk kanaal kiest onafhankelijk zijn
+            # eigen hoogste punt langs de kijkstraal"-beperking (zie hierboven) stapelt dit zwakke,
+            # verspreide signalen in alle 3 kanalen overal even zwaar op tot lichte/witte tinten die in de
+            # gefilterde 2D-weergave nooit zo zouden verschijnen. Fix: elk kanaal vooraf vermenigvuldigen
+            # met zijn eigen alpha, zodat een zwakke-echo-voxel navenant minder bijdraagt aan de MIP i.p.v.
+            # alles-of-niets -- consistent met hoe alpha al werkt in 2D en in de puntenwolk (face_color).
+            _no_data = rgba_full[..., 3] <= 0. # Zelfde "geen data/uitgefilterd"-criterium (alpha<=0) als de
+            #puntenwolk-selectie hieronder (alpha>0) -- consistente resultaten tussen beide weergavemodi.
+            _alpha_weight = rgba_full[..., 3]
+            _r_nan = np.where(_no_data, np.nan, rgba_full[..., 0]*_alpha_weight).astype('float32')
+            _g_nan = np.where(_no_data, np.nan, rgba_full[..., 1]*_alpha_weight).astype('float32')
+            _b_nan = np.where(_no_data, np.nan, rgba_full[..., 2]*_alpha_weight).astype('float32')
+            _channel_cmaps = [color.Colormap([(0, 0, 0, 1), (1, 0, 0, 1)]),
+                               color.Colormap([(0, 0, 0, 1), (0, 1, 0, 1)]),
+                               color.Colormap([(0, 0, 0, 1), (0, 0, 1, 1)])]
+            for _chan_data, _chan_cmap in zip((_r_nan, _g_nan, _b_nan), _channel_cmaps):
+                _chan_volume = scene.visuals.Volume(_chan_data, clim=(0., 1.), cmap=_chan_cmap, method='mip',
+                                                      interpolation='linear', parent=view.scene)
+                # additive i.p.v. de standaard translucent GL-blendmodus: laat de 3 kanalen optellen i.p.v.
+                # elkaar (gedeeltelijk) af te dekken. depth_test=False om dezelfde reden als bij de kader-
+                # kubus hierboven (anders kan het ene kanaal het andere op dieptevolgorde wegdrukken i.p.v.
+                # ermee op te tellen).
+                _chan_volume.set_gl_state('additive', cull_face=False, depth_test=False)
+                _chan_volume.transform = scene.STTransform(
+                    translate=(x_axis[0], y_axis[0], z_axis[0]),
+                    scale=(grid_res_km, grid_res_km, z_res_km*vertical_exaggeration))
+                self._volume_3d_polrgb_visuals.append(_chan_volume)
+
+        # Puntenwolk-weergave (8 juli 2026, op Eriks verzoek: "een dichte pixelweergave waar ik doorheen kan
+        # kijken", i.p.v. MIP/translucent die last hebben van opstapelende (on)doorzichtigheid bij een dikke
+        # cel). In plaats van een aaneengesloten oppervlak/textuur (Volume) worden hier alleen LOSSE punten
+        # getekend, met echt LEGE ruimte ertussen -- dat is precies wat translucent niet kan bieden. Dit is
+        # bewust een COMPLEET APARTE visual (scene.visuals.Markers), niet een aanpassing van de bestaande,
+        # goedwerkende Volume/MIP/translucent-opzet hierboven, om geen enkel risico te lopen voor wat al
+        # goed werkt. Zie ook de eerdere notitie hierboven (Erik, 5 juli 2026) die dit destijds om een ANDERE
+        # reden (esthetiek, niet doorkijkbaarheid) bewust niet koos.
+        _pc_stride = max(1, int(self.volume3d_pointcloud_stride))
+        if is_polrgb:
+            # PolRGB heeft ECHTE per-voxel RGBA-kleuren (rgba_full), geen scalaire waarde+colormap -- dus
+            # geen volume_cmap.map(...)-stap zoals hieronder voor een gewoon product: de kleuren liggen al
+            # klaar en gaan rechtstreeks in face_color. Selectie op alpha>0 i.p.v. np.isfinite (rgba_full
+            # bevat geen NaN's, "geen data" is hier alpha=0 -- zie get_volume_grid_polrgb/hierboven).
+            _pc_sub_rgba = rgba_full[::_pc_stride, ::_pc_stride, ::_pc_stride, :]
+            _pc_iz, _pc_iy, _pc_ix = np.where(_pc_sub_rgba[..., 3] > 0.)
+        else:
+            _pc_sub = volume_data[::_pc_stride, ::_pc_stride, ::_pc_stride]
+            _pc_iz, _pc_iy, _pc_ix = np.where(np.isfinite(_pc_sub))
+        if len(_pc_iz) > 0:
+            # Terug naar volledige-resolutie-indices, om exact dezelfde wereld-coordinaten te berekenen als
+            # de transform van de Volume-visual hierboven gebruikt (zodat de puntenwolk perfect uitlijnt met
+            # hetzelfde kader/dezelfde tick-streepjes).
+            _pc_x = x_axis[0] + (_pc_ix*_pc_stride)*grid_res_km
+            _pc_y = y_axis[0] + (_pc_iy*_pc_stride)*grid_res_km
+            _pc_z = z_axis[0] + (_pc_iz*_pc_stride)*z_res_km*vertical_exaggeration
+            if is_polrgb:
+                _pc_colors = _pc_sub_rgba[_pc_iz, _pc_iy, _pc_ix, :]
+            else:
+                _pc_values = _pc_sub[_pc_iz, _pc_iy, _pc_ix]
+                _pc_t = np.clip((_pc_values-vmin)/(vmax-vmin), 0., 1.)**self.volume3d_gamma
+                _pc_colors = volume_cmap.map(_pc_t)
+            pointcloud = scene.visuals.Markers(parent=view.scene)
+            pointcloud.set_data(pos=np.column_stack([_pc_x, _pc_y, _pc_z]), face_color=_pc_colors,
+                                 size=self.volume3d_pointcloud_point_size, edge_width=0)
+        else:
+            pointcloud = scene.visuals.Markers(parent=view.scene) # Leeg, voor het geval er (na subsampling) geen enkel geldig punt overblijft.
+        # Standaard verborgen (alleen zichtbaar in de 'pointcloud'-weergavemodus, P-toets) -- ook bij PolRGB:
+        # de nieuwe additieve RGB-MIP-weergave hierboven is daar voortaan de standaard (P-toets wisselt ernaar
+        # terug naar de puntenwolk, met echte per-voxel-kleuren, zie toggle_3d_pointcloud verderop).
+        pointcloud.visible = False
+        self._volume_3d_pointcloud_visual = pointcloud
+
+        # The scene-coordinate bounding box (voor het draadframe-kader en het kompas hieronder) -- z is
+        # exaggerated (zie vertical_exaggeration), x/y niet.
+        z_scene_min = z_axis[0]
+        z_scene_max = z_axis[0]+(z_axis[-1]-z_axis[0])*vertical_exaggeration
+        box_corners_x = (x_axis[0], x_axis[-1])
+        box_corners_y = (y_axis[0], y_axis[-1])
+        box_corners_z = (z_scene_min, z_scene_max)
+
+        # Wireframe reference box around the reconstructed area (all 12 edges), so it's clear where the
+        # visible storm shape sits within/relative to the selected area -- on 5 July 2026 there was no
+        # spatial reference at all, making it impossible to tell scale, orientation, or whether the whole
+        # selected area or only part of it was being shown.
+        edges = []
+        for (x0, x1) in [box_corners_x]:
+            for y in box_corners_y:
+                for z in box_corners_z:
+                    edges.append([(x0, y, z), (x1, y, z)])
+        for (y0, y1) in [box_corners_y]:
+            for x in box_corners_x:
+                for z in box_corners_z:
+                    edges.append([(x, y0, z), (x, y1, z)])
+        for (z0, z1) in [box_corners_z]:
+            for x in box_corners_x:
+                for y in box_corners_y:
+                    edges.append([(x, y, z0), (x, y, z1)])
+        edge_points = np.array(edges).reshape(-1, 3)
+        # Lijst om alle kader-/tick-lijn-visuals te verzamelen (8 juli 2026, op Eriks verzoek: "de hele kubus-
+        # omlijning met tics en al aan/uit te zetten") -- apart van self._volume_3d_text_visuals (die alleen
+        # de TEKST-labels bevat), zodat de B-toets (zie verderop) alle lijn-elementen samen kan tonen/verbergen.
+        self._volume_3d_wireframe_visuals = []
+        # TEST (7 juli 2026): dekking verhoogd van 0.3 naar 0.8 -- de kader-kubus (volledige wireframe) was
+        # nauwelijks nog zichtbaar t.o.v. het origineel (zie screenshotvergelijking), vermoedelijk omdat deze
+        # nieuwere vispy-versie dunne, halfdoorzichtige lijnen anders combineert met de ondoorzichtige
+        # 3D-volumedata erachter. Test of een hogere dekking de kubus terugbrengt.
+        _box_line = scene.visuals.Line(pos=edge_points, connect='segments', color=(1, 1, 1, 0.8), width=1,
+                            parent=view.scene)
+        # FIX (7 juli 2026): dieptetest uitgeschakeld voor deze lijn. Zonder dit werd de kader-kubus door de
+        # ondoorzichtige 3D-volumedata verborgen zodra een deel van een rand "achter" de data lag vanuit het
+        # huidige camerastandpunt -- in het origineel (oudere vispy-versie) bleef de kubus altijd overal
+        # zichtbaar, dwars door de gekleurde vorm heen. depth_test=False herstelt dat gedrag.
+        _box_line.set_gl_state(depth_test=False)
+        self._volume_3d_wireframe_visuals.append(_box_line)
+
+        # Assenkader ALS KUBUS OM DE BUI HEEN (i.p.v. kruisende lijnen door het midden, zie feedback 5 juli
+        # 2026: "kan dat assenstelsel niet als kubus om de bui heen"): streepjes elke 10 km op de 4
+        # bodemranden van het kader zelf (rood=Noord-rand, groen=Oost-rand, blauw=Zuid-rand, geel=West-rand,
+        # zelfde kleurbetekenis als voorheen, nu alleen verplaatst naar de rand i.p.v. het midden), plus een
+        # apart hoogte-liniaal (wit, streepjes elke 2 km WERKELIJKE hoogte) op de verticale rand bij de
+        # zuidwesthoek van het kader.
+        tick_interval_km = self.volume3d_tick_interval_km # Instelbaar via Settings -> Miscellaneous.
+        tick_len = 0.02*horizontal_extent
+        text_visuals = [] # Alle tekst-objecten hierin verzamelen, zodat ze straks met 1 toets (T) samen
+        #aan/uit gezet kunnen worden -- zie de key_press-koppeling verderop.
+        edge_specs = [ # (naam, punt1, punt2, kleur) -- de 4 bodemranden van het kader.
+            ('Zuid', (box_corners_x[0], box_corners_y[0]), (box_corners_x[1], box_corners_y[0]), (0, 0.4, 1)),
+            ('Noord', (box_corners_x[0], box_corners_y[1]), (box_corners_x[1], box_corners_y[1]), (1, 0, 0)),
+            ('West', (box_corners_x[0], box_corners_y[0]), (box_corners_x[0], box_corners_y[1]), (1, 1, 0)),
+            ('Oost', (box_corners_x[1], box_corners_y[0]), (box_corners_x[1], box_corners_y[1]), (0, 1, 0)),
+        ]
+        for name, (x0, y0), (x1, y1), rgb in edge_specs:
+            edge_len_km = float(np.hypot(x1-x0, y1-y0))
+            unit = np.array([x1-x0, y1-y0])/edge_len_km if edge_len_km > 0 else np.array([0., 0.])
+            perp = np.array([-unit[1], unit[0]])
+            n_ticks = int(edge_len_km//tick_interval_km)
+            tick_segments = []
+            for k in range(n_ticks+1):
+                pt = np.array([x0, y0])+unit*min(k*tick_interval_km, edge_len_km)
+                tick_segments.append([(*(pt-perp*tick_len/2), z_scene_min), (*(pt+perp*tick_len/2), z_scene_min)])
+                if k > 0 and k % 2 == 0: # Alleen bij elk 2e streepje een cijfer (i.p.v. elk streepje) --
+                    #minder drukte, en k=0 is toch de hoek zelf (0 km).
+                    tick_label_pos = pt+perp*tick_len*1.5
+                    text_visuals.append(scene.visuals.Text(f"{int(k*tick_interval_km)}",
+                                         pos=(*tick_label_pos, z_scene_min), color=rgb, font_size=AXIS_LABEL_FONT_SIZE,
+                                         parent=view.scene))
+            _tick_line = scene.visuals.Line(pos=np.array(tick_segments).reshape(-1, 3), connect='segments',
+                                color=rgb, width=2, parent=view.scene)
+            _tick_line.set_gl_state(depth_test=False) # Zelfde reden als bij de kader-kubus hierboven.
+            self._volume_3d_wireframe_visuals.append(_tick_line)
+            # Label in het MIDDEN van de rand (i.p.v. aan het eind) -- bij het eind kwamen "Noord" en "Oost"
+            # toevallig in dezelfde hoek samen (ze delen de NO-hoek van het kader), waardoor de tekst over
+            # elkaar heen viel (zie screenshot 5 juli 2026). Vanuit het midden van elke rand, met een klein
+            # stukje naar buiten (weg van het midden van het kader), overlapt niets meer.
+            edge_mid = np.array([x0, y0])+unit*edge_len_km/2.
+            outward = edge_mid-np.array([box_center_x, box_center_y])
+            outward_len = np.linalg.norm(outward)
+            outward_unit = outward/outward_len if outward_len > 0 else perp
+            label_pos = edge_mid+outward_unit*0.05*horizontal_extent
+            text_visuals.append(scene.visuals.Text(f"{name} {edge_len_km:.0f} km", pos=(*label_pos, z_scene_min),
+                                 color=rgb, font_size=AXIS_LABEL_FONT_SIZE, bold=True, parent=view.scene))
+
+        # Hoogte-liniaal: streepjes elke 2 km WERKELIJKE hoogte (dus vertaald door de vertical_exaggeration
+        # heen naar scherm-coordinaten), op de verticale rand bij de zuidwesthoek (x0, y0) van het kader.
+        height_tick_interval_km = self.volume3d_height_tick_interval_km # Instelbaar via Settings -> Miscellaneous.
+        n_height_ticks = int((z_axis[-1]-z_axis[0])//height_tick_interval_km)
+        height_tick_segments = []
+        corner_x, corner_y = box_corners_x[0], box_corners_y[0]
+        for k in range(n_height_ticks+1):
+            real_height_km = min(k*height_tick_interval_km, z_axis[-1]-z_axis[0])
+            z_scene = z_axis[0]+real_height_km*vertical_exaggeration
+            height_tick_segments.append([(corner_x-tick_len/2, corner_y, z_scene), (corner_x+tick_len/2, corner_y, z_scene)])
+            if k > 0 and k % 2 == 0: # Alleen bij elk 2e streepje een cijfer -- zie toelichting bij de
+                #bodemranden hierboven.
+                text_visuals.append(scene.visuals.Text(f"{real_height_km:.0f}",
+                                     pos=(corner_x-tick_len*2, corner_y, z_scene), color='white',
+                                     font_size=AXIS_LABEL_FONT_SIZE, parent=view.scene))
+        _height_ticks_line = scene.visuals.Line(pos=np.array(height_tick_segments).reshape(-1, 3), connect='segments',
+                            color=(1, 1, 1, 0.9), width=2, parent=view.scene)
+        _height_ticks_line.set_gl_state(depth_test=False) # Zelfde reden als bij de kader-kubus hierboven.
+        self._volume_3d_wireframe_visuals.append(_height_ticks_line)
+        # De verticale rand zelf ook tekenen, als duidelijke "liniaal-staaf" waarlangs de streepjes lopen.
+        _height_bar_line = scene.visuals.Line(pos=np.array([[corner_x, corner_y, z_scene_min], [corner_x, corner_y, z_scene_max]]),
+                            color=(1, 1, 1, 0.9), width=2, parent=view.scene)
+        _height_bar_line.set_gl_state(depth_test=False) # Zelfde reden als bij de kader-kubus hierboven.
+        self._volume_3d_wireframe_visuals.append(_height_bar_line)
+        text_visuals.append(scene.visuals.Text(f"hoogte {z_axis[-1]-z_axis[0]:.1f} km",
+                             pos=(corner_x, corner_y, z_scene_max), color='white', font_size=AXIS_LABEL_FONT_SIZE,
+                             bold=True, parent=view.scene))
+
+        # Positiemarkers (7 juli 2026): elke marker die je via het rechtermuisknop-menu op de kaart hebt gezet
+        # ("Set position marker: Coordinate input", zie set_marker_coordinates()) en die binnen het huidige
+        # 3D-kader valt, wordt hier als een verticale lijn getekend, van de bodem tot de bovenkant van het
+        # kader -- zodat je in de 3D-weergave meteen ziet waar die positie zich bevindt t.o.v. de storm. Cyaan
+        # gekozen om duidelijk te onderscheiden van de rood/groen/blauw/gele kompasranden. Het optionele label
+        # (in te stellen in datzelfde scherm) wordt, indien ingevuld, bovenaan de lijn getoond.
+        for _marker_i, _marker_pos in enumerate(self.pos_markers_positions):
+            _mx, _my = float(_marker_pos[0]), float(_marker_pos[1])
+            if x_axis[0] <= _mx <= x_axis[-1] and y_axis[0] <= _my <= y_axis[-1]:
+                _marker_line = scene.visuals.Line(pos=np.array([[_mx, _my, z_scene_min], [_mx, _my, z_scene_max]]),
+                                    color=(0, 1, 1, 0.9), width=2, parent=view.scene)
+                _marker_line.set_gl_state(depth_test=False) # Zelfde reden als bij de kader-kubus hierboven.
+                _marker_label = self.pos_markers_labels[_marker_i] if _marker_i < len(self.pos_markers_labels) else ''
+                if _marker_label:
+                    text_visuals.append(scene.visuals.Text(_marker_label, pos=(_mx, _my, z_scene_max),
+                                         color='cyan', font_size=AXIS_LABEL_FONT_SIZE, bold=True, parent=view.scene))
+
+        # Kleurschaal (7 juli 2026, definitieve aanpak): rechtstreeks het CSV-kleurtabel-bestand zelf inlezen
+        # dat voor dit product actief staat (self.colortables_dirs_filenames[product]) i.p.v. via cm1/cm2 --
+        # die laatste twee bleken allebei net niet de exacte, zichtbare kleuren/waarden te geven die Erik
+        # verwachtte (2 mislukte pogingen, 7 juli 2026). Rechtstreeks uit het bronbestand lezen is
+        # onafhankelijk van die eerdere verwarring, en werkt bovendien automatisch correct voor ELKE
+        # kleurtabel die je ooit via Settings -> Color tables instelt (dus ook bij bv. de ESSL-tabellen).
+        def _parse_colortable_csv(filepath):
+            values, colors, step = [], [], None
+            with open(filepath) as f:
+                for line in f:
+                    line = line.strip()
+                    if line.lower().startswith('step:'):
+                        try: step = float(line.split(':')[1].strip())
+                        except Exception: pass
+                        continue
+                    if not line or ':' in line:
+                        continue # Lege regels en andere header-regels (bv. "Units: m/s") overslaan.
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) < 4:
+                        continue
+                    try:
+                        v = float(parts[0])
+                        r, g, b = float(parts[1])/255., float(parts[2])/255., float(parts[3])/255.
+                    except ValueError:
+                        continue
+                    values.append(v); colors.append((r, g, b, 1.0))
+            return np.array(values), np.array(colors), step
+
+        # Titel bovenaan (7 juli 2026, op Eriks verzoek): scan-datum/tijd wit, gecentreerd, in het vaste
+        # titel-paneel dat hierboven bij canvas/view is aangemaakt -- blijft daardoor altijd op zijn plek
+        # staan, ongeacht hoe de 3D-weergave zelf gedraaid/gekanteld/gezoomd wordt.
+        _title_name = gv.productnames_cmapstab.get(product, product.upper()) if hasattr(gv, 'productnames_cmapstab') else product.upper()
+        # De weergavemethode (MIP/translucent) wordt in de titel getoond en LIVE bijgewerkt wanneer je op de
+        # M-toets drukt (zie toggle_3d_render_method verderop, die self._volume_3d_method_text.text aanpast) --
+        # zonder dit was nergens te zien in welke van de twee modi je momenteel zat (Erik, 7 juli 2026).
+        self._volume_3d_method_text = scene.visuals.Text(
+            f"{_title_name} {scandatetime_str}",
+            pos=(300, 15), color='white', font_size=14, bold=True, parent=title_view.scene)
+
+        if is_polrgb:
+            # PolRGB heeft geen kleurentabel (self.colortables_dirs_filenames['g'] is slechts een ongebruikte
+            # placeholder, zie hierboven), dus geen zinvolle ENKELE kleurschaal-legenda zoals bij een gewoon
+            # product. In plaats daarvan: 3 losse balkjes (R=Z, G=CC, B=ZDR), zelfde principe als de 2D-
+            # PolRGB-legenda (PlottingPanels.draw_polrgb_legend/polrgb_channel_colors in nlr_plotting.py) --
+            # zwart bij het kanaal-minimum, volle kanaalkleur bij het kanaal-maximum, Z met dezelfde
+            # Z_GAMMA-correctie als de echte data (zie get_volume_grid_polrgb) zodat de balk hetzelfde
+            # niet-lineaire verloop toont als de puntenwolk zelf.
+            _params = self.polrgb_params
+            _fallback = {'Z_MIN':-10.0,'Z_MAX':60.0,'CC_MIN':70.0,'CC_MAX':100.0,'ZDR_MIN':0.0,'ZDR_MAX':3.0,'Z_GAMMA':2.0}
+            def _pp(key):
+                return _params[key] if key in _params else _fallback[key]
+            _bar_specs = [((1.,0.,0.), _pp('Z_MIN'), _pp('Z_MAX'), 'Z', 'dBZ', max(_pp('Z_GAMMA'), 0.1)),
+                          ((0.,1.,0.), _pp('CC_MIN'), _pp('CC_MAX'), u'\u03c1HV', '%', 1.0),
+                          ((0.,0.,1.), _pp('ZDR_MIN'), _pp('ZDR_MAX'), 'ZDR', 'dB', 1.0)]
+            _n_rows = 120 # Per balk (i.p.v. 256 voor 1 enkele balk hierboven) -- 3 balkjes moeten samen in
+            #hetzelfde smalle, vaste legend_view-paneel passen.
+            _bar_width = 22
+            _bar_gap = 55 # Verticale ruimte tussen 2 balkjes, voor de min/max-tekst + kanaallabel ertussen.
+            _y = 0
+            for _color, _vmin, _vmax, _label, _unit, _gamma in _bar_specs:
+                _t = np.linspace(0., 1., _n_rows) ** _gamma
+                _img = np.ones((_n_rows, 1, 4), dtype='float32')
+                for _ch in range(3):
+                    _img[:, 0, _ch] = _t*_color[_ch]
+                _img_visual = scene.visuals.Image(_img, parent=legend_view.scene)
+                _img_visual.transform = scene.STTransform(translate=(0, _y), scale=(_bar_width, 1))
+                scene.visuals.Text(f"{_label} ({_unit})", pos=(_bar_width/2, _y-16), color='white',
+                                    font_size=10, bold=True, parent=legend_view.scene)
+                scene.visuals.Text(str(ft.rifdot0(ft.rndec(_vmax, 2))), pos=(_bar_width+6, _y),
+                                    color='white', font_size=9, anchor_x='left', parent=legend_view.scene)
+                scene.visuals.Text(str(ft.rifdot0(ft.rndec(_vmin, 2))), pos=(_bar_width+6, _y+_n_rows),
+                                    color='white', font_size=9, anchor_x='left', parent=legend_view.scene)
+                _y += _n_rows+_bar_gap
+            legend_view.camera.rect = (-70, -30, _bar_width+140, _y+30)
+        else:
+            _ct_path = self.colortables_dirs_filenames[product]
+            _ct_values, _ct_colors, _ct_step = _parse_colortable_csv(_ct_path)
+            _legend_vmax, _legend_vmin = float(_ct_values[-1]), float(_ct_values[0])
+
+            _n_cbar_rows = 256
+            _cbar_bar_width = 22 # In dezelfde lokale eenheden als _n_cbar_rows (nu net als bij een afbeelding:
+            #1 "pixel" breed voor schaling); bepaalt puur de zichtbare dikte van de balk in de legenda.
+            # Rij 0 = bovenkant van de afbeelding = hoogste waarde (vmax); laatste rij = laagste waarde (vmin) --
+            # dat komt overeen met hoe de bestaande 2D-kleurenbalken (zie de bijgevoegde screenshots) het tonen:
+            # hoge waarden boven, lage waarden onder.
+            # OMGEDRAAID (7 juli 2026): bleek dat rij 0 in dit legend_view/PanZoomCamera-paneel juist ONDERAAN
+            # het scherm terechtkomt (y neemt hier kennelijk omhoog toe, net als bij een gewone Cartesische as,
+            # NIET zoals bij een standaard afbeelding waar rij 0 boven zou moeten staan) -- vandaar dat -20/-60
+            # eerst boven i.p.v. onder stond. Nu vmin/vmax verwisseld t.o.v. de vorige versie.
+            _row_values = np.linspace(_legend_vmin, _legend_vmax, _n_cbar_rows)
+            _cbar_img_data = np.ones((_n_cbar_rows, 1, 4), dtype='float32')
+            for _ch in range(3):
+                _cbar_img_data[:, 0, _ch] = np.interp(_row_values, _ct_values, _ct_colors[:, _ch])
+            _cbar_image = scene.visuals.Image(_cbar_img_data, parent=legend_view.scene)
+            _cbar_image.transform = scene.STTransform(scale=(_cbar_bar_width, 1))
+
+            _cbar_unit = self.pb.productunits.get(product, '')
+            _cbar_name = gv.productnames_cmapstab.get(product, product.upper()) if hasattr(gv, 'productnames_cmapstab') else product.upper()
+            scene.visuals.Text(f"{_cbar_unit}" if _cbar_unit else _cbar_name, pos=(_cbar_bar_width/2, -20),
+                                color='white', font_size=10, bold=True, parent=legend_view.scene)
+            scene.visuals.Text(f"{_cbar_name}", pos=(_cbar_bar_width/2, _n_cbar_rows+20),
+                                color='white', font_size=10, bold=True, parent=legend_view.scene)
+            # Tick-stappen rechtstreeks uit de "Step:"-regel in het bestand zelf (bv. 10 voor Z, 15 voor V) --
+            # zelfde regelmatige tick-afstand als in de bijgevoegde referentie-schermafbeeldingen. Als het
+            # bestand geen Step-regel bevat, val terug op 5 gelijk verdeelde tick-punten.
+            if _ct_step:
+                _first_tick = np.ceil(_legend_vmin/_ct_step)*_ct_step
+                _tick_values = np.arange(_first_tick, _legend_vmax+1e-6, _ct_step)
+            else:
+                _tick_values = _legend_vmin+np.array([0., 0.25, 0.5, 0.75, 1.])*(_legend_vmax-_legend_vmin)
+            for _tick_value in _tick_values:
+                _tick_text = str(ft.rifdot0(ft.rndec(_tick_value, 3)))
+                _tick_frac = 0. if _legend_vmax == _legend_vmin else (_tick_value-_legend_vmin)/(_legend_vmax-_legend_vmin)
+                _tick_row = _tick_frac*_n_cbar_rows
+                scene.visuals.Text(_tick_text, pos=(_cbar_bar_width+18, _tick_row), color='white',
+                                    font_size=9, anchor_x='left', parent=legend_view.scene)
+            # Cameragebied ruim rond de balk (marge links/rechts voor tick-tekst, boven/onder voor de
+            # eenheid/product-labels) -- vast (interactive=False hierboven), dus dit hoeft maar 1x goed te staan.
+            # Marge flink verruimd (7 juli 2026): "Reflectivity" werd links afgeknipt (het woord is te breed voor
+            # het gecentreerde label t.o.v. de smalle 22-brede balk) -- ruimere marge geeft de gecentreerde
+            # tekst voldoende plek, ten koste van een ietsje kleinere balk/tekst binnen hetzelfde vaste
+            # paneel (legend_view.width_max), wat geen probleem is.
+            legend_view.camera.rect = (-70, -40, _cbar_bar_width+140, _n_cbar_rows+80)
+
+
+        # self._volume_3d_text_visuals wordt bij ELKE (her)tekening vervangen door de nieuwste lijst, en de
+        # toets-koppeling verwijst naar self._volume_3d_text_visuals (niet naar een lokale closure-variabele)
+        # -- zo blijft de T-toets ook na een live-refresh de JUISTE (nieuwste) tekst-objecten aan/uit zetten,
+        # zonder de key_press-handler telkens opnieuw (en dus meerdere keren tegelijk) te moeten koppelen.
+        self._volume_3d_text_visuals = text_visuals
+
+        # BUGFIX (10 juli 2026): wireframe/tekst-visuals worden hierboven bij ELKE (her)tekening helemaal
+        # opnieuw aangemaakt (dus standaard weer zichtbaar), ongeacht een eerder met B/T ingestelde
+        # combinatie. self._volume3d_wireframe_visible/_volume3d_text_visible (default True bij een
+        # gloednieuw venster) worden hier toegepast zodat die instelling standhoudt over herbouwen heen --
+        # essentieel voor de video-export (self._run_volume_3d_export), die _render_volume_3d_scene meerdere
+        # keren achter elkaar aanroept.
+        if not hasattr(self, '_volume3d_wireframe_visible'):
+            self._volume3d_wireframe_visible = True
+        if not hasattr(self, '_volume3d_text_visible'):
+            self._volume3d_text_visible = True
+        for wv in self._volume_3d_wireframe_visuals:
+            wv.visible = self._volume3d_wireframe_visible
+        for tv in self._volume_3d_text_visuals:
+            tv.visible = self._volume3d_text_visible
+
+        # Diagnose (15 juli 2026, op Eriks vraag "welke elevatiehoek is duplicate, dat kan ik zelf nooit
+        # vinden"): welke scan-indices van het huidige radar/dataset binnen 1 volume vaker dan 1x worden
+        # afgetast (zie de toelichting bij step_3d_time hierboven -- dat verklaart het "om en om"-patroon
+        # bij tijdnavigatie), en of de nu in dit paneel geselecteerde scan daar toevallig bij hoort. Puur
+        # informatief (console + korte statusbalk-melding), verandert niets aan de rendering zelf.
+        try:
+            _dup_scan_idx = sorted(i for i, jj in self.dsg.scannumbers_all['z'].items() if len(jj) > 1)
+            _current_scan = self.crd.scans[j]
+            if _dup_scan_idx:
+                _dup_angles = {}
+                for i in _dup_scan_idx:
+                    try:
+                        _dup_angles[i] = round(float(self.dsg.scanangles_all['z'][i]), 2)
+                    except Exception:
+                        _dup_angles[i] = '?'
+                _current_flag = " <- DIT IS DE NU GESELECTEERDE SCAN" if _current_scan in _dup_scan_idx else ""
+                print(f"[3D viewer] Elevatiehoeken met duplicaten binnen 1 volume (scan-index: hoek in graden): "
+                      f"{_dup_angles}. Huidige scan-index in dit paneel: {_current_scan}{_current_flag}")
+                if _current_scan in _dup_scan_idx:
+                    self.set_textbar(f"Let op: huidige elevatiehoek ({_dup_angles.get(_current_scan, '?')} graden) "
+                                      f"heeft duplicaten binnen 1 volume -- tijdnavigatie kan daardoor soms een "
+                                      f"deel-stap i.p.v. een vol nieuw volume geven. Zie console voor alternatieven.",
+                                      'orange', 4)
+            else:
+                print("[3D viewer] Geen elevatiehoeken met duplicaten gevonden voor dit radar/dataset.")
+        except Exception as _e_dup:
+            print(f"[3D viewer] Kon duplicate-scans niet bepalen: {_e_dup}")
+
+        if not reuse:
+            # Sneltoets T (binnen dit 3D-venster): alle tekstlabels in 1 keer aan/uit -- op verzoek van Erik,
+            # 5 juli 2026. Alleen bij het aanmaken van een NIEUW venster koppelen, niet bij elke live-
+            # refresh, anders zou dezelfde toets na een paar instellingswijzigingen meerdere keren per druk
+            # toggelen.
+            def toggle_3d_labels(event):
+                if event.key is not None and event.key.name == 'T':
+                    # BUGFIX (10 juli 2026, zie ook toggle_3d_wireframe hierboven): zelfde reden -- de vlag
+                    # self._volume3d_text_visible wordt apart onthouden en na elke herbouw toegepast, zodat
+                    # T-alleen (tekst uit, kubus aan) ook standhoudt tijdens de video-export.
+                    new_visible = not self._volume_3d_text_visuals[0].visible if self._volume_3d_text_visuals else True
+                    self._volume3d_text_visible = new_visible
+                    for tv in self._volume_3d_text_visuals:
+                        tv.visible = new_visible
+                    canvas.update()
+            canvas.events.key_press.connect(toggle_3d_labels)
+
+            # Sneltoets M (binnen dit 3D-venster): wissel tussen 'mip' (huidige, scherpe standaard) en
+            # 'translucent' (semi-transparant, laat eventuele interne structuur -- bv. een zwakke-echo-koker
+            # (BWER) -- er vaag doorheen zien, ten koste van scherpte). Op verzoek van Erik, 7 juli 2026, om
+            # zonder risico voor de standaardweergave (MIP blijft de default) te kunnen experimenteren.
+            # Dezelfde reden als bij toggle_3d_labels hierboven om ALLEEN bij een nieuw venster te koppelen
+            # (verwijst naar self._volume_3d_visual, niet naar de lokale closure-variabele 'volume').
+            def toggle_3d_render_method(event):
+                if event.key is not None and event.key.name == 'M':
+                    # PolRGB (product 'g') heeft geen aparte translucent-variant: de additieve RGB-MIP-
+                    # weergave hierboven (3 losse kanaal-volumes, additief samengesteld) is zelf al de
+                    # PolRGB-tegenhanger van MIP. Een losse translucent-versie is (nog) niet gebouwd -- P
+                    # blijft het enige alternatief (puntenwolk, met echte per-voxel-kleuren i.p.v. de
+                    # per-kanaal-benadering van de additieve MIP-weergave).
+                    if getattr(self, '_volume3d_rect_params', None) and self._volume3d_rect_params[0] == 'g':
+                        self.set_textbar("PolRGB heeft geen aparte translucent-modus (wel een puntenwolk-"
+                                          "alternatief met echte kleuren, zie P).", 'orange', 3)
+                        return
+                    current = self._volume_3d_visual.method
+                    self._volume_3d_visual.method = 'translucent' if current == 'mip' else 'mip'
+                    new_method = self._volume_3d_visual.method
+                    self.set_textbar(f"3D-weergavemethode: {new_method}", 'green', 3)
+                    # Modus-indicatie live bijwerken in de Windows-titelbalk (8 juli 2026, BIJGESTELD op Eriks
+                    # verzoek: geen tekst meer in de 3D-scene zelf behalve de titel -- dus [MIP]/[TRANSLUCENT]
+                    # staat nu in canvas.title i.p.v. in een aparte tekst-visual binnen de scene).
+                    old_title = canvas.title
+                    canvas.title = old_title[:old_title.index('[')] + f"[{new_method.upper()}]" + old_title[old_title.index(']')+1:]
+                    canvas.update()
+            canvas.events.key_press.connect(toggle_3d_render_method)
+
+            # Sneltoets P (8 juli 2026): wisselt naar/van de puntenwolk-weergave (zie hierboven bij
+            # canvas/view voor de opbouw). Losse, aparte toets t.o.v. M (i.p.v. M laten rouleren door 3
+            # standen) zodat MIP/translucent zelf volledig ongewijzigd blijven werken zoals altijd.
+            def toggle_3d_pointcloud(event):
+                if event.key is not None and event.key.name == 'P':
+                    is_g = bool(getattr(self, '_volume3d_rect_params', None)) and self._volume3d_rect_params[0] == 'g'
+                    pc = self._volume_3d_pointcloud_visual
+                    pc.visible = not pc.visible
+                    if is_g:
+                        # Bij PolRGB wisselt P tussen de additieve RGB-MIP-weergave (3 kanaal-volumes, zie
+                        # hierboven) en de puntenwolk (echte per-voxel-kleuren) -- geen enkel scalair
+                        # Volume-object om aan/uit te zetten zoals bij een gewoon product.
+                        for _v in self._volume_3d_polrgb_visuals:
+                            _v.visible = not pc.visible
+                        new_mode = 'POINTCLOUD' if pc.visible else 'RGB-MIP'
+                    else:
+                        self._volume_3d_visual.visible = not pc.visible
+                        new_mode = 'POINTCLOUD' if pc.visible else self._volume_3d_visual.method.upper()
+                    self.set_textbar(f"3D-weergavemethode: {new_mode.lower()}", 'green', 3)
+                    old_title = canvas.title
+                    canvas.title = old_title[:old_title.index('[')] + f"[{new_mode}]" + old_title[old_title.index(']')+1:]
+                    canvas.update()
+            canvas.events.key_press.connect(toggle_3d_pointcloud)
+
+            # Sneltoets H (8 juli 2026, BIJGESTELD op Eriks verzoek: "geen tekst meer in de 3D-weergave zelf,
+            # behalve de titel -- de rest in een apart schermpje"): opent een ECHT, los Qt-venster met de
+            # toetsen-uitleg, i.p.v. tekst binnen de vispy-scene zelf. Sluit je het 3D-venster, dan sluit dit
+            # hulpschermpje (als kind-venster) automatisch mee.
+            def show_3d_help(event):
+                if event.key is not None and event.key.name == 'H':
+                    if getattr(self, '_volume_3d_help_dialog', None) is not None:
+                        try:
+                            self._volume_3d_help_dialog.close()
+                        except Exception:
+                            pass
+                        self._volume_3d_help_dialog = None
+                        return
+                    dialog = QWidget()
+                    dialog.setWindowTitle('NLradar 3D - toetsenbediening')
+                    layout = QVBoxLayout()
+                    for line in (
+                        'T       labels (windrichtingen, tick-cijfers, hoogte) aan/uit',
+                        'M       wisselen tussen MIP en translucent',
+                        'R       camera resetten naar de startpositie',
+                        'P       puntenwolk-weergave aan/uit',
+                        'H       dit schermpje tonen/verbergen',
+                        'B       kader-kubus + tick-streepjes + hoogte-liniaal + labels aan/uit',
+                        'S       huidige 3D-weergave opslaan als PNG-schermafbeelding',
+                        'J       video exporteren (tijd + camerarotatie, instelbaar)',
+                        'Rechts  1 scan vooruit in de tijd (3D wordt herbouwd)',
+                        'Links   1 scan terug in de tijd (3D wordt herbouwd)',
+                        'A       automatisch met de tijd mee laten lopen aan/uit',
+                        '',
+                        'Cyaan verticale lijn = positiemarker (rechtermuisknop op de kaart)',
+                    ):
+                        layout.addWidget(QLabel(line))
+                    dialog.setLayout(layout)
+                    dialog.resize(dialog.sizeHint())
+                    dialog.show()
+                    self._volume_3d_help_dialog = dialog
+            canvas.events.key_press.connect(show_3d_help)
+
+            # Sneltoets B (8 juli 2026, op Eriks verzoek: "de hele kubus-omlijning met tics en al aan/uit
+            # zetten"): toont/verbergt in een keer alle kader-/tick-lijn-elementen (self._volume_3d_
+            # wireframe_visuals, hierboven verzameld) -- los van de T-toets, die alleen de TEKST-labels
+            # (windrichtingen, tick-cijfers, hoogte) raakt, niet de lijnen zelf.
+            def toggle_3d_wireframe(event):
+                if event.key is not None and event.key.name == 'B':
+                    # Bijgesteld (8 juli 2026, Erik: "de hoogte en windrichtingen + getallen moeten ook
+                    # tegelijk aan/uit"): B verbergt/toont nu zowel de lijn-elementen (kader-kubus, tick-
+                    # streepjes, hoogte-liniaal) ALS de bijbehorende tekst-labels (windrichtingen, tick-
+                    # cijfers, hoogte) in een keer -- i.p.v. dat je daarvoor apart ook nog T nodig had.
+                    #
+                    # BUGFIX (10 juli 2026, gevonden tijdens testen van de J-video-export): self._volume_3d_
+                    # wireframe_visuals wordt bij ELKE (her)tekening HELEMAAL OPNIEUW aangemaakt (zie
+                    # hierboven), dus zonder onthouden vlag verloor een eerder met B/T ingestelde combinatie
+                    # (bv. "kubus uit, tics aan") zich na elke tijdstap tijdens de video-export -- de kubus
+                    # kwam dan steeds terug in de opgeslagen beeldjes. self._volume3d_wireframe_visible wordt
+                    # daarom nu apart onthouden en na elke herbouw toegepast (zie verderop bij text_visuals).
+                    new_visible = not self._volume_3d_wireframe_visuals[0].visible if self._volume_3d_wireframe_visuals else True
+                    self._volume3d_wireframe_visible = new_visible
+                    self._volume3d_text_visible = new_visible
+                    for wv in self._volume_3d_wireframe_visuals:
+                        wv.visible = new_visible
+                    for tv in self._volume_3d_text_visuals:
+                        tv.visible = new_visible
+                    canvas.update()
+            canvas.events.key_press.connect(toggle_3d_wireframe)
+
+            # Sneltoets S (8 juli 2026, op Eriks verzoek): slaat de HUIDIGE 3D-weergave (inclusief legenda,
+            # titel, positiemarkers -- alles wat je op dat moment ziet) op als PNG-bestand. Gebruikt vispy's
+            # eigen canvas.render() (pakt precies de inhoud van dit ene vispy-canvas, niet een schermafbeelding
+            # van je hele beeldscherm/bureaublad), en PIL.Image om weg te schrijven -- beide al elders in dit
+            # bestand gebruikt voor de gewone (2D) "sla op als afbeelding"-functie, dus geen nieuwe dependency.
+            def save_3d_screenshot(event):
+                if event.key is not None and event.key.name == 'S':
+                    # BIJGESTELD (8 juli 2026, op Eriks verzoek: "krijg ik dan eerst nog een keuze waar ik het
+                    # wil opslaan?") -- toont nu een echt "Opslaan als"-dialoogvenster (hetzelfde patroon als
+                    # elders in dit bestand, bv. bij het kiezen van een kleurtabel-bestand), i.p.v. altijd
+                    # automatisch naar een vaste map te schrijven.
+                    try:
+                        _dt_str = str(scandatetime).replace(':', '').replace(' ', '_').replace('-', '')
+                        _default_dir = os.path.join(gv.userdir, 'Output_files', '3D_screenshots')
+                        os.makedirs(_default_dir, exist_ok=True)
+                        _default_name = f"3D_{product}_{_dt_str}_{pytime.strftime('%H%M%S')}.png"
+                        _default_path = os.path.join(_default_dir, _default_name)
+                        filepath = str(QFileDialog.getSaveFileName(None, 'Sla de 3D-weergave op als:',
+                                       _default_path, filter='*.png', options=QFileDialog.DontUseNativeDialog)[0])
+                        if not filepath:
+                            return # Geannuleerd
+                        if not filepath.lower().endswith('.png'):
+                            filepath += '.png'
+                        img_arr = canvas.render()
+                        Image.fromarray(img_arr).save(filepath)
+                        self.set_textbar(f"3D-schermafbeelding opgeslagen: {filepath}", 'green', 4)
+                    except Exception as _e:
+                        self.set_textbar(f"Opslaan 3D-schermafbeelding mislukt: {_e}", 'red', 4)
+            canvas.events.key_press.connect(save_3d_screenshot)
+
+
+
+            # Sneltoets R (binnen dit 3D-venster, 7 juli 2026, BIJGESTELD): zet de camera terug naar de
+            # startpositie. Eerdere versie stelde alleen elevatie/azimut/fov bij op de BESTAANDE camera, maar
+            # dat bleek onvoldoende -- Erik liep na verloop van tijd tegen een "kan niet meer voor-/achterover
+            # kantelen"-probleem aan dat R zo niet oploste, terwijl het volledig sluiten en opnieuw openen van
+            # het venster (waarbij een HELE NIEUWE camera wordt aangemaakt) het wel oploste. Dat wijst erop
+            # dat TurntableCamera intern meer status bijhoudt dan alleen die drie zichtbare eigenschappen, die
+            # tijdens langdurig slepen kennelijk kan "vastlopen". Nu maakt R daarom, net als bij het openen
+            # van een vers venster, een VOLLEDIG NIEUWE camera aan (i.p.v. de bestaande bij te stellen) --
+            # inclusief het opnieuw toepassen van de centrering, die anders verloren zou gaan.
+            def reset_3d_camera(event):
+                if event.key is not None and event.key.name == 'R':
+                    view.camera = 'turntable'
+                    view.camera.fov = 45
+                    view.camera.azimuth = 0
+                    view.camera.elevation = 65
+                    view.camera.center = (box_center_x, box_center_y, (box_corners_z[0]+box_corners_z[1])/2.)
+                    view.camera.set_range()
+                    self.set_textbar("3D-camera volledig opnieuw aangemaakt en teruggezet naar startpositie", 'green', 3)
+                    canvas.update()
+            canvas.events.key_press.connect(reset_3d_camera)
+
+            # Sneltoets J (10 juli 2026, op Eriks verzoek; eerst V, toen E overwogen, maar beide bleken al
+            # globale product-sneltoetsen -- Z/A/M/H/R/E/L/V/UV/S/W/P/K/C/D/X/Q/T/Y/I/G zijn allemaal al
+            # bezet via gv.products_all in nlr_globalvars.py. J is geverifieerd volledig vrij, zowel globaal
+            # als binnen dit 3D-venster): opent een instellingendialoog voor het exporteren van een VIDEO
+            # (i.p.v. een losse PNG zoals de S-toets), waarin zowel de tijd doorloopt (elke volgende
+            # radarscan) als de camera een instelbare hoek verder draait. Zie
+            # export_volume_3d_video/_run_volume_3d_export hieronder voor de daadwerkelijke implementatie.
+            # Alleen bij een NIEUW venster koppelen, zelfde reden als bij T/M/P/H/B/S/R hierboven.
+            def export_3d_video_key(event):
+                if event.key is not None and event.key.name == 'J':
+                    self.export_volume_3d_video()
+            canvas.events.key_press.connect(export_3d_video_key)
+
+            # Sneltoetsen Rechts/Links en A (15 juli 2026, op Eriks verzoek "kan ik de 3D met de tijd mee
+            # laten lopen?"): Rechts/Links stapt de 3D-scene 1 scan vooruit/achteruit in de tijd, A schakelt
+            # een doorlopende "automatisch meelopen"-modus aan/uit. Hergebruikt BEWUST dezelfde aanpak als
+            # de al bestaande (nog niet door Erik bevestigde, zie LET OP bij _run_volume_3d_export hieronder)
+            # J-video-export: self.crd.process_keyboardinput(1,0,0,'0',None,False) (=pijltje-rechts) om een
+            # stap te zetten, en _wait_for_new_scandatetime om te wachten tot die nieuwe scan daadwerkelijk
+            # is ingeladen voordat de 3D-scene wordt herbouwd -- dus hetzelfde risico als daar staat
+            # beschreven (ongeteste aanname over hoe/wanneer nieuwe scandata precies beschikbaar komt).
+            # Rechts/A zijn door Erik BEVESTIGD werkend; het achteruit-gedeelte (Links, -1) is een aanname
+            # op basis daarvan, symmetrisch aan Rechts, maar nooit apart getest.
+            def step_3d_time(direction):
+                if getattr(self, '_volume3d_stepping', False):
+                    return False  # Voorkomt overlappende stappen als er nog eentje bezig is.
+                self._volume3d_stepping = True
+                try:
+                    j2 = self.pb.panel
+                    old_scandatetime = self._volume3d_rect_params[3]
+                    # BUGFIX TERUGGEDRAAID (15 juli 2026): hier stond kort 12*direction i.p.v. direction, in
+                    # de veronderstelling dat leftright_step=12 (SHIFT+RECHTS/LINKS) altijd een VOLLEDIGE
+                    # volumestap zou geven ongeacht "duplicate" scans binnen 1 volume. Dat bleek niet te
+                    # kloppen: in nlr_changedata.py (perform_leftrightstep) betekent |lr_step|==12 een VASTE
+                    # sprong van 60 minuten (letterlijk zo in commentaar: "Use a time step of 60 minutes"),
+                    # los van de daadwerkelijke volumetijd van de radar (meestal enkele minuten) -- dus geen
+                    # "volgende volledige scan", maar een vaste uur-sprong. Terug naar de oorspronkelijke 1/-1.
+                    #
+                    # De ECHTE oorzaak van Eriks "om en om slaat hij een compleet beeldje over"-waarneming zit
+                    # in hetzelfde bestand: consider_duplicates (perform_leftrightstep, alleen relevant bij
+                    # |lr_step|==1) is True als het momenteel zichtbare paneel een scan/elevatiehoek toont die
+                    # BINNEN 1 volume vaker wordt afgetast (self.visible_productscans_with_duplicates, bv. een
+                    # laagste elevatiehoek die om extra tijdresolutie vaker wordt gescand dan de rest van het
+                    # volume -- vergelijkbaar met NEXRAD SAILS/MESO-SAILS). In dat geval stapt RECHTS soms
+                    # alleen naar de eerstvolgende DUPLICATE van diezelfde elevatiehoek (tijd verschuift wel,
+                    # maar de OVERIGE elevatiehoeken -- en dus het 3D-volume als geheel -- blijven van het
+                    # oude volume) i.p.v. naar een echt nieuw, volledig volume met alle elevaties vernieuwd.
+                    # Dat verklaart het "om en om"-patroon exact. Geen simpele parameterfix hiervoor gevonden
+                    # die niet ook (zoals hierboven) iets anders breekt.
+                    # POGING 2 (15 juli 2026, na Eriks "wat schiet ik hiermee op?"): i.p.v. alleen te wachten
+                    # tot de LOSSE scan-tijd verandert (die verandert ook al bij een duplicate-deelstap, zie
+                    # toelichting hierboven), nu blijven doorstappen tot het VOLUME-tijdstip zelf verandert.
+                    # Onderbouwing, rechtstreeks uit nlr_changedata.py (perform_leftrightstep): het volume-
+                    # tijdstip (self.date/self.time daar, hier self.crd.date/self.crd.time) wordt ALLEEN
+                    # bijgewerkt als use_same_volumetime False is -- dus als er daadwerkelijk een nieuwe,
+                    # volledige volumeronde is bereikt, niet bij een deelstap binnen dezelfde ronde. Dat is dus
+                    # een betrouwbaarder signaal dan de losse scan-tijd. NOG NIET DOOR ERIK BEVESTIGD: dit gaat
+                    # ervan uit dat self.crd.date/self.crd.time synchroon met process_keyboardinput worden
+                    # bijgewerkt (net als bij de rest van dit 3D-onderdeel kon ik dit niet zelf natesten).
+                    old_volume_dt = self.crd.date + self.crd.time
+                    _max_attempts = 20  # Veiligheidsgrens tegen een oneindige lus als er iets onverwachts gebeurt.
+                    for _attempt in range(_max_attempts):
+                        self.crd.process_keyboardinput(direction, 0, 0, '0', None, False)
+                        new_scandatetime = self._wait_for_new_scandatetime(j2, old_scandatetime)
+                        if new_scandatetime is None:
+                            richting = 'nieuwere' if direction > 0 else 'oudere'
+                            self.set_textbar(f"3D: geen {richting} scan beschikbaar (einde bereikt).", 'orange', 2)
+                            self._volume3d_following = False
+                            return False
+                        new_volume_dt = self.crd.date + self.crd.time
+                        if new_volume_dt != old_volume_dt:
+                            break  # Nu wel een echt nieuw, volledig volume bereikt.
+                        old_scandatetime = new_scandatetime  # Nog dezelfde ronde (duplicate-substap) -- meteen door.
+                    else:
+                        self.set_textbar("3D: geen volledig nieuw volume gevonden na herhaald doorstappen "
+                                          "(mogelijk blijvend dezelfde elevatiehoek-duplicaten) -- toont het "
+                                          "laatst bereikte resultaat.", 'orange', 3)
+                    product2, x_range2, y_range2, _ = self._volume3d_rect_params
+                    self._volume3d_rect_params = (product2, x_range2, y_range2, new_scandatetime)
+                    self._render_volume_3d_scene(force_new_window=False)
+                    return True
+                finally:
+                    self._volume3d_stepping = False
+
+            def volume3d_follow_tick():
+                if not getattr(self, '_volume3d_following', False):
+                    return
+                ok = step_3d_time(1)
+                if ok and getattr(self, '_volume3d_following', False):
+                    # Klein pauzetje tussen stappen (via singleShot i.p.v. een blocking sleep), zodat het
+                    # 3D-venster ondertussen gewoon interactief/draaibaar blijft.
+                    QTimer.singleShot(50, volume3d_follow_tick)
+                else:
+                    self._volume3d_following = False
+            self._volume3d_follow_tick_func = volume3d_follow_tick  # Referentie vasthouden voor de singleShot-keten.
+
+            def handle_3d_time_keys(event):
+                if event.key is None:
+                    return
+                name = event.key.name
+                if name == 'Right' and not getattr(self, '_volume3d_following', False):
+                    step_3d_time(1)
+                elif name == 'Left' and not getattr(self, '_volume3d_following', False):
+                    step_3d_time(-1)
+                elif name == 'A':
+                    self._volume3d_following = not getattr(self, '_volume3d_following', False)
+                    if self._volume3d_following:
+                        self.set_textbar("3D: automatisch meelopen met de tijd gestart ('A' om te stoppen).", 'green', 2)
+                        self._volume3d_follow_tick_func()
+                    else:
+                        self.set_textbar('3D: automatisch meelopen met de tijd gestopt.', 'orange', 2)
+            canvas.events.key_press.connect(handle_3d_time_keys)
+
+            # Center the camera on the ACTUAL object instead of the default (0, 0, 0) -- (0, 0, 0) is the
+            # radar's own location, which can easily be tens of km away from the selected storm. Alleen bij
+            # een NIEUW venster: bij een live-refresh blijft de camera precies staan waar Erik 'm liet, dat
+            # is nou net het punt van "live".
+            view.camera.center = (box_center_x, box_center_y, (box_corners_z[0]+box_corners_z[1])/2.)
+            view.camera.set_range()
+
+        status_message = (f"3D-venster: '{product}' {scandatetime_str}, {width_km:.0f}x{height_km:.0f} km, "
+                           f"{distance_from_radar_km:.0f} km {bearing_label} van de radar. "
+                           f"Kompaslijnen: rood=Noord, groen=Oost, blauw=Zuid, geel=West, wit=omhoog. "
+                           f"Hoogte-as is {vertical_exaggeration:.0f}x overdreven.")
+        self.set_textbar(status_message, 'green', 4)
+        print(f"[3D viewer] {status_message}")
+        print(f"[3D viewer] Werkelijke hoogte van het gebied: {z_axis[-1]-z_axis[0]:.1f} km "
+              f"(op het scherm {vertical_exaggeration:.0f}x uitgerekt).")
+
+    def export_volume_3d_video(self):
+        """Sneltoets J (binnen het 3D-venster, 10 juli 2026, op Eriks verzoek): toont een instellingen-
+        dialoog en start daarna een video-export waarin zowel de TIJD doorloopt (elke volgende radarscan,
+        alsof herhaaldelijk op pijltje-rechts gedrukt wordt -- zie regel ~799 hierboven voor die sneltoets
+        zelf) als de camera een instelbare hoek verder draait over de hele video. Erik koos hiervoor
+        (i.p.v. alleen tijd, of alleen rotatie) na een korte afweging: puur tijd is het duidelijkst te lezen
+        qua storm-ontwikkeling, dus dat blijft de hoofdas, met een lichte/optionele rotatie erbovenop voor
+        wat extra dimensionaliteit zonder verwarrend te worden (0 graden = camera blijft stilstaan).
+
+        Gebruikt hetzelfde encodeermechanisme (PyAV/libx264) als de bestaande 2D-animatie-export
+        (self.create_ani, ext='mp4') -- dus GEEN nieuwe afhankelijkheid t.o.v. ffmpeg."""
+        if getattr(self, '_volume_3d_canvas', None) is None or getattr(self, '_volume3d_rect_params', None) is None:
+            self.set_textbar('Geen 3D-venster open om een video van te exporteren.', 'red', 2)
+            return
+        if getattr(self, '_volume3d_exporting', False):
+            self.set_textbar('Er loopt al een video-export.', 'orange', 2)
+            return
+
+        dialog = QWidget()
+        dialog.setWindowTitle('3D-video exporteren')
+        layout = QFormLayout()
+        n_steps_w = QLineEdit('20')
+        rotation_deg_w = QLineEdit('90')
+        fps_w = QLineEdit('10')
+        layout.addRow(QLabel('Aantal tijdstappen vooruit (elk = 1x pijltje-rechts):'), n_steps_w)
+        layout.addRow(QLabel('Totale camerarotatie over de hele video (graden, 0 = camera stil):'), rotation_deg_w)
+        layout.addRow(QLabel('Beeldjes per seconde (fps):'), fps_w)
+        start_button = QPushButton('Start export', autoDefault=True)
+        layout.addRow(start_button)
+        dialog.setLayout(layout)
+        dialog.resize(dialog.sizeHint())
+
+        def start_export():
+            try:
+                n_steps = int(round(ft.to_number(n_steps_w.text())))
+                rotation_deg = float(ft.to_number(rotation_deg_w.text()))
+                fps = float(ft.to_number(fps_w.text()))
+                if n_steps < 1 or fps <= 0:
+                    raise ValueError('Ongeldige waarde(n)')
+            except Exception:
+                self.set_textbar('Ongeldige invoer voor tijdstappen/rotatie/fps.', 'red', 3)
+                return
+            dialog.close()
+            product = self._volume3d_rect_params[0]
+            _dt_str = str(self._volume3d_rect_params[3]).replace(':', '').replace(' ', '_').replace('-', '')
+            default_dir = os.path.join(gv.userdir, 'Output_files', '3D_videos')
+            os.makedirs(default_dir, exist_ok=True)
+            default_name = f"3D_{product}_{_dt_str}_{pytime.strftime('%H%M%S')}.mp4"
+            default_path = os.path.join(default_dir, default_name)
+            filepath = str(QFileDialog.getSaveFileName(None, 'Sla de 3D-video op als:', default_path,
+                           filter='*.mp4', options=QFileDialog.DontUseNativeDialog)[0])
+            if not filepath:
+                return  # Geannuleerd
+            if not filepath.lower().endswith('.mp4'):
+                filepath += '.mp4'
+            self._run_volume_3d_export(n_steps, rotation_deg, fps, filepath)
+
+        start_button.clicked.connect(start_export)
+        dialog.show()
+        self._volume3d_export_dialog = dialog  # Referentie vasthouden zodat Qt het venster niet meteen opruimt.
+
+    def _run_volume_3d_export(self, n_steps, rotation_deg, fps, filepath):
+        """Doet het eigenlijke werk voor export_volume_3d_video: stapt n_steps keer de tijd vooruit, draait
+        de camera geleidelijk mee, en vangt na elke stap 1 beeldje met canvas.render() (hetzelfde mechanisme
+        als save_3d_screenshot hierboven, S-toets). Aan het eind worden alle beeldjes samengevoegd tot 1
+        MP4-bestand via _encode_frames_to_mp4.
+
+        LET OP -- NOG NIET DOOR ERIK BEVESTIGD: dit gaat ervan uit dat self.crd.process_keyboardinput(1,0,0,
+        '0',None,False) (dezelfde aanroep als de pijltje-rechts-sneltoets) de nieuwe scandata al volledig
+        geladen heeft zodra de aanroep terugkeert, OF in elk geval kort daarna via Qt's event-loop (vandaar
+        de wachtlus in _wait_for_new_scandatetime). Als het inladen van nieuwe scans in werkelijkheid via
+        een aparte achtergrond-thread met eigen callback gebeurt (zoals bv. bij het downloaden van
+        radardata), kan deze aanpak tekortschieten en moet die wachtlus vervangen worden door een echt
+        signaal uit die laad-pijplijn. Graag testen en terugkoppelen of dit al dan niet werkt zoals bedoeld."""
+        self._volume3d_exporting = True
+        self.set_textbar('3D-video wordt geexporteerd, even geduld...', 'orange', 0)
+        canvas = self._volume_3d_canvas
+        view = self._volume_3d_view
+        j = self.pb.panel
+        azimuth_start = view.camera.azimuth
+        azimuth_step = rotation_deg/(n_steps-1) if n_steps > 1 else 0.
+        frames = []
+        try:
+            for i in range(n_steps):
+                canvas.update()
+                QApplication.processEvents()  # Zorgt dat vispy de scene ook echt (opnieuw) tekent voor render().
+                img_arr = canvas.render()
+                frames.append(img_arr.copy())
+                if i == n_steps-1:
+                    break
+                old_scandatetime = self._volume3d_rect_params[3]
+                # Zelfde fix als bij step_3d_time hierboven: blijven doorstappen tot het VOLUME-tijdstip
+                # (self.crd.date+self.crd.time) daadwerkelijk verandert, i.p.v. te stoppen zodra alleen de
+                # losse scan-tijd verandert (die kan ook al bij een duplicate-deelstap veranderen).
+                old_volume_dt = self.crd.date + self.crd.time
+                new_scandatetime = None
+                for _attempt in range(20):
+                    self.crd.process_keyboardinput(1, 0, 0, '0', None, False)  # Zelfde als pijltje-rechts.
+                    new_scandatetime = self._wait_for_new_scandatetime(j, old_scandatetime)
+                    if new_scandatetime is None:
+                        break
+                    if self.crd.date + self.crd.time != old_volume_dt:
+                        break
+                    old_scandatetime = new_scandatetime
+                if new_scandatetime is None:
+                    self.set_textbar(f"Einde van beschikbare data bereikt na {i+1} tijdstappen, video wordt "
+                                      f"afgemaakt met wat er is.", 'orange', 3)
+                    break
+                product, x_range, y_range, _ = self._volume3d_rect_params
+                self._volume3d_rect_params = (product, x_range, y_range, new_scandatetime)
+                view.camera.azimuth = azimuth_start + azimuth_step*(i+1)
+                self._render_volume_3d_scene(force_new_window=False)
+            self._encode_frames_to_mp4(frames, fps, filepath)
+            self.set_textbar(f"3D-video opgeslagen: {filepath} ({len(frames)} beeldjes)", 'green', 4)
+        except Exception as e:
+            self.set_textbar(f"3D-video-export mislukt: {e}", 'red', 3)
+            print('_run_volume_3d_export error:'); print(traceback.format_exc())
+        finally:
+            self._volume3d_exporting = False
+
+    def _wait_for_new_scandatetime(self, j, old_scandatetime, timeout_s=5.):
+        """Wacht (met een korte polling-lus, zie ook LET OP hierboven bij _run_volume_3d_export) tot
+        self.pb.data_attr['scandatetime'] voor paneel j verandert t.o.v. old_scandatetime. Geeft de nieuwe
+        scandatetime terug, of None als er binnen timeout_s niets veranderde (bv. einde van de beschikbare
+        data bereikt)."""
+        start = pytime.time()
+        while pytime.time()-start < timeout_s:
+            QApplication.processEvents()
+            current = self.pb.data_attr['scandatetime'].get(j)
+            if current is not None and current != old_scandatetime:
+                return current
+            pytime.sleep(0.02)
+        return None
+
+    def _encode_frames_to_mp4(self, frames, fps, filepath):
+        """Zet een lijst RGBA-numpy-arrays (zoals geleverd door vispy's canvas.render(), zie ook
+        save_3d_screenshot hierboven) om naar 1 MP4-bestand. Gebruikt PyAV op dezelfde manier als
+        self.create_ani(ext='mp4') hierboven -- dus geen nieuwe afhankelijkheid t.o.v. ffmpeg/imageio-ffmpeg
+        nodig, want dat is al aanwezig en beproefd in dit bestand."""
+        if not frames:
+            raise ValueError('Geen beeldjes om te exporteren.')
+        height, width = frames[0].shape[:2]
+        # H264 vereist een even breedte/hoogte (zelfde reden als bij de bestaande 2D savefig, zie hieronder).
+        width_even, height_even = int(np.ceil(width/2)*2), int(np.ceil(height/2)*2)
+        fps_int = max(1, int(round(fps)))
+        container = av.open(filepath, mode='w')
+        stream = container.add_stream('libx264', rate=fps_int, width=width_even, height=height_even,
+                                       pix_fmt='yuv420p', options={'crf': '18'})
+        stream.codec_context.time_base = Fraction(1, fps_int)
+        try:
+            for i, arr in enumerate(frames):
+                img = Image.fromarray(arr[:, :, :3])  # canvas.render() geeft RGBA; alpha niet nodig voor video.
+                if (width_even, height_even) != (width, height):
+                    padded = Image.new('RGB', (width_even, height_even))
+                    padded.paste(img, (0, 0))
+                    img = padded
+                frame = av.VideoFrame.from_image(img)
+                frame.pts = i
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode():  # Flush stream, zelfde patroon als in create_ani.
+                container.mux(packet)
+        finally:
+            container.close()
+
     def savefig(self, select_filename=True):
         #select_filename should be False when self.continue_savefig=True, after initially the directory and filename format have been chosen.
         
@@ -3153,15 +5065,16 @@ class GUI(QWidget):
     def settings(self):
         self.settings=QTabWidget()
         self.settings.setWindowTitle('NLradar settings')
-        self.settingsmain=QWidget(); self.settingsmap=QWidget(); self.settingsdownload=QWidget(); self.settingsdatastorage=QWidget(); self.settingscolortables=QWidget(); self.settingsalgorithms = QWidget(); self.settingsmiscellaneous=QWidget()
+        self.settingsmain=QWidget(); self.settingsmap=QWidget(); self.settingsdownload=QWidget(); self.settingsdatastorage=QWidget(); self.settingscolortables=QWidget(); self.settingspolrgb=QWidget(); self.settingsalgorithms = QWidget(); self.settingsmiscellaneous=QWidget()
         self.settings.addTab(self.settingsmain,'Main')
         self.settings.addTab(self.settingsmap,'Map')
         self.settings.addTab(self.settingsdownload,'Download')
         self.settings.addTab(self.settingsdatastorage,'Data storage')
         self.settings.addTab(self.settingscolortables,'Color tables')
+        self.settings.addTab(self.settingspolrgb,'PolRGB')
         self.settings.addTab(self.settingsalgorithms,'Algorithms')
         self.settings.addTab(self.settingsmiscellaneous,'Miscellaneous')
-        self.settings_tabmain(); self.settings_tabmap(); self.settings_tabdownload(); self.settings_tabdatastorage(); self.settings_tabcolortables(); self.settings_tabalgorithms(); self.settings_tabmiscellaneous()
+        self.settings_tabmain(); self.settings_tabmap(); self.settings_tabdownload(); self.settings_tabdatastorage(); self.settings_tabcolortables(); self.settings_tabpolrgb(); self.settings_tabalgorithms(); self.settings_tabmiscellaneous()
         self.settings.resize(self.settings.sizeHint())
         self.settings.show()
         
@@ -3270,9 +5183,12 @@ class GUI(QWidget):
     def settings_tabmap(self):
         map_layout=QFormLayout()
         hbox_bgmapcolor=QHBoxLayout(); hbox_mapvisibility=QHBoxLayout(); hbox_mapcolorfilter=QHBoxLayout()
+        hbox_radardata_colorfilter=QHBoxLayout()
         hbox_maptiles_update_time = QHBoxLayout(); hbox_boxtitles=QHBoxLayout()
+        hbox_basemap_source = QHBoxLayout(); hbox_basemap_source_maptiler_style = QHBoxLayout()
+        hbox_basemap_source_maptiler_provider = QHBoxLayout()
         b_size=5
-        hboxes_background=[hbox_bgmapcolor,hbox_mapvisibility,hbox_mapcolorfilter,hbox_maptiles_update_time]
+        hboxes_background=[hbox_bgmapcolor,hbox_mapvisibility,hbox_mapcolorfilter,hbox_radardata_colorfilter,hbox_maptiles_update_time,hbox_basemap_source,hbox_basemap_source_maptiler_style,hbox_basemap_source_maptiler_provider]
         for hbox in hboxes_background:
             hbox.addStretch(0)      
         
@@ -3288,10 +5204,68 @@ class GUI(QWidget):
         
         self.mapcolorfilterw=QLineEdit(ft.list_to_string(self.mapcolorfilter))
         hbox_mapcolorfilter.addWidget(self.mapcolorfilterw)
+
+        self.radardata_opacity_slider=QSlider(Qt.Horizontal)
+        self.radardata_opacity_slider.setMinimum(0); self.radardata_opacity_slider.setMaximum(100)
+        self.radardata_opacity_slider.setValue(int(round(self.radardata_colorfilter[3]*100)))
+        self.radardata_opacity_slider.setToolTip("Opacity of the radar data itself. Lower this to let the basemap "
+                                                  "(streets/place names) show through the radar echoes, uniformly "
+                                                  "regardless of echo intensity.")
+        self.radardata_opacity_label=QLabel(str(self.radardata_opacity_slider.value())+'%')
+        self.radardata_opacity_label.setMinimumWidth(int(round(self.pb.scale_pixelsize(35))))
+        hbox_radardata_colorfilter.addWidget(self.radardata_opacity_slider,b_size+8)
+        hbox_radardata_colorfilter.addWidget(self.radardata_opacity_label,b_size)
         
         self.maptiles_update_timew = QLineEdit(str(self.maptiles_update_time))
         self.maptiles_update_timew.setToolTip('Map tiles are updated when the last occurrence of panning/zooming was this number of seconds ago.')
         hbox_maptiles_update_time.addWidget(self.maptiles_update_timew)
+
+        self.basemap_source_localw=QRadioButton('Local (bundled tiles, works offline)')
+        self.basemap_source_maptilerw=QRadioButton('MapTiler (live, scrollable map, requires API key + internet)')
+        self.basemap_source_group=QButtonGroup(); self.basemap_source_group.addButton(self.basemap_source_localw); self.basemap_source_group.addButton(self.basemap_source_maptilerw)
+        hbox_basemap_source.addWidget(self.basemap_source_localw,b_size+10); hbox_basemap_source.addWidget(self.basemap_source_maptilerw,b_size+10)
+        self.basemap_source_maptilerw.setChecked(True) if self.basemap_source == 'MapTiler' else self.basemap_source_localw.setChecked(True)
+
+        self.basemap_source_maptiler_stylew=QLineEdit(self.basemap_source_maptiler_style)
+        self.basemap_source_maptiler_stylew.setToolTip("MapTiler map style/ID, e.g. 'dataviz-v4-dark'. Find this in your MapTiler dashboard under the map's 'Use vector style' URL: .../maps/<this part>/style.json")
+        hbox_basemap_source_maptiler_style.addWidget(self.basemap_source_maptiler_stylew)
+
+        self.basemap_source_maptiler_esriw=QRadioButton('Esri Dark Gray')
+        self.basemap_source_maptiler_esristreetw=QRadioButton('Esri Street')
+        self.basemap_source_maptiler_esrilightw=QRadioButton('Esri Light Gray')
+        self.basemap_source_maptiler_esriimageryw=QRadioButton('Esri Satellite')
+        self.basemap_source_maptiler_esritopow=QRadioButton('Esri Topo')
+        self.basemap_source_maptiler_stadiaw=QRadioButton('Stadia Maps (requires API key)')
+        self.basemap_source_maptiler_esriw.setToolTip('All Esri maps: free, no account or API key needed')
+        self.basemap_source_maptiler_provider_group=QButtonGroup()
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_esriw)
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_esristreetw)
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_esrilightw)
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_esriimageryw)
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_esritopow)
+        self.basemap_source_maptiler_provider_group.addButton(self.basemap_source_maptiler_stadiaw)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_esriw,b_size+10)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_esristreetw,b_size+10)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_esrilightw,b_size+10)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_esriimageryw,b_size+10)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_esritopow,b_size+10)
+        hbox_basemap_source_maptiler_provider.addWidget(self.basemap_source_maptiler_stadiaw,b_size+10)
+        if gv.frozen:
+            # Gedeelde versie: geen kaarten met API-key
+            self.basemap_source_maptilerw.setText('Live map (Esri: free, no account or API key, requires internet)')
+            self.basemap_source_maptiler_stadiaw.setVisible(False)
+        if self.basemap_source_maptiler_provider == 'stadia' and not gv.frozen:
+            self.basemap_source_maptiler_stadiaw.setChecked(True)
+        elif self.basemap_source_maptiler_provider == 'esri_street':
+            self.basemap_source_maptiler_esristreetw.setChecked(True)
+        elif self.basemap_source_maptiler_provider == 'esri_light':
+            self.basemap_source_maptiler_esrilightw.setChecked(True)
+        elif self.basemap_source_maptiler_provider == 'esri_imagery':
+            self.basemap_source_maptiler_esriimageryw.setChecked(True)
+        elif self.basemap_source_maptiler_provider == 'esri_topo':
+            self.basemap_source_maptiler_esritopow.setChecked(True)
+        else:
+            self.basemap_source_maptiler_esriw.setChecked(True)
         
         for hbox in hboxes_background:
             hbox.addStretch(40)
@@ -3370,7 +5344,9 @@ class GUI(QWidget):
                      [QLabel('Background color (RGB)'),hbox_bgmapcolor],
                      [QLabel('Visibility'),hbox_mapvisibility],
                      [QLabel('Color filter (RGBA)'),hbox_mapcolorfilter],  
+                     [QLabel('Radar data opacity'),hbox_radardata_colorfilter],
                      [QLabel('Map tiles update time (s)'), hbox_maptiles_update_time],
+
                      [QLabel('Radars'),hbox_radars],
                      [QLabel(''),QLabel('')],
                      [QLabel('<b>Lines</b>'),hbox_boxtitles],
@@ -3398,7 +5374,17 @@ class GUI(QWidget):
         self.mapvis_false.toggled.connect(lambda: self.pb.change_mapvisibility(False))
         self.mapvis_true.toggled.connect(lambda: self.pb.change_mapvisibility(True))
         self.mapcolorfilterw.editingFinished.connect(self.pb.change_mapcolorfilter)
+        self.radardata_opacity_slider.valueChanged.connect(self.pb.change_radardata_opacity)
         self.maptiles_update_timew.editingFinished.connect(self.change_maptiles_update_time)
+        self.basemap_source_localw.toggled.connect(lambda checked: self.change_basemap_source('Local') if checked else None)
+        self.basemap_source_maptilerw.toggled.connect(lambda checked: self.change_basemap_source('MapTiler') if checked else None)
+        self.basemap_source_maptiler_stylew.editingFinished.connect(self.change_basemap_source_maptiler_style)
+        self.basemap_source_maptiler_esriw.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('esri') if checked else None)
+        self.basemap_source_maptiler_esristreetw.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('esri_street') if checked else None)
+        self.basemap_source_maptiler_esrilightw.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('esri_light') if checked else None)
+        self.basemap_source_maptiler_esriimageryw.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('esri_imagery') if checked else None)
+        self.basemap_source_maptiler_esritopow.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('esri_topo') if checked else None)
+        self.basemap_source_maptiler_stadiaw.toggled.connect(lambda checked: self.change_basemap_source_maptiler_provider('stadia') if checked else None)
         self.radars_selectcolorsw.clicked.connect(self.select_properties_radar_markers)
         for line in self.lines_names:
             self.lines_widgets[line][0].toggled.connect(lambda state, line=line: self.change_line_state(line,False))
@@ -3458,6 +5444,56 @@ class GUI(QWidget):
         number=ft.to_number(inputtime)
         if not number is None and number>0: 
             self.maptiles_update_time = number
+
+    def change_basemap_source(self, source):
+        if source == self.basemap_source:
+            return
+        self.basemap_source = source
+        # Debounce: reopening the Settings dialog can, in practice, fire this twice in quick succession for
+        # what is really one user action (an artifact of how the radio buttons get re-initialized each time
+        # Settings is opened). Rather than starting a full tile fetch immediately on every call, wait a brief
+        # moment -- if another call comes in before that moment passes, only the LAST one actually proceeds.
+        if hasattr(self, '_basemap_source_debounce_timer') and self._basemap_source_debounce_timer.isActive():
+            self._basemap_source_debounce_timer.stop()
+        self._basemap_source_debounce_timer = QTimer()
+        self._basemap_source_debounce_timer.setSingleShot(True)
+        self._basemap_source_debounce_timer.timeout.connect(lambda: self._apply_basemap_source_change(source))
+        self._basemap_source_debounce_timer.start(150)
+
+    def _apply_basemap_source_change(self, source):
+        if source == 'MapTiler' and not gv.frozen and not self.api_keys.get('MapTiler', {}).get('maps', ''):
+            self.set_textbar("MapTiler basemap selected, but no API key is set. Add one in Settings -> Download -> API keys.", 'red', 1)
+        # Force a fresh tile fetch under the new source, rather than continuing to show whatever was cached
+        # from the previous source.
+        self.pb.get_active_mt().starting = True
+        self.pb.update_map_tiles(separate_thread=False, draw_map=True)
+        # set_maplineproperties now also depends on self.basemap_source (to hide NLradar's own country/
+        # province/river lines when MapTiler -- which already renders its own borders -- is active), but
+        # isn't otherwise re-evaluated by update_map_tiles, so refresh it explicitly here.
+        self.pb.set_maplineproperties(self.pb.panellist)
+        self.pb.update()
+
+    def change_basemap_source_maptiler_style(self):
+        input_style = self.basemap_source_maptiler_stylew.text().strip()
+        if input_style:
+            self.basemap_source_maptiler_style = input_style
+            if self.basemap_source == 'MapTiler':
+                self.pb.get_active_mt().starting = True
+                self.pb.update_map_tiles(separate_thread=False, draw_map=True)
+        else:
+            self.basemap_source_maptiler_stylew.setText(self.basemap_source_maptiler_style)
+
+    def change_basemap_source_maptiler_provider(self, provider):
+        if provider == self.basemap_source_maptiler_provider:
+            return
+        self.basemap_source_maptiler_provider = provider
+        if provider == 'stadia' and not self.api_keys.get('MapTiler', {}).get('maps', ''):
+            self.set_textbar("Stadia Maps provider selected, but no API key is set. Add one in Settings -> Download -> API keys.", 'red', 1)
+        if self.basemap_source == 'MapTiler':
+            # Force a fresh tile fetch under the new provider, rather than continuing to show whatever was
+            # cached from the previous one.
+            self.pb.get_active_mt().starting = True
+            self.pb.update_map_tiles(separate_thread=False, draw_map=True)
         
     def change_radar_markersize(self):
         inputsize=self.radar_markersizew.text()
@@ -3583,12 +5619,16 @@ class GUI(QWidget):
         self.api_keysw = copy.deepcopy(self.api_keys) # Is only done to get the same keys, values will be updated below
         labels = {'KNMI': "Set the API keys for the <b>KNMI</b> Data Platform. You can request these <A href='https://developer.dataplatform.knmi.nl/apis/'>here</a>.",
                   'DMI': "Set the API key for the <b>DMI</b> open data service. Follow the <A href='https://opendatadocs.dmi.govcloud.dk/en/Authentication'>following</a> guide to obtain a key for the radar data service.",
-                  'Météo-France': "Set the API key for de <b>Météo-France</b> open data service. Subscribe to the radar data API <A href='https://portail-api.meteofrance.fr/web/en/api/DonneesPubliquesRadar'>here</a>, then click on 'configure the API' and generate a token."}
+                  'Météo-France': "Set the API key for de <b>Météo-France</b> open data service. Subscribe to the radar data API <A href='https://portail-api.meteofrance.fr/web/en/api/DonneesPubliquesRadar'>here</a>, then click on 'configure the API' and generate a token.",
+                  'MapTiler': "Set the API key for <b>MapTiler</b>, used for the optional live, scrollable basemap (Settings -> Map -> Basemap source). Get a free key <A href='https://www.maptiler.com/cloud/'>here</a>.",
+                  'MeteoGate': "Set the API key for the EUMETNET <b>MeteoGate</b> Open Radar Data service, used for the Belgian KMI/skeyes/VMM radars (Wideumont, Jabbeke, Zaventem, Helchteren). Register and create a free key at the <A href='https://devportal.meteogate.eu/'>MeteoGate Developer Portal</a> (click 'Get API Key')."}
         labels_keys = {'KNMI': {'opendata': 'Open Data', 'sfcobs': 'Current 10 Minute Data KNMI Stations'},
                        'DMI': {'radardata': 'Radar Data'},
-                       'Météo-France': {'radardata': 'Radar Data'}}
+                       'Météo-France': {'radardata': 'Radar Data'},
+                       'MapTiler': {'maps': 'Maps'},
+                       'MeteoGate': {'radardata': 'Radar Data'}}
         for datasource in self.api_keys:
-            label = QLabel(labels[datasource])
+            label = QLabel(labels.get(datasource, f"Set the API key(s) for <b>{datasource}</b>."))
             label.setOpenExternalLinks(True)
             layout.addWidget(label)
             formlayout=QFormLayout()
@@ -3597,7 +5637,7 @@ class GUI(QWidget):
                 self.api_keysw[datasource][key].editingFinished.connect(lambda datasource=datasource, key=key: self.change_api_keys(datasource, key))
                 hbox = QHBoxLayout()
                 hbox.addWidget(self.api_keysw[datasource][key], 5); hbox.addStretch(2)
-                formlayout.addRow(QLabel('API key '+labels_keys[datasource][key]),hbox)
+                formlayout.addRow(QLabel('API key '+labels_keys.get(datasource, {}).get(key, key)),hbox)
             layout.addLayout(formlayout)
             
         layout.addStretch(50)
@@ -3695,6 +5735,7 @@ class GUI(QWidget):
         self.radardirs_widgets, self.default_dirs_widgets = {}, {}
         self.additionaldirs_rds_widgets, self.additionaldirs_widgets = {}, {}
         for j in gv.data_sources_all:
+            if not gv.radars.get(j): continue # kan gebeuren als alle radars van deze bron in radars_disabled staan
             self.dirselecttabs[j]=QWidget()
             self.dirselect.addTab(self.dirselecttabs[j],j)
             self.dirs_dstabs(j)
@@ -3928,6 +5969,221 @@ class GUI(QWidget):
             self.cmaps_maxvaluesw[product].setText(str(self.cmaps_maxvalues[product]))
         
         
+    def settings_tabpolrgb(self):
+        layout = QFormLayout()
+
+        # ESSL-modus (bespoke checkbox, geen onderdeel van polrgb_field_specs hieronder: die velden zijn
+        # allemaal getallen via change_polrgb_param, dit is een aan/uit-schakelaar met eigen handler -- zelfde
+        # opzet als attenuation_correction_enabledw hierboven). AAN: vaste ESSL-poster-tabel (Van 't Veen/
+        # Groenemeijer/Pucik, ECSS 2025 Utrecht) i.p.v. de doorlopende Z_MIN/Z_MAX/etc.-parameters hieronder,
+        # die dan genegeerd worden (blijven wel zichtbaar/bewaard, voor als je teruggaat naar UIT).
+        self.polrgb_essl_modew = QCheckBox('ESSL-tabel gebruiken i.p.v. onderstaande parameters')
+        self.polrgb_essl_modew.setChecked(bool(self.polrgb_params.get('ESSL_MODE', False)))
+        self.polrgb_essl_modew.setToolTip("Gebruikt de vaste RGB/alpha-opzoektabel uit de ESSL-poster "
+            "(Van 't Veen, Groenemeijer & Pucik, ECSS 2025) i.p.v. de doorlopende passthrough hieronder: "
+            "R=Z 30-60dBZ, G=CC 100-70% (omgekeerd), B=ZDR 0-4dB, alpha volgens de 11-punts Z-curve uit de "
+            "poster. De parameters hieronder worden dan genegeerd (niet gewist).")
+        self.polrgb_essl_modew.toggled.connect(self.change_polrgb_essl_mode)
+        layout.addRow(QLabel(''), self.polrgb_essl_modew)
+
+        polrgb_field_specs = [
+            ('Z_MIN', 'Z scale minimum (dBZ)'),
+            ('Z_MAX', 'Z scale maximum (dBZ)'),
+            ('CC_MIN', 'CC scale minimum (%)'),
+            ('CC_MAX', 'CC scale maximum (%)'),
+            ('ZDR_MIN', 'ZDR scale minimum (dB)'),
+            ('ZDR_MAX', 'ZDR scale maximum (dB)'),
+            ('Z_FADE_LO', 'Visibility fade-in start (Z, dBZ)'),
+            ('Z_FADE_HI', 'Visibility fade-in end (Z, dBZ)'),
+            ('ALPHA_GAMMA', 'Visibility fade curve (gamma, <1 boosts weak echo)'),
+            ('Z_GAMMA', 'Z color curve (gamma, >1 = lage dBZ donker/hoge dBZ snel rood, 1=lineair)'),
+            ('CC_FALLBACK', 'CC fallback when missing but Z is valid (%)'),
+            ('ZDR_FALLBACK', 'ZDR fallback when missing but Z is valid (dB)'),
+        ]
+        self.polrgb_paramsw = {}
+        for key, label in polrgb_field_specs:
+            widget = QLineEdit(str(ft.rifdot0(self.polrgb_params[key])))
+            self.polrgb_paramsw[key] = widget
+            hbox = QHBoxLayout(); hbox.addWidget(widget); hbox.addStretch(30)
+            layout.addRow(QLabel(label), hbox)
+            widget.editingFinished.connect(lambda key=key: self.change_polrgb_param(key))
+
+        # ESSL-tabel zelf instelbaar (16 september 2026, op Eriks verzoek: Bram blijkt deze getallen per
+        # publicatie/sessie te varieren -- zie posterbijlage vs. conferentie-abstract vs. live ESSL-viewer,
+        # alle 3 met andere Z/CC/ZDR-grenzen). De 6 grenswaarden zijn gewone getallen -> hergebruikt de
+        # generieke polrgb_field_specs/change_polrgb_param-mechaniek hierboven (dus ook automatisch
+        # meegenomen in reset_polrgb_params via polrgb_paramsw). Werken ALLEEN als ESSL-modus aanstaat --
+        # blijven verder gewoon bewaard/zichtbaar als dat niet zo is, net als de passthrough-parameters
+        # hierboven wanneer ESSL wel aanstaat.
+        layout.addRow(QLabel(''), QLabel('<b>ESSL-tabel</b> (alleen actief als de checkbox hierboven aanstaat)'))
+        essl_range_specs = [
+            ('ESSL_Z_MIN', 'ESSL: Z scale minimum (dBZ)'),
+            ('ESSL_Z_MAX', 'ESSL: Z scale maximum (dBZ)'),
+            ('ESSL_CC_MIN', 'ESSL: CC scale minimum (%)'),
+            ('ESSL_CC_MAX', 'ESSL: CC scale maximum (%)'),
+            ('ESSL_ZDR_MIN', 'ESSL: ZDR scale minimum (dB)'),
+            ('ESSL_ZDR_MAX', 'ESSL: ZDR scale maximum (dB)'),
+        ]
+        for key, label in essl_range_specs:
+            widget = QLineEdit(str(ft.rifdot0(self.polrgb_params[key])))
+            self.polrgb_paramsw[key] = widget
+            hbox = QHBoxLayout(); hbox.addWidget(widget); hbox.addStretch(30)
+            layout.addRow(QLabel(label), hbox)
+            widget.editingFinished.connect(lambda key=key: self.change_polrgb_param(key))
+
+        # ESSL: 11-punts alpha(Z)-curve, bespoke tabel (2 kolommen Z/alpha x 11 rijen) i.p.v. de generieke
+        # 1-veld-per-key-mechaniek hierboven: dit zijn 2 LIJSTEN (ESSL_ALPHA_Z/ESSL_ALPHA_V) i.p.v. losse
+        # getallen, dus een eigen widget-structuur en handler (change_polrgb_essl_alpha) nodig. Z moet
+        # strikt oplopend blijven (np.interp-eis, zie DataSource_General._essl_polrgb_channels) -- de
+        # handler bewaart pas als alle 11 rijen geldige getallen zijn EN Z strikt oplopend is, anders wordt
+        # het hele stel teruggezet naar de laatst geldige stand (voorkomt een half-geldige, verwarrende
+        # tussentoestand in een 11-rijen-tabel).
+        layout.addRow(QLabel(''), QLabel("ESSL: zichtbaarheid (alpha) vs. Z -- 11 punten, strikt oplopende Z"))
+        essl_alpha_grid = QGridLayout()
+        essl_alpha_grid.addWidget(QLabel('<b>Z (dBZ)</b>'), 0, 0)
+        essl_alpha_grid.addWidget(QLabel('<b>Alpha</b>'), 0, 1)
+        self.polrgb_essl_alpha_widgets = []
+        essl_alpha_z = self.polrgb_params['ESSL_ALPHA_Z']
+        essl_alpha_v = self.polrgb_params['ESSL_ALPHA_V']
+        for i in range(len(essl_alpha_z)):
+            z_widget = QLineEdit(str(ft.rifdot0(essl_alpha_z[i])))
+            v_widget = QLineEdit(str(ft.rifdot0(essl_alpha_v[i])))
+            essl_alpha_grid.addWidget(z_widget, i+1, 0)
+            essl_alpha_grid.addWidget(v_widget, i+1, 1)
+            self.polrgb_essl_alpha_widgets.append((z_widget, v_widget))
+            z_widget.editingFinished.connect(self.change_polrgb_essl_alpha)
+            v_widget.editingFinished.connect(self.change_polrgb_essl_alpha)
+        essl_alpha_container = QWidget(); essl_alpha_container.setLayout(essl_alpha_grid)
+        layout.addRow(QLabel(''), essl_alpha_container)
+
+        self.polrgb_reset_defaultsw = QPushButton('Reset to defaults', autoDefault=True)
+        layout.addRow(QLabel(''), self.polrgb_reset_defaultsw)
+        self.polrgb_reset_defaultsw.clicked.connect(self.reset_polrgb_params)
+
+        # Bespoke veld buiten polrgb_field_specs (15 augustus 2026): moet, anders dan de velden hierboven,
+        # LEEG kunnen zijn (= geen grens) i.p.v. altijd een getal te vereisen -- change_polrgb_param
+        # hierboven behandelt lege tekst als ongeldige invoer, niet als "uitgeschakeld". Zelfde None/leeg-
+        # patroon als het analoge 3D-only veld (volume3d_polrgb_cc_max, Settings -> Miscellaneous), maar hier
+        # voor de gewone 2D-weergave.
+        self.polrgb_cc_hide_abovew = QLineEdit()
+        self.polrgb_cc_hide_abovew.setText('' if self.polrgb_cc_hide_above is None else str(ft.rifdot0(self.polrgb_cc_hide_above)))
+        self.polrgb_cc_hide_abovew.setToolTip("Pixels with CC (correlation coefficient, %) ABOVE this "
+            "threshold are not drawn at all (fully transparent), regardless of their Z/ZDR -- useful to hide "
+            "widespread ordinary rain (which has a high CC regardless of Z) without affecting hail (which "
+            "has a lower CC by definition, so stays visible). Independent of CC scale minimum/maximum above, "
+            "which only affect how brightly the green channel colors, not whether a pixel is drawn at all. "
+            "Leave empty for no limit (original behaviour).")
+        hbox_cc_hide = QHBoxLayout(); hbox_cc_hide.addWidget(self.polrgb_cc_hide_abovew); hbox_cc_hide.addStretch(30)
+        layout.addRow(QLabel('Hide CC above (%, empty=no limit)'), hbox_cc_hide)
+        self.polrgb_cc_hide_abovew.editingFinished.connect(self.change_polrgb_cc_hide_above)
+
+        self.settingspolrgb.setLayout(layout)
+
+    def change_polrgb_essl_mode(self, checked):
+        self.polrgb_params['ESSL_MODE'] = bool(checked)
+        self.pb.cmap_lastmodification_time['g'] = pytime.time()
+        # Zelfde cache-reset als in change_polrgb_param hierboven -- nodig omdat dit veld, net als de andere
+        # polrgb_params-sleutels, de daadwerkelijke PolRGB-berekening beinvloedt (niet alleen de kleurtabel).
+        keys_to_delete = [k for k in self.dsg.stored_data if "'g'" in k or '"g"' in k]
+        for k in keys_to_delete:
+            del self.dsg.stored_data[k]
+        if self.pb.firstplot_performed:
+            self.pb.set_newdata([j for j in self.pb.panellist if self.crd.products[j] == 'g'])
+
+    def change_polrgb_essl_alpha(self):
+        # Bespoke handler voor de 11-rijen ESSL-alphatabel (zie settings_tabpolrgb): valideert ALLE 11 rijen
+        # tegelijk (niet per los veld, zoals change_polrgb_param) omdat de eis "Z strikt oplopend" een
+        # eigenschap van de hele lijst is, niet van 1 los getal -- np.interp (DataSource_General.
+        # _essl_polrgb_channels) gedraagt zich onvoorspelbaar/stilletjes fout bij een niet-oplopende Z-reeks,
+        # dus liever hier hard weigeren dan straks een stille rekenfout.
+        z_values, v_values = [], []
+        for z_widget, v_widget in self.polrgb_essl_alpha_widgets:
+            z_num, v_num = ft.to_number(z_widget.text()), ft.to_number(v_widget.text())
+            if z_num is None or v_num is None:
+                self._reset_polrgb_essl_alpha_widgets()
+                return
+            z_values.append(float(z_num)); v_values.append(float(v_num))
+        if any(z_values[i] >= z_values[i+1] for i in range(len(z_values)-1)):
+            print('change_polrgb_essl_alpha: Z-waarden moeten strikt oplopend zijn, wijziging genegeerd.')
+            self._reset_polrgb_essl_alpha_widgets()
+            return
+        self.polrgb_params['ESSL_ALPHA_Z'] = z_values
+        self.polrgb_params['ESSL_ALPHA_V'] = v_values
+        self.pb.cmap_lastmodification_time['g'] = pytime.time()
+        # Zelfde cache-reset als in change_polrgb_param hierboven.
+        keys_to_delete = [k for k in self.dsg.stored_data if "'g'" in k or '"g"' in k]
+        for k in keys_to_delete:
+            del self.dsg.stored_data[k]
+        if self.pb.firstplot_performed:
+            self.pb.set_newdata([j for j in self.pb.panellist if self.crd.products[j] == 'g'])
+
+    def _reset_polrgb_essl_alpha_widgets(self):
+        """Zet de 11-rijen ESSL-alphatabel terug naar de laatst opgeslagen (geldige) waarden in
+        self.polrgb_params -- gebruikt door change_polrgb_essl_alpha bij ongeldige invoer en door
+        reset_polrgb_params."""
+        essl_alpha_z = self.polrgb_params['ESSL_ALPHA_Z']
+        essl_alpha_v = self.polrgb_params['ESSL_ALPHA_V']
+        for i, (z_widget, v_widget) in enumerate(self.polrgb_essl_alpha_widgets):
+            z_widget.setText(str(ft.rifdot0(essl_alpha_z[i])))
+            v_widget.setText(str(ft.rifdot0(essl_alpha_v[i])))
+
+    def change_polrgb_param(self, key):
+        input_text = self.polrgb_paramsw[key].text()
+        try:
+            number = float(input_text)
+        except (ValueError, TypeError):
+            number = None
+        if number is not None:
+            self.polrgb_params[key] = number
+            self.pb.cmap_lastmodification_time['g'] = pytime.time()
+            # Wis ook de stored_data-cache voor 'g': cmap_lastmodification_time alleen is niet genoeg,
+            # want de PolRGB-berekening zelf (niet alleen de kleurtabel) hangt af van polrgb_params.
+            # Zonder deze stap gebruikt check_presence_data_in_memory de gecachte RGBA-pixels en
+            # roept _calculate_polrgb nooit opnieuw aan, waardoor Z_GAMMA e.d. geen effect hebben.
+            keys_to_delete = [k for k in self.dsg.stored_data if "'g'" in k or '"g"' in k]
+            for k in keys_to_delete:
+                del self.dsg.stored_data[k]
+            if self.pb.firstplot_performed:
+                self.pb.set_newdata([j for j in self.pb.panellist if self.crd.products[j] == 'g'])
+        else:
+            self.polrgb_paramsw[key].setText(str(ft.rifdot0(self.polrgb_params[key])))
+
+    def change_polrgb_cc_hide_above(self):
+        # Bespoke handler i.p.v. change_polrgb_param hierboven: dit veld MOET leeg kunnen zijn (= geen
+        # grens), terwijl change_polrgb_param lege tekst als ongeldige invoer behandelt -- zelfde None/leeg-
+        # patroon als change_volume3d_polrgb_cc_max (Settings -> Miscellaneous, de analoge 3D-only versie).
+        input_text = self.polrgb_cc_hide_abovew.text()
+        number = ft.to_number(input_text)
+        if input_text=='' or not number is None:
+            self.polrgb_cc_hide_above = None if input_text=='' else float(number)
+            self.pb.cmap_lastmodification_time['g'] = pytime.time()
+            # Zelfde cache-reset als in change_polrgb_param hierboven -- nodig omdat dit veld, net als
+            # polrgb_params, de daadwerkelijke PolRGB-berekening beinvloedt (niet alleen de kleurtabel).
+            keys_to_delete = [k for k in self.dsg.stored_data if "'g'" in k or '"g"' in k]
+            for k in keys_to_delete:
+                del self.dsg.stored_data[k]
+            if self.pb.firstplot_performed:
+                self.pb.set_newdata([j for j in self.pb.panellist if self.crd.products[j] == 'g'])
+        else:
+            self.polrgb_cc_hide_abovew.setText('' if self.polrgb_cc_hide_above is None else str(ft.rifdot0(self.polrgb_cc_hide_above)))
+
+    def reset_polrgb_params(self):
+        self.polrgb_params = dict(polrgb_params_default)
+        for key, widget in self.polrgb_paramsw.items():
+            widget.setText(str(ft.rifdot0(self.polrgb_params[key])))
+        self.polrgb_essl_modew.setChecked(bool(self.polrgb_params.get('ESSL_MODE', False)))
+        self._reset_polrgb_essl_alpha_widgets()
+        self.polrgb_cc_hide_above = None
+        self.polrgb_cc_hide_abovew.setText('')
+        self.pb.cmap_lastmodification_time['g'] = pytime.time()
+        # Zelfde cache-reset als in change_polrgb_param hierboven.
+        keys_to_delete = [k for k in self.dsg.stored_data if "'g'" in k or '"g"' in k]
+        for k in keys_to_delete:
+            del self.dsg.stored_data[k]
+        if self.pb.firstplot_performed:
+            self.pb.set_newdata([j for j in self.pb.panellist if self.crd.products[j] == 'g'])
+
+
     def settings_tabalgorithms(self):
         layout = QFormLayout()
         
@@ -3965,21 +6221,396 @@ class GUI(QWidget):
         self.use_scissorw=QCheckBox(); self.use_scissorw.setTristate(False)
         self.use_scissorw.setCheckState(2 if self.use_scissor else 0)
         hbox_use_scissor.addWidget(self.use_scissorw)
-        
+        hbox_cross_section_resolution_factor=QHBoxLayout(); hbox_cross_section_resolution_factor.addStretch(1)
+        self.cross_section_resolution_factorw=QLineEdit(); self.cross_section_resolution_factorw.setText(str(ft.rifdot0(self.cross_section_resolution_factor)))
+        self.cross_section_resolution_factorw.setToolTip("Detail level of the vertical cross-section (F2/'Show "
+            "cross-section >>'), as a multiplier on its base 150x80 raster -- e.g. 2 gives 300x160, 3 gives "
+            "450x240. Higher looks sharper but, since the amount of underlying radar data along the line is "
+            "fixed, pushing this too high can make the cross-section look sparse/speckled again instead of "
+            "sharper. Takes effect immediately on any cross-section(s) currently open.")
+        hbox_cross_section_resolution_factor.addWidget(self.cross_section_resolution_factorw)
+        hbox_cross_section_resolution_factor.addStretch(50)
+        hbox_cross_section_interpolation_mode=QHBoxLayout(); hbox_cross_section_interpolation_mode.addStretch(1)
+        self.cross_section_interpolation_modew=QComboBox()
+        self.cross_section_interpolation_modew.addItems(['nearest','bilinear','bicubic'])
+        self.cross_section_interpolation_modew.setCurrentText(self.cross_section_interpolation_mode)
+        self.cross_section_interpolation_modew.setToolTip("How the cross-section raster's bins are blended "
+            "when stretched to the on-screen image. 'nearest' shows hard-edged blocks (no smoothing); "
+            "'bilinear' smooths gently; 'bicubic' smooths the most, but can show a faint light/dark fringe "
+            "right at hard edges (e.g. the top of an echo). Takes effect immediately.")
+        hbox_cross_section_interpolation_mode.addWidget(self.cross_section_interpolation_modew)
+        hbox_cross_section_interpolation_mode.addStretch(50)
+        hbox_cross_section_n_samples=QHBoxLayout(); hbox_cross_section_n_samples.addStretch(1)
+        self.cross_section_n_samplesw=QLineEdit(); self.cross_section_n_samplesw.setText(str(ft.rifdot0(self.cross_section_n_samples)))
+        self.cross_section_n_samplesw.setToolTip("Number of sample points taken along the A/B line, per "
+            "elevation scan, when computing a cross-section. Higher gives a more densely-filled raster "
+            "(mainly useful if 'Cross-section detail level' above is increased), at the cost of a bit more "
+            "computation each time the cross-section is (re)shown. Takes effect immediately.")
+        hbox_cross_section_n_samples.addWidget(self.cross_section_n_samplesw)
+        hbox_cross_section_n_samples.addStretch(50)
+        hbox_cross_section_height_headroom=QHBoxLayout(); hbox_cross_section_height_headroom.addStretch(1)
+        self.cross_section_height_headroom_percentw=QLineEdit(); self.cross_section_height_headroom_percentw.setText(str(ft.rifdot0(self.cross_section_height_headroom_percent)))
+        self.cross_section_height_headroom_percentw.setToolTip("Extra empty space above the highest echo top, "
+            "as a percentage, when setting the cross-section's vertical scale (there's always at least 8 km "
+            "shown regardless). Higher shows more empty sky above the echo (more 'zoomed out' vertically); "
+            "lower zooms in more tightly on the echo itself. Takes effect immediately.")
+        hbox_cross_section_height_headroom.addWidget(self.cross_section_height_headroom_percentw)
+        hbox_cross_section_height_headroom.addStretch(50)
+
+        hbox_volume3d_grid_res_km=QHBoxLayout(); hbox_volume3d_grid_res_km.addStretch(1)
+        self.volume3d_grid_res_kmw=QLineEdit(); self.volume3d_grid_res_kmw.setText(str(ft.rifdot0(self.volume3d_grid_res_km)))
+        self.volume3d_grid_res_kmw.setToolTip("Horizontal grid resolution (km) for the 3D volume viewer "
+            "(CTRL+SHIFT+4). Finer (lower) shows more detail but is "
+            "slower to compute/render; coarser (higher) is quicker but blockier. Takes effect the next time "
+            "the 3D viewer is opened, not on any already-open window.")
+        hbox_volume3d_grid_res_km.addWidget(self.volume3d_grid_res_kmw)
+        hbox_volume3d_grid_res_km.addStretch(50)
+        hbox_volume3d_z_max_km=QHBoxLayout(); hbox_volume3d_z_max_km.addStretch(1)
+        self.volume3d_z_max_kmw=QLineEdit(); self.volume3d_z_max_kmw.setText(str(ft.rifdot0(self.volume3d_z_max_km)))
+        self.volume3d_z_max_kmw.setToolTip("Maximum height (km) included in the 3D volume reconstruction. "
+            "Updates the 3D viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_z_max_km.addWidget(self.volume3d_z_max_kmw)
+        hbox_volume3d_z_max_km.addStretch(50)
+        hbox_volume3d_z_res_km=QHBoxLayout(); hbox_volume3d_z_res_km.addStretch(1)
+        self.volume3d_z_res_kmw=QLineEdit(); self.volume3d_z_res_kmw.setText(str(ft.rifdot0(self.volume3d_z_res_km)))
+        self.volume3d_z_res_kmw.setToolTip("Vertical grid resolution (km) for the 3D volume viewer. Finer "
+            "(lower) is smoother but slower; coarser (higher) is quicker but blockier vertically. Updates "
+            "the 3D viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_z_res_km.addWidget(self.volume3d_z_res_kmw)
+        hbox_volume3d_z_res_km.addStretch(50)
+        hbox_volume3d_vertical_exaggeration=QHBoxLayout(); hbox_volume3d_vertical_exaggeration.addStretch(1)
+        self.volume3d_vertical_exaggerationw=QLineEdit(); self.volume3d_vertical_exaggerationw.setText(str(ft.rifdot0(self.volume3d_vertical_exaggeration)))
+        self.volume3d_vertical_exaggerationw.setToolTip("How many times taller the height axis is stretched "
+            "on screen in the 3D volume viewer, since a storm's real height (a few km) would otherwise look "
+            "almost flat next to its horizontal extent (tens of km). 1 = no exaggeration (true to scale). "
+            "Updates the 3D viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_vertical_exaggeration.addWidget(self.volume3d_vertical_exaggerationw)
+        hbox_volume3d_vertical_exaggeration.addStretch(50)
+        hbox_volume3d_smoothing_sigma=QHBoxLayout(); hbox_volume3d_smoothing_sigma.addStretch(1)
+        self.volume3d_smoothing_sigmaw=QLineEdit(); self.volume3d_smoothing_sigmaw.setText(str(ft.rifdot0(self.volume3d_smoothing_sigma)))
+        self.volume3d_smoothing_sigmaw.setToolTip("Strength of the horizontal smoothing between neighbouring "
+            "grid columns in the 3D volume viewer, that turns the raw, blocky ('Minecraft') reconstruction "
+            "into a smoother cloud shape. 0 disables smoothing entirely (raw/blocky). Updates the 3D viewer "
+            "live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_smoothing_sigma.addWidget(self.volume3d_smoothing_sigmaw)
+        hbox_volume3d_smoothing_sigma.addStretch(50)
+        hbox_volume3d_tick_interval_km=QHBoxLayout(); hbox_volume3d_tick_interval_km.addStretch(1)
+        self.volume3d_tick_interval_kmw=QLineEdit(); self.volume3d_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_tick_interval_km)))
+        self.volume3d_tick_interval_kmw.setToolTip("Spacing (km) between the ruler tick marks along the 4 "
+            "base edges of the 3D viewer's reference box. Updates the 3D viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_tick_interval_km.addWidget(self.volume3d_tick_interval_kmw)
+        hbox_volume3d_tick_interval_km.addStretch(50)
+        hbox_volume3d_height_tick_interval_km=QHBoxLayout(); hbox_volume3d_height_tick_interval_km.addStretch(1)
+        self.volume3d_height_tick_interval_kmw=QLineEdit(); self.volume3d_height_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_height_tick_interval_km)))
+        self.volume3d_height_tick_interval_kmw.setToolTip("Spacing (km, real height, before the exaggeration "
+            "above) between the ruler tick marks on the 3D viewer's vertical height ruler. Updates the 3D "
+            "viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_height_tick_interval_km.addWidget(self.volume3d_height_tick_interval_kmw)
+        hbox_volume3d_height_tick_interval_km.addStretch(50)
+        hbox_volume3d_gamma=QHBoxLayout(); hbox_volume3d_gamma.addStretch(1)
+        self.volume3d_gammaw=QLineEdit(); self.volume3d_gammaw.setText(str(ft.rifdot0(self.volume3d_gamma)))
+        self.volume3d_gammaw.setToolTip("Gamma correction on the color intensity of the 3D volume data. "
+            "1.0 = no change (original behaviour). Lower than 1 makes mid-range values relatively brighter/"
+            "more contrasty; higher than 1 dims everything except the highest values. Purely a visual "
+            "intensity translation -- the underlying data/values themselves are unaffected. Updates the 3D "
+            "viewer live if one is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_gamma.addWidget(self.volume3d_gammaw)
+        hbox_volume3d_gamma.addStretch(50)
+        hbox_volume3d_pointcloud_stride=QHBoxLayout(); hbox_volume3d_pointcloud_stride.addStretch(1)
+        self.volume3d_pointcloud_stridew=QLineEdit(); self.volume3d_pointcloud_stridew.setText(str(ft.rifdot0(self.volume3d_pointcloud_stride)))
+        self.volume3d_pointcloud_stridew.setToolTip("Density of the point cloud 3D render mode (P key in the "
+            "3D viewer). 1 = every grid point (dense, slow), higher = every Nth point in each direction "
+            "(sparser, faster, more see-through). Updates the 3D viewer live if one is currently open, "
+            "otherwise takes effect the next time it's opened.")
+        hbox_volume3d_pointcloud_stride.addWidget(self.volume3d_pointcloud_stridew)
+        hbox_volume3d_pointcloud_stride.addStretch(50)
+        hbox_volume3d_pointcloud_point_size=QHBoxLayout(); hbox_volume3d_pointcloud_point_size.addStretch(1)
+        self.volume3d_pointcloud_point_sizew=QLineEdit(); self.volume3d_pointcloud_point_sizew.setText(str(ft.rifdot0(self.volume3d_pointcloud_point_size)))
+        self.volume3d_pointcloud_point_sizew.setToolTip("Size (screen pixels) of each point in the point cloud "
+            "3D render mode (P key in the 3D viewer). Larger points overlap more, looking more like a solid "
+            "surface again; smaller points give a sparser, more see-through look but can be hard to make out "
+            "as a shape. Updates the 3D viewer live if one is currently open, otherwise takes effect the next "
+            "time it's opened.")
+        hbox_volume3d_pointcloud_point_size.addWidget(self.volume3d_pointcloud_point_sizew)
+        hbox_volume3d_pointcloud_point_size.addStretch(50)
+        hbox_volume3d_min_value=QHBoxLayout(); hbox_volume3d_min_value.addStretch(1)
+        self.volume3d_min_valuew=QLineEdit()
+        self.volume3d_min_valuew.setText('' if self.volume3d_min_value is None else str(ft.rifdot0(self.volume3d_min_value)))
+        self.volume3d_min_valuew.setToolTip("Values below this threshold are not drawn at all in the 3D "
+            "viewer (in any of the 3 render modes: MIP, translucent, or point cloud), instead of just being "
+            "colored differently -- useful to get rid of clutter from widespread weak echo. For a symmetric, "
+            "two-sided product like V (e.g. -60 to +60 m/s), this instead filters by absolute value around "
+            "zero, keeping both strong inbound and strong outbound values while removing weak values near "
+            "zero on both sides. Leave empty for no limit (original behaviour). Same unit as whichever "
+            "product you're viewing (e.g. dBZ for Z, m/s for V). Updates the 3D viewer live if one is "
+            "currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_min_value.addWidget(self.volume3d_min_valuew)
+        hbox_volume3d_min_value.addStretch(50)
+        hbox_volume3d_polrgb_cc_max=QHBoxLayout(); hbox_volume3d_polrgb_cc_max.addStretch(1)
+        self.volume3d_polrgb_cc_maxw=QLineEdit()
+        self.volume3d_polrgb_cc_maxw.setText('' if self.volume3d_polrgb_cc_max is None else str(ft.rifdot0(self.volume3d_polrgb_cc_max)))
+        self.volume3d_polrgb_cc_maxw.setToolTip("PolRGB only: voxels with CC (correlation coefficient, %) "
+            "ABOVE this threshold are not drawn at all in the 3D viewer (RGB-MIP or point cloud), regardless "
+            "of their Z/ZDR -- useful to hide widespread ordinary rain (which has a high CC regardless of Z) "
+            "without affecting hail (which has a lower CC by definition, so stays visible). Independent of "
+            "'minimum value to draw' above, which filters on Z instead. Leave empty for no limit (original "
+            "behaviour). Has no effect for any product other than PolRGB. Updates the 3D viewer live if one "
+            "is currently open, otherwise takes effect the next time it's opened.")
+        hbox_volume3d_polrgb_cc_max.addWidget(self.volume3d_polrgb_cc_maxw)
+        hbox_volume3d_polrgb_cc_max.addStretch(50)
+        hbox_volume3d_circular_area=QHBoxLayout(); hbox_volume3d_circular_area.addStretch(1)
+        self.volume3d_circular_areaw=QCheckBox(); self.volume3d_circular_areaw.setTristate(False)
+        self.volume3d_circular_areaw.setCheckState(2 if self.volume3d_circular_area else 0)
+        self.volume3d_circular_areaw.setToolTip("When checked, the area drawn with CTRL+SHIFT+drag is "
+            "treated as an ELLIPSE inscribed within that rectangle (center = rectangle center, semi-axes = "
+            "half width/height), instead of the full rectangle. Data outside that ellipse is masked out, in "
+            "both the 2D preview of the drawn area and the 3D data itself -- the 3D box/axes/ticks always "
+            "keep showing the full rectangular extent, only the colored data itself gets cut round. Affects "
+            "the NEXT time you draw an area / open the 3D viewer, not an already-drawn rectangle.")
+        hbox_volume3d_circular_area.addWidget(self.volume3d_circular_areaw)
+        hbox_volume3d_circular_area.addStretch(50)
+
         for hbox in hboxes:
             hbox.addStretch(50)
 
         miscellaneous_widgets=[[QLabel('Maximum amount of radar data kept in memory (GB)'),hbox_max_radardata_in_memory_GBs],
                                [QLabel('Sleep time after plotting'),hbox_sleeptime_after_plotting],
-                               [QLabel('Enable partial drawing of screen'),hbox_use_scissor]]
+                               [QLabel('Enable partial drawing of screen'),hbox_use_scissor],
+                               [QLabel('Cross-section detail level (raster size multiplier)'),hbox_cross_section_resolution_factor],
+                               [QLabel('Cross-section smoothing (interpolation)'),hbox_cross_section_interpolation_mode],
+                               [QLabel('Cross-section line samples per scan'),hbox_cross_section_n_samples],
+                               [QLabel('Cross-section vertical headroom (%)'),hbox_cross_section_height_headroom],
+                               [QLabel('3D viewer: horizontal grid resolution (km)'),hbox_volume3d_grid_res_km],
+                               [QLabel('3D viewer: maximum height (km)'),hbox_volume3d_z_max_km],
+                               [QLabel('3D viewer: vertical grid resolution (km)'),hbox_volume3d_z_res_km],
+                               [QLabel('3D viewer: vertical exaggeration factor'),hbox_volume3d_vertical_exaggeration],
+                               [QLabel('3D viewer: horizontal smoothing strength'),hbox_volume3d_smoothing_sigma],
+                               [QLabel('3D viewer: ruler tick spacing, horizontal (km)'),hbox_volume3d_tick_interval_km],
+                               [QLabel('3D viewer: ruler tick spacing, height (km)'),hbox_volume3d_height_tick_interval_km],
+                               [QLabel('3D viewer: color gamma (1.0 = normal)'),hbox_volume3d_gamma],
+                               [QLabel('3D viewer: point cloud density (1=dense, higher=sparser)'),hbox_volume3d_pointcloud_stride],
+                               [QLabel('3D viewer: point cloud point size (px)'),hbox_volume3d_pointcloud_point_size],
+                               [QLabel('3D viewer: minimum value to draw (empty=no limit)'),hbox_volume3d_min_value],
+                               [QLabel('3D viewer PolRGB: hide CC above (%, empty=no limit)'),hbox_volume3d_polrgb_cc_max],
+                               [QLabel('3D viewer: circular (ellipse) area instead of rectangle'),hbox_volume3d_circular_area]]
         for j in range(0,len(miscellaneous_widgets)):
             miscellaneous_layout.addRow(miscellaneous_widgets[j][0],miscellaneous_widgets[j][1])
+
+        self.cross_section_reset_defaultsw=QPushButton('Reset cross-section settings to defaults', autoDefault=True)
+        miscellaneous_layout.addRow(QLabel(''), self.cross_section_reset_defaultsw)
+        self.volume3d_reset_defaultsw=QPushButton('Reset 3D viewer settings to defaults', autoDefault=True)
+        miscellaneous_layout.addRow(QLabel(''), self.volume3d_reset_defaultsw)
 
         self.settingsmiscellaneous.setLayout(miscellaneous_layout)
         self.max_radardata_in_memory_GBsw.editingFinished.connect(self.change_max_radardata_in_memory_GBs)
         self.sleeptime_after_plottingw.editingFinished.connect(self.change_sleeptime_after_plotting)
         self.use_scissorw.stateChanged.connect(self.change_use_scissor)
+        self.cross_section_resolution_factorw.editingFinished.connect(self.change_cross_section_resolution_factor)
+        self.cross_section_interpolation_modew.currentTextChanged.connect(self.change_cross_section_interpolation_mode)
+        self.cross_section_n_samplesw.editingFinished.connect(self.change_cross_section_n_samples)
+        self.cross_section_height_headroom_percentw.editingFinished.connect(self.change_cross_section_height_headroom_percent)
+        self.cross_section_reset_defaultsw.clicked.connect(self.reset_cross_section_settings)
+        self.volume3d_grid_res_kmw.editingFinished.connect(self.change_volume3d_grid_res_km)
+        self.volume3d_z_max_kmw.editingFinished.connect(self.change_volume3d_z_max_km)
+        self.volume3d_z_res_kmw.editingFinished.connect(self.change_volume3d_z_res_km)
+        self.volume3d_vertical_exaggerationw.editingFinished.connect(self.change_volume3d_vertical_exaggeration)
+        self.volume3d_smoothing_sigmaw.editingFinished.connect(self.change_volume3d_smoothing_sigma)
+        self.volume3d_tick_interval_kmw.editingFinished.connect(self.change_volume3d_tick_interval_km)
+        self.volume3d_height_tick_interval_kmw.editingFinished.connect(self.change_volume3d_height_tick_interval_km)
+        self.volume3d_gammaw.editingFinished.connect(self.change_volume3d_gamma)
+        self.volume3d_pointcloud_stridew.editingFinished.connect(self.change_volume3d_pointcloud_stride)
+        self.volume3d_pointcloud_point_sizew.editingFinished.connect(self.change_volume3d_pointcloud_point_size)
+        self.volume3d_min_valuew.editingFinished.connect(self.change_volume3d_min_value)
+        self.volume3d_polrgb_cc_maxw.editingFinished.connect(self.change_volume3d_polrgb_cc_max)
+        self.volume3d_circular_areaw.stateChanged.connect(self.change_volume3d_circular_area)
+        self.volume3d_reset_defaultsw.clicked.connect(self.reset_volume3d_settings)
+
+    def reset_cross_section_settings(self):
+        """Resets the 4 tunable cross-section settings (Settings -> Miscellaneous) to their shipped defaults
+        (see cross_section_settings_default), updates the widgets to reflect that, and immediately refreshes
+        any cross-section(s) currently open -- the same 'reset, update widgets, refresh live view' pattern as
+        reset_polrgb_params uses for the PolRGB tab."""
+        d = cross_section_settings_default
+        self.cross_section_resolution_factor = d['cross_section_resolution_factor']
+        self.cross_section_interpolation_mode = d['cross_section_interpolation_mode']
+        self.cross_section_n_samples = d['cross_section_n_samples']
+        self.cross_section_height_headroom_percent = d['cross_section_height_headroom_percent']
+
+        self.cross_section_resolution_factorw.setText(str(ft.rifdot0(self.cross_section_resolution_factor)))
+        self.cross_section_interpolation_modew.setCurrentText(self.cross_section_interpolation_mode)
+        self.cross_section_n_samplesw.setText(str(ft.rifdot0(self.cross_section_n_samples)))
+        self.cross_section_height_headroom_percentw.setText(str(ft.rifdot0(self.cross_section_height_headroom_percent)))
+
+        for panel in list(self.pb.cross_section_active_panels):
+            self.pb.show_cross_section(panel)
+
+    def reset_volume3d_settings(self):
+        """Resets the 7 tunable 3D-viewer settings (Settings -> Miscellaneous) to their shipped defaults
+        (see volume3d_settings_default), updates the widgets to reflect that, and live-refreshes the 3D
+        viewer if one is currently open (see _live_refresh_volume_3d) -- same 'reset, update widgets,
+        refresh live view' pattern as reset_cross_section_settings."""
+        d = volume3d_settings_default
+        self.volume3d_grid_res_km = d['volume3d_grid_res_km']
+        self.volume3d_z_max_km = d['volume3d_z_max_km']
+        self.volume3d_z_res_km = d['volume3d_z_res_km']
+        self.volume3d_vertical_exaggeration = d['volume3d_vertical_exaggeration']
+        self.volume3d_smoothing_sigma = d['volume3d_smoothing_sigma']
+        self.volume3d_tick_interval_km = d['volume3d_tick_interval_km']
+        self.volume3d_height_tick_interval_km = d['volume3d_height_tick_interval_km']
+        self.volume3d_gamma = d['volume3d_gamma']
+        self.volume3d_pointcloud_stride = d['volume3d_pointcloud_stride']
+        self.volume3d_pointcloud_point_size = d['volume3d_pointcloud_point_size']
+        self.volume3d_min_value = d['volume3d_min_value']
+        self.volume3d_circular_area = d['volume3d_circular_area']
+        self.volume3d_polrgb_cc_max = d['volume3d_polrgb_cc_max']
+
+        self.volume3d_grid_res_kmw.setText(str(ft.rifdot0(self.volume3d_grid_res_km)))
+        self.volume3d_z_max_kmw.setText(str(ft.rifdot0(self.volume3d_z_max_km)))
+        self.volume3d_z_res_kmw.setText(str(ft.rifdot0(self.volume3d_z_res_km)))
+        self.volume3d_vertical_exaggerationw.setText(str(ft.rifdot0(self.volume3d_vertical_exaggeration)))
+        self.volume3d_smoothing_sigmaw.setText(str(ft.rifdot0(self.volume3d_smoothing_sigma)))
+        self.volume3d_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_tick_interval_km)))
+        self.volume3d_height_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_height_tick_interval_km)))
+        self.volume3d_gammaw.setText(str(ft.rifdot0(self.volume3d_gamma)))
+        self.volume3d_pointcloud_stridew.setText(str(ft.rifdot0(self.volume3d_pointcloud_stride)))
+        self.volume3d_pointcloud_point_sizew.setText(str(ft.rifdot0(self.volume3d_pointcloud_point_size)))
+        self.volume3d_min_valuew.setText('' if self.volume3d_min_value is None else str(ft.rifdot0(self.volume3d_min_value)))
+        self.volume3d_polrgb_cc_maxw.setText('' if self.volume3d_polrgb_cc_max is None else str(ft.rifdot0(self.volume3d_polrgb_cc_max)))
+        self.volume3d_circular_areaw.setCheckState(2 if self.volume3d_circular_area else 0)
+        self._live_refresh_volume_3d()
+
+    def change_volume3d_grid_res_km(self):
+        number = ft.to_number(self.volume3d_grid_res_kmw.text())
+        if not number is None and number>0:
+            self.volume3d_grid_res_km = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_grid_res_kmw.setText(str(ft.rifdot0(self.volume3d_grid_res_km)))
+
+    def change_volume3d_z_max_km(self):
+        number = ft.to_number(self.volume3d_z_max_kmw.text())
+        if not number is None and number>0:
+            self.volume3d_z_max_km = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_z_max_kmw.setText(str(ft.rifdot0(self.volume3d_z_max_km)))
+
+    def change_volume3d_z_res_km(self):
+        number = ft.to_number(self.volume3d_z_res_kmw.text())
+        if not number is None and number>0:
+            self.volume3d_z_res_km = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_z_res_kmw.setText(str(ft.rifdot0(self.volume3d_z_res_km)))
+
+    def change_volume3d_vertical_exaggeration(self):
+        number = ft.to_number(self.volume3d_vertical_exaggerationw.text())
+        if not number is None and number>0:
+            self.volume3d_vertical_exaggeration = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_vertical_exaggerationw.setText(str(ft.rifdot0(self.volume3d_vertical_exaggeration)))
+
+    def change_volume3d_smoothing_sigma(self):
+        number = ft.to_number(self.volume3d_smoothing_sigmaw.text())
+        if not number is None and number>=0:
+            self.volume3d_smoothing_sigma = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_smoothing_sigmaw.setText(str(ft.rifdot0(self.volume3d_smoothing_sigma)))
+
+    def change_volume3d_tick_interval_km(self):
+        number = ft.to_number(self.volume3d_tick_interval_kmw.text())
+        if not number is None and number>0:
+            self.volume3d_tick_interval_km = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_tick_interval_km)))
+
+    def change_volume3d_height_tick_interval_km(self):
+        number = ft.to_number(self.volume3d_height_tick_interval_kmw.text())
+        if not number is None and number>0:
+            self.volume3d_height_tick_interval_km = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_height_tick_interval_kmw.setText(str(ft.rifdot0(self.volume3d_height_tick_interval_km)))
+
+    def change_volume3d_gamma(self):
+        number = ft.to_number(self.volume3d_gammaw.text())
+        if not number is None and 0.1<=number<=5.0:
+            self.volume3d_gamma = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_gammaw.setText(str(ft.rifdot0(self.volume3d_gamma)))
+
+    def change_volume3d_pointcloud_stride(self):
+        number = ft.to_number(self.volume3d_pointcloud_stridew.text())
+        if not number is None and number>=1:
+            self.volume3d_pointcloud_stride = int(round(number))
+            self._live_refresh_volume_3d()
+        else: self.volume3d_pointcloud_stridew.setText(str(ft.rifdot0(self.volume3d_pointcloud_stride)))
+
+    def change_volume3d_pointcloud_point_size(self):
+        number = ft.to_number(self.volume3d_pointcloud_point_sizew.text())
+        if not number is None and number>0:
+            self.volume3d_pointcloud_point_size = float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_pointcloud_point_sizew.setText(str(ft.rifdot0(self.volume3d_pointcloud_point_size)))
+
+    def change_volume3d_min_value(self):
+        input_text = self.volume3d_min_valuew.text()
+        number = ft.to_number(input_text)
+        if input_text=='' or not number is None:
+            self.volume3d_min_value = None if input_text=='' else float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_min_valuew.setText('' if self.volume3d_min_value is None else str(ft.rifdot0(self.volume3d_min_value)))
+
+    def change_volume3d_polrgb_cc_max(self):
+        input_text = self.volume3d_polrgb_cc_maxw.text()
+        number = ft.to_number(input_text)
+        if input_text=='' or not number is None:
+            self.volume3d_polrgb_cc_max = None if input_text=='' else float(number)
+            self._live_refresh_volume_3d()
+        else: self.volume3d_polrgb_cc_maxw.setText('' if self.volume3d_polrgb_cc_max is None else str(ft.rifdot0(self.volume3d_polrgb_cc_max)))
+
+    def change_volume3d_circular_area(self):
+        self.volume3d_circular_area = True if self.volume3d_circular_areaw.checkState()==2 else False
+        # Bestaande, al getekende rechthoek meteen bijwerken naar de nieuwe voorkeur (i.p.v. pas bij de
+        # volgende keer tekenen), zodat de 2D-voorvertoning altijd meteen klopt met deze instelling.
+        if getattr(self.pb, 'volume3d_rect_a', None) is not None:
+            self.pb.draw_volume3d_rect()
+
+    def change_cross_section_n_samples(self):
+        input_text=self.cross_section_n_samplesw.text()
+        number=ft.to_number(input_text)
+        if not number is None and number>=100:
+            self.cross_section_n_samples=int(round(number))
+            for panel in list(self.pb.cross_section_active_panels):
+                self.pb.show_cross_section(panel)
+        else: self.cross_section_n_samplesw.setText(str(ft.rifdot0(self.cross_section_n_samples)))
+
+    def change_cross_section_height_headroom_percent(self):
+        input_text=self.cross_section_height_headroom_percentw.text()
+        number=ft.to_number(input_text)
+        if not number is None and number>=0:
+            self.cross_section_height_headroom_percent=float(number)
+            for panel in list(self.pb.cross_section_active_panels):
+                self.pb.show_cross_section(panel)
+        else: self.cross_section_height_headroom_percentw.setText(str(ft.rifdot0(self.cross_section_height_headroom_percent)))
         
+    def change_cross_section_resolution_factor(self):
+        input_text=self.cross_section_resolution_factorw.text()
+        number=ft.to_number(input_text)
+        if not number is None and number>0:
+            self.cross_section_resolution_factor=float(number)
+            # Live refresh: redraw any cross-section(s) currently open with the new raster size right away,
+            # using their existing A/B line -- mirrors how change_polrgb_param immediately re-renders any
+            # panel showing product 'g', rather than requiring the person to close and reopen the view.
+            for panel in list(self.pb.cross_section_active_panels):
+                self.pb.show_cross_section(panel)
+        else: self.cross_section_resolution_factorw.setText(str(ft.rifdot0(self.cross_section_resolution_factor)))
+
+    def change_cross_section_interpolation_mode(self):
+        self.cross_section_interpolation_mode=self.cross_section_interpolation_modew.currentText()
+        # Live and safe: nlr_plotting.py now pre-builds one ImageVisual per panel for EACH interpolation mode
+        # at startup (see __init__ and cross_section_visual), rather than creating/mutating one at runtime --
+        # so switching mode here just means re-running show_cross_section for any panel with an open cross-
+        # section, which picks the already-fully-wired visual matching the new mode and hides the other 2.
+        for panel in list(self.pb.cross_section_active_panels):
+            self.pb.show_cross_section(panel)
+
     def change_max_radardata_in_memory_GBs(self):
         input_max_radardata_in_memory_GBs=self.max_radardata_in_memory_GBsw.text()
         number=ft.to_number(input_max_radardata_in_memory_GBs)
@@ -4061,6 +6692,8 @@ class GUI(QWidget):
         global plottimes_max
         keyboard_layout=QFormLayout()
         keyboard_text=[['ENTER','Plot for current input'],
+                  ['SHIFT+click (twice)','Draw an A/B measuring line on the current panel'],
+                  ['F2','Show/hide a vertical Velocity cross-section along the current A/B line'],
                   ['LEFT/RIGHT, SHIFT+LEFT/RIGHT','Go to previous/next radar volume, go one hour backward/forward in time.'],
                   ['END/SHIFT+END', "Set the date and time equal to 'c' (most current data), with/without plotting the data."],
                   ['SPACE',"Start/stop animation, or stop continuing backward/forward in time. Animation ends at input date and time. If both 'c', then end time gets updated when new data available."],        
@@ -4266,8 +6899,6 @@ class GUI(QWidget):
                                 
 
     def closeEvent(self, event=None):
-        QCoreApplication.instance().quit()
-        
         self.derivedproducts_filename_version = self.dp.filename_version
         
         settings={}
@@ -4284,6 +6915,14 @@ class GUI(QWidget):
             pickle.dump(self.dsg.attributes_IDs,f)
         with open(self.dsg.attributes_variable_filename,'wb') as f:
             pickle.dump(self.dsg.attributes_variable,f)
+
+        # Only tell Qt to quit once every settings file has been fully written to disk. The previous order (quit()
+        # called first) meant the application shutdown raced against these writes -- if the process got torn
+        # down before a write completed, the result would be an incomplete/stale settings file on the next
+        # startup. This is a plausible explanation for a one-off, non-reproducible crash on a later startup
+        # (e.g. a missing or stale dict entry) that can't be reproduced afterwards, since a subsequent normal
+        # close would simply overwrite it correctly again.
+        QCoreApplication.instance().quit()
              
 
 

@@ -6,6 +6,8 @@ opa=os.path.abspath
 import numpy as np
 import re
 import time as pytime
+import copy
+import h5py
 
 import nlr_globalvars as gv
 import nlr_background as bg
@@ -66,12 +68,35 @@ class Source_KMI():
         self.crd=self.dsg.crd
         self.dp=self.dsg.dp
         self.pb = self.gui.pb
+        self._jabbeke_combined_scan_files = {} # combined_scan_index -> filepath, see _build_jabbeke_combined_z_scans
                 
+    def _current_z_dir_index(self):
+        """Returns the currently-active directory index for this radar's 'Z' dataset (0 or 1) -- for Jabbeke,
+        this reflects whichever of the 2 directories (long/short range, toggled via CTRL+D /
+        self.crd.change_dir_index in nlr_changedata.py) is currently selected; for every other radar in this
+        class there's only ever 1 directory, so this harmlessly returns 0."""
+        radar_dataset = self.dsg.get_radar_dataset(self.crd.radar, 'Z')
+        return self.gui.radardata_dirs_indices.get(radar_dataset, 0)
                                                                                             
     def correct_filename(self, filename, product=None):
         file_extension = os.path.splitext(filename)[1][1:]
-        i_p = gv.i_p.get(product, None)
-        pname = gv.productnames_KMI[file_extension].get(i_p, None)
+        # Try the product string itself as a direct key first (this matters for 'u'-prefixed/unfiltered
+        # products, e.g. 'uz' -- see filepath below, which builds this as 'u'+product when
+        # productunfiltered is True). gv.productnames_KMI has its own dedicated entries for these (e.g.
+        # 'uz': 'dBuZ' for the '.h5' extension -- TH, the unfiltered counterpart of DBZH, see
+        # Source_MeteoGate in nlr_currentdata.py for how that file gets downloaded and saved). Falling
+        # through to gv.i_p[product] instead would map 'uz' to the SAME category as 'z' (since i_p only
+        # tracks broad categories like 'z'/'v'/'w', not the filtered/unfiltered distinction), which would
+        # incorrectly look up the FILTERED product's name (dBZ) for what should be the unfiltered one
+        # (dBuZ) -- or, before this 'uz' entry was even added to gv.productnames_KMI's lookup path here,
+        # would silently match every '.h5' file as "correct" (see the git history of this function for that
+        # earlier, more broken state), which is what caused SHIFT+U on a KMI/VMM radar to sometimes load the
+        # wrong file's data into a Z-shaped panel and show '(OLD)' in the title bar (self.data_isold in
+        # nlr_plotting.py, set whenever self.dsg.get_data raises an exception while reading mismatched data).
+        pname = gv.productnames_KMI[file_extension].get(product, None)
+        if pname is None:
+            i_p = gv.i_p.get(product, None)
+            pname = gv.productnames_KMI[file_extension].get(i_p, None)
         
         correct_name = False
         if file_extension == 'hdf':
@@ -85,6 +110,15 @@ class Source_KMI():
                 correct_name = filename[-9:-4] == dataset_str
         elif file_extension == 'h5':
             correct_name = filename[16:-3] == pname+'.vol' if pname else True
+            # Note on Jabbeke's 2 DBZH range variants (short/long, see Source_MeteoGate in
+            # nlr_currentdata.py): these are told apart purely by which of the 2 configured directories for
+            # 'Jabbeke_Z' (see self.gui.radardata_dirs in nlr.py) self.crd.directory currently points at --
+            # self.dsg.files_datetime, which this function filters, only ever contains files from ONE of
+            # those 2 directories at a time (whichever is currently selected via
+            # self.gui.radardata_dirs_indices['Jabbeke_Z'], switched with the existing CTRL+D shortcut). So
+            # no extra check is needed here: by construction, a Jabbeke '.h5' DBZH file passing the check
+            # above is always the one matching whichever range is currently selected, because the other
+            # range's files simply aren't in this list to begin with.
             
         return correct_name
 
@@ -113,6 +147,203 @@ class Source_KMI():
             product = 'z'
         return [filepath, product] if source_function == self.get_scans_information else [filepath, productunfiltered, polarization]
     
+    
+
+    def _read_raw_scan_elevations(self, filepath):
+        """Reads elangle/nbins/rscale directly for every scan in an ODIM HDF5 file, without touching any
+        shared self.dsg state. Used by _build_jabbeke_combined_z_scans below to inspect both of Jabbeke's Z
+        files (long and short range) independently before deciding how to combine them."""
+        result = {}
+        with h5py.File(filepath, 'r') as hf:
+            scans = [int(j[7:]) for j in hf if j.startswith('dataset')]
+            for j in scans:
+                try:
+                    attrs = hf['dataset'+str(j)]['where'].attrs
+                    result[j] = (ft.rndec(float(attrs['elangle']), 2), int(attrs['nbins']), float(attrs['rscale'])/1000.)
+                except Exception:
+                    continue
+        return result
+
+    def _find_z_file(self, dir_index, product='z'):
+        """Locates the actual Z-family file for the given directory index (0=long range, 1=short range for
+        Jabbeke; other radars in this class only ever have dir_index 0) and product ('z' for DBZH/filtered,
+        'uz' for TH/unfiltered -- both exist side by side in the same directory, per timestamp), independent
+        of self.crd.directory -- same approach as the Z/V-search loops and _fix_z_scan_structure elsewhere in
+        this class."""
+        directory = self.dsg.get_directory(self.crd.date, self.crd.time, self.crd.radar, 'Z', dir_index=dir_index)
+        if not directory or not os.path.exists(directory):
+            return None
+        try:
+            files = os.listdir(directory)
+        except Exception:
+            return None
+        matches = [i for i in files if i[:12] == self.crd.date+self.crd.time and self.correct_filename(i, product)]
+        return directory+'/'+matches[0] if matches else None
+
+    def _build_jabbeke_combined_z_scans(self):
+        """Combines Jabbeke's 2 separate Z files (long range: 299 km; short range: 150 km) into a single,
+        continuously-scannable list of elevations, instead of requiring CTRL+D to switch between the 2
+        ranges. This mirrors the existing precedent in ODIM_hdf5.get_scans_information for Zaventem, where
+        scannumbers_all[product][scan] already gives a RAW scan number relative to a product-SPECIFIC file
+        (there, a separate v/w file; here, either of Jabbeke's 2 Z files) -- get_data below is extended to
+        look up, per combined scan index, which of the 2 files it actually needs to open.
+
+        IMPORTANT, confirmed by directly inspecting actual downloaded files (not just the MeteoGate catalog,
+        which doesn't show this): the 'long' range file does NOT only contain its 6 unique low elevations
+        (0.3-3.8 degrees) -- it redundantly ALSO contains the same 5 higher elevations (4.8/6.5/9.0/13.0/25.0
+        degrees, at the same 150 km range) that the 'short' file has. These aren't simple duplicates though --
+        confirmed by comparing actual pixel data between the two copies of the same elevation, they're 2
+        genuinely independent scans of that elevation a few minutes apart (once as part of the long-range
+        sweep, once as part of the short-range sweep), so which one gets shown is a real, meaningful choice,
+        not just an implementation detail. Naively combining both files' full scan lists produces 5 duplicate
+        elevations (20 raw entries for only 15 actually distinct elevations), which is confirmed to break
+        both the DOWN/UP scan-stepping (each duplicate needs 2 presses to get past) and the 1-9/0/SHIFT+1-5
+        direct-scan-number shortcuts (which only ever reach the first 15 of the 20 raw entries, permanently
+        hiding the last 5) -- fixed below by de-duplicating on elevation angle, keeping only one occurrence
+        per shared elevation.
+
+        Which of the 2 copies wins for those 5 shared elevations is controlled by CTRL+D (the same shortcut
+        that used to switch the whole range before this combining feature existed): dir_index 0 (long,
+        '(299 km)') prefers the long file's copy, dir_index 1 (short, '(150 km)') prefers the short file's.
+        This keeps CTRL+D meaningful instead of becoming a dead shortcut now that both ranges are always
+        combined into one list -- it no longer switches the whole range, just which copy wins on overlap.
+
+        Populates self._jabbeke_combined_scan_files[combined_scan_index] = filepath, and the usual
+        scanangles_all/scannumbers_all/radial_bins_all/radial_res_all['z'] (plus every other already-present
+        Z-family product key, e.g. 'uz'/'d'/'p'/'k'/'c' -- but NOT 'v'/'w', which come from a wholly separate
+        file and must keep their own, independently-read structure).
+        """
+        long_filepath = self._find_z_file(dir_index=0)
+        short_filepath = self._find_z_file(dir_index=1)
+
+        # CTRL+D still toggles self.gui.radardata_dirs_indices as before (see _current_z_dir_index) -- reused
+        # here to decide which file's copy of a shared elevation is preferred, via which one is added to
+        # 'combined' FIRST below (Python's sort() is stable, so among entries with an identical elangle, the
+        # one added first keeps that relative order after sorting, and is therefore the one the de-duplication
+        # step right after keeps).
+        preferred_first, preferred_second = (
+            (long_filepath, short_filepath) if self._current_z_dir_index() == 0 else (short_filepath, long_filepath)
+        )
+
+        combined = []  # (elangle, filepath, raw_scan, nbins, rscale)
+        for filepath in (preferred_first, preferred_second):
+            if not filepath:
+                continue
+            for raw_scan, (elangle, nbins, rscale) in self._read_raw_scan_elevations(filepath).items():
+                combined.append((elangle, filepath, raw_scan, nbins, rscale))
+
+        if not combined:
+            return False  # Neither file could be read -- caller falls back to the normal, single-file path.
+
+        combined.sort(key=lambda t: t[0])
+
+        # De-duplicate: keep only the first entry for each distinct elevation angle (see docstring above for
+        # why duplicates occur at all, and how CTRL+D controls which copy is kept for a shared elevation).
+        deduplicated = []
+        seen_elangles = set()
+        for entry in combined:
+            elangle = entry[0]
+            if elangle in seen_elangles:
+                continue
+            seen_elangles.add(elangle)
+            deduplicated.append(entry)
+        combined = deduplicated
+
+        # Both the filtered (DBZH/'z') and unfiltered (TH/'uz') files live side by side in the same directory
+        # per timestamp -- precompute the unfiltered sibling for each of the (up to 2) directories involved,
+        # so SHIFT+U keeps working for the combined scans too instead of always forcing the filtered file.
+        uz_sibling = {}
+        for dir_index in (0, 1):
+            z_fp = self._find_z_file(dir_index=dir_index, product='z')
+            if z_fp:
+                uz_sibling[z_fp] = self._find_z_file(dir_index=dir_index, product='uz')
+
+        scanangles_all = {}
+        scannumbers_all = {}
+        radial_bins_all = {}
+        radial_res_all = {}
+        scan_files = {}
+        for i, (elangle, filepath, raw_scan, nbins, rscale) in enumerate(combined, start=1):
+            scanangles_all[i] = elangle
+            scannumbers_all[i] = [raw_scan]
+            radial_bins_all[i] = nbins
+            radial_res_all[i] = rscale
+            scan_files[i] = {'z': filepath, 'uz': uz_sibling.get(filepath)}
+
+        self.dsg.scanangles_all['z'] = scanangles_all
+        self.dsg.scannumbers_all['z'] = scannumbers_all
+        self.dsg.radial_bins_all['z'] = radial_bins_all
+        self.dsg.radial_res_all['z'] = radial_res_all
+        self._jabbeke_combined_scan_files = scan_files
+
+        # Copy onto every other already-present Z-family product key (e.g. 'uz'/'d'/'p'/'k'/'c'), same as
+        # ODIM_hdf5.get_scans_information's own copy-to-all-keys step would -- but explicitly excluding
+        # 'v'/'w', which come from a separate file and must keep their own structure untouched.
+        for p in list(self.dsg.scannumbers_all):
+            if p in ('v', 'w'):
+                continue
+            for attr in gv.volume_attributes_p:
+                self.dsg.__dict__[attr][p] = copy.deepcopy(self.dsg.__dict__[attr]['z'])
+
+        return True
+
+    def _fix_z_scan_structure(self):
+        """Re-reads Z's own actual file and re-populates the 'z'-keyed scan structure (scanangles_all,
+        scannumbers_all, radial_bins_all, radial_res_all) from it. Needed because the normal scan-info read
+        always uses the V file first (product='v', to obtain the Nyquist velocity -- see get_scans_information),
+        and ODIM_hdf5.get_scans_information always stores whatever it just read under the 'z' key regardless of
+        which file that actually was. For Jabbeke and Wideumont, V's file has FEWER elevations than Z's (always
+        missing Z's lowest one(s) -- confirmed via the MeteoGate API), so without this correction Z's displayed
+        scan angles get silently replaced by V's shorter set. For Helchteren this just re-derives the same
+        values (Z and V share the exact same 12 elevations there), a harmless no-op.
+
+        For Jabbeke specifically, this now combines BOTH of its Z files (long+short range) into one
+        continuous scan list instead of just re-reading whichever one CTRL+D currently has selected -- see
+        _build_jabbeke_combined_z_scans above.
+
+        Called from BOTH get_scans_information AND get_data below -- NOT just get_scans_information -- because
+        get_scans_information can be skipped entirely by NLradar's own cross-session volume-attribute cache
+        (restore_volume_attributes in nlr_datasourcegeneral.py) whenever a radar/date/time combination has
+        already been seen before, e.g. after switching to a different radar and back. get_data has no such
+        cache and always runs, so only calling this from there guarantees the correction can't silently stop
+        taking effect after a radar switch (confirmed: that's exactly what was happening before this was moved
+        here -- switching to another radar and back made Z revert to showing V's angles again).
+        """
+        saved_nyquist = copy.deepcopy(self.dsg.nyquist_velocities_all_mps)
+        saved_nyquist_low = copy.deepcopy(self.dsg.low_nyquist_velocities_all_mps)
+        saved_nyquist_high = copy.deepcopy(self.dsg.high_nyquist_velocities_all_mps)
+        # ODIM_hdf5.get_scans_information also has a side effect where it copies whatever it just read (labeled
+        # 'z' internally) onto EVERY product key already present in self.dsg.scannumbers_all -- including 'v',
+        # if that key already exists from elsewhere in the broader read pipeline. Save/restore these too, so
+        # this correction can't overwrite V's own, correct structure with Z's in the other direction.
+        saved_v_attrs = {attr: copy.deepcopy(self.dsg.__dict__[attr].get('v')) for attr in gv.volume_attributes_p
+                          if 'v' in self.dsg.__dict__[attr]}
+        try:
+            if self.crd.radar == 'Jabbeke':
+                if self._build_jabbeke_combined_z_scans():
+                    return
+                # Neither Z file could be read -- fall through to the normal, single-file behavior below as a
+                # last resort, same as for every other radar in this class.
+            # NOT using self.filepath('z', ...) here: that function only ever searches self.dsg.files_datetime,
+            # which reflects self.crd.directory -- and that can still be pointing at the V directory at this
+            # point. Instead, explicitly resolve Z's own directory first (independent of self.crd.directory)
+            # and search directly within that, the same way the Z/V-search loops elsewhere already do.
+            z_directory = self.dsg.get_directory(self.crd.date, self.crd.time, self.crd.radar, 'Z', dir_index=self._current_z_dir_index())
+            z_filepath = None
+            if z_directory and os.path.exists(z_directory):
+                z_files = os.listdir(z_directory)
+                z_matches = [i for i in z_files if i[:12] == self.crd.date+self.crd.time and self.correct_filename(i, 'z')]
+                if z_matches:
+                    z_filepath = z_directory+'/'+z_matches[0]
+            if z_filepath:
+                self.dsg.ODIM_hdf5.get_scans_information(z_filepath, 'z')
+        except Exception:
+            pass # If this fails for any reason, we're no worse off than before this correction existed.
+        self.dsg.nyquist_velocities_all_mps = saved_nyquist
+        self.dsg.low_nyquist_velocities_all_mps = saved_nyquist_low
+        self.dsg.high_nyquist_velocities_all_mps = saved_nyquist_high
+        for attr, value in saved_v_attrs.items():
+            self.dsg.__dict__[attr]['v'] = value
 
     def get_scans_information(self):
         #product 'v' is tried initially, because it enables the program to obtain the Nyquist velocities
@@ -120,15 +351,104 @@ class Source_KMI():
         #the velocity. In this case it is therefore necessary to take 'z' as product.        
         product = 'v' if self.crd.radar != 'Zaventem' else 'z'
         filepath_hdf, filepath_product = self.filepath(product, source_function=self.get_scans_information)
-        if not filepath_hdf or filepath_product != product and any('.vol' in i for i in self.dsg.files_datetime):
+        # NOTE: the '.vol' check just below (and its twin a few lines down) must test the actual file
+        # EXTENSION, not just look for '.vol' as a substring -- Source_Leonardo's own files end in the literal
+        # extension '.vol' (confirmed via Source_Leonardo.get_filenames_directory: filenames=[j for j in entries
+        # if j[-4:]=='.vol']), whereas KMI/MeteoGate '.h5' files are deliberately named e.g.
+        # '...dBZ.vol.h5' (see Source_MeteoGate.get_urls_and_savenames_downloadfile in nlr_currentdata.py --
+        # the '.vol' there exists purely so Source_KMI.correct_filename's h5-extension check, filename[16:-3]
+        # == pname+'.vol', matches). A plain substring check ('.vol' in i) can't tell these apart, and
+        # incorrectly treats normal KMI h5 files as Leonardo data whenever filepath_product happens to differ
+        # from the requested product -- which didn't matter for Helchteren before VRADH became unavailable
+        # (filepath_product always equaled the requested 'v' then), but now that the 'v' lookup for Helchteren
+        # legitimately falls back to a 'z' file instead (a mismatch), this false positive routed everything to
+        # source_Leonardo (wrong format), breaking display even though the correct '.h5' file was right there.
+        if (not filepath_hdf or filepath_product != product and any(i[-4:] == '.vol' for i in self.dsg.files_datetime)) \
+        and self.crd.radar in gv.radars_with_datasets:
+            # self.crd.directory's content may not match the dataset (Z or V) this call actually needs. The
+            # previous approach here temporarily overwrote the SHARED instance attributes self.crd.directory and
+            # self.dsg.files_datetime to probe the other dataset's folder, then restored them afterwards. That is
+            # unsafe: those same attributes are read/written by the background auto-download mechanism at any
+            # time, completely independently of user action (confirmed: the resulting file-not-found symptom
+            # occurred consistently, not tied to animation/looping) -- so a concurrent access during the brief
+            # window where these were temporarily repointed could interleave with this function's own logic,
+            # leaving filepath_hdf/filepath_product built from a mix of the two dataset's state. This version
+            # never mutates shared state at all: it lists each candidate directory directly into a local variable
+            # and matches the filename locally, so there is nothing left for a concurrent access to race with.
+            #
+            # Deliberately NOT skipping a candidate whose directory happens to equal self.crd.directory (unlike
+            # the old version): the very fact that we're here means the normal self.filepath() lookup against
+            # self.dsg.files_datetime (which may be stale, e.g. from before the background downloader added a
+            # new file) just failed for the current directory too -- a fresh, independent directory listing can
+            # still succeed even when self.crd.directory is already the theoretically-correct one, which matters
+            # in particular when viewing the V dataset itself (self.crd.directory already ends in '_V').
+            for candidate_dataset in ('Z', 'V'):
+                candidate_directory = self.dsg.get_directory(self.crd.date, self.crd.time, self.crd.radar, candidate_dataset, dir_index=0)
+                if not candidate_directory or not os.path.exists(candidate_directory):
+                    continue
+                try:
+                    candidate_files = os.listdir(candidate_directory)
+                except Exception:
+                    continue
+                matches = [i for i in candidate_files if i[:12] == self.crd.date+self.crd.time and self.correct_filename(i, product)]
+                if matches:
+                    filepath_hdf, filepath_product = candidate_directory+'/'+matches[0], product
+                    break
+        if not filepath_hdf or filepath_product != product and any(i[-4:] == '.vol' for i in self.dsg.files_datetime):
             return self.dsg.source_Leonardo.get_scans_information()
         else:
             #product is used to determine whether it is possible to obtain the Nyquist velocities (only when product=='v')
             self.dsg.ODIM_hdf5.get_scans_information(filepath_hdf, filepath_product)
+            if filepath_product == 'v':
+                self._fix_z_scan_structure()
         
     def get_data(self, j): #j is the panel
         filepath, self.crd.using_unfilteredproduct[j], polarization = self.filepath(gv.i_p[self.crd.products[j]], self.crd.productunfiltered[j], 
                                                                                     self.crd.polarization[j])
+        if not filepath and self.crd.radar in gv.radars_with_datasets:
+            # Same underlying issue as in get_scans_information above -- see that function's comment for the full
+            # explanation of why this searches locally (avoiding a race with the background auto-download
+            # mechanism) and deliberately does NOT skip a candidate directory just because it equals
+            # self.crd.directory (needed so viewing the V dataset itself can still succeed via a fresh listing).
+            product_for_search = gv.i_p[self.crd.products[j]]
+            for candidate_dataset in ('Z', 'V'):
+                candidate_directory = self.dsg.get_directory(self.crd.date, self.crd.time, self.crd.radar, candidate_dataset, dir_index=0)
+                if not candidate_directory or not os.path.exists(candidate_directory):
+                    continue
+                try:
+                    candidate_files = os.listdir(candidate_directory)
+                except Exception:
+                    continue
+                matches = [i for i in candidate_files if i[:12] == self.crd.date+self.crd.time and self.correct_filename(i, product_for_search)]
+                if matches:
+                    filepath = candidate_directory+'/'+matches[0]
+                    self.crd.using_unfilteredproduct[j] = self.crd.productunfiltered[j]
+                    polarization = self.crd.polarization[j]
+                    break
+        if self.crd.radar in gv.radars_with_datasets and gv.i_p.get(self.crd.products[j]) == 'z':
+            # See _fix_z_scan_structure's docstring for why this must ALSO be called here, not just from
+            # get_scans_information: this guarantees the correction runs every time a Z panel is actually
+            # displayed, regardless of whether get_scans_information itself got skipped this time due to
+            # NLradar's own cross-session attribute cache (confirmed: switching to a different radar and back
+            # was enough to make Z silently revert to V's angles again, because that skipped
+            # get_scans_information -- and therefore the correction -- entirely on the return visit).
+            self._fix_z_scan_structure()
+            if self.crd.radar == 'Jabbeke':
+                # Jabbeke's Z scans are combined from 2 separate files (long+short range, see
+                # _build_jabbeke_combined_z_scans) -- self.dsg.scannumbers_all['z'][scan] is already the
+                # correct RAW scan number for whichever of those 2 files this particular combined scan index
+                # actually lives in, but 'filepath' above was resolved generically (just 'the Z directory
+                # CTRL+D currently has selected'), which is only right for scans that happen to live in that
+                # same file. Override it with the specific file this scan actually needs -- and specifically
+                # its 'uz' (TH/unfiltered) sibling when SHIFT+U is active, otherwise this would always show
+                # the filtered (DBZH) data regardless of that setting.
+                combined_entry = self._jabbeke_combined_scan_files.get(self.crd.scans[j])
+                if combined_entry:
+                    key = 'uz' if self.crd.productunfiltered[j] else 'z'
+                    combined_filepath = combined_entry.get(key) or combined_entry.get('z')
+                    if combined_filepath:
+                        filepath = combined_filepath
+                        self.crd.using_unfilteredproduct[j] = key == 'uz' and combined_entry.get('uz') is not None
         if filepath:
             self.crd.using_verticalpolarization[j] = polarization == 'V'
             self.dsg.ODIM_hdf5.get_data(filepath, j)
@@ -348,6 +668,8 @@ class Source_DWD():
         self.dp = self.dsg.dp
         self.pb = self.gui.pb
         self.import_classes = {'buf.bz2': self.dsg.DWD_bufr, 'buf': self.dsg.DWD_bufr, 'hd5': self.dsg.DWD_odimh5}
+        self._warned_unrecognized_products = set() # Tracks (radar, product_str) combinations already warned about,
+        #to avoid repeatedly warning about the same unrecognized product identifier.
         
         
         
@@ -363,11 +685,36 @@ class Source_DWD():
             product_files = {p:[] for p in gv.products_all}
             for i,f in enumerate(self.dsg.files_datetime):
                 product_str = f.split('_')[-2]
+
+                # DWD-HD5: TV is only used by the explicit TV reflectivity route.
+                # Do not register tv as normal velocity here, otherwise V/SRV can load TV.
+                # TH (the H-pol counterpart, used for unfiltered Z via SHIFT+U) is excluded here for the same
+                # reason: both are handled separately elsewhere, not via the normal per-product matching below,
+                # so they are not unrecognized products and shouldn't trigger the warning just below.
+                if product_str in ('tv', 'th'):
+                    files_exclude.append(f)
+                    continue
+
                 matches = [k for k,v in gv.productnames_DWD['hd5'].items() if product_str in ([v] if type(v) is str else v)]
+                if not matches:
+                    # This product identifier is not in gv.productnames_DWD['hd5'] (and is not 'th'/'tv', handled
+                    # above), meaning this file is silently ignored below. Could be an unsupported product, but
+                    # could also mean the DWD started providing a new product. Warn once per radar+identifier.
+                    warn_key = (self.crd.radar, product_str)
+                    if not warn_key in self._warned_unrecognized_products:
+                        self._warned_unrecognized_products.add(warn_key)
+                        msg = (f"onbekende DWD-productidentifier '{product_str}' aangetroffen voor radar {self.crd.radar} "
+                               "(bijbehorende bestanden worden genegeerd). Mogelijk biedt de DWD een nieuw product aan "
+                               "dat nog niet wordt ondersteund.")
+                        print("NLradar: "+msg)
+                        gv.log_product_check("WAARSCHUWING - DWD - "+msg)
+                    files_exclude.append(f)
+                    continue
+
                 # It's possible that multiple versions are available for a single product, e.g. rhohv and urhohv for CC. In that
                 # case show the first product version in gv.productnames_DWD['hd5'] that is available. The check for product_files
                 # below ensures that no file for another product version gets added to the list of available files.
-                if not matches or f.replace(product_str, '') in product_files[matches[0]]:
+                if f.replace(product_str, '') in product_files[matches[0]]:
                     files_exclude.append(f)
                     continue
                 product = matches[0]
@@ -375,6 +722,8 @@ class Source_DWD():
                 for pv in pvs:
                     if files_pvs[i] == pv or not product in self.dsg.products_version_dependent:
                         filenames_per_pv[pv].append(f)
+            
+            gv.log_product_check(f"OK - DWD - check uitgevoerd voor radar {self.crd.radar}, geen onbekende producten gevonden.")
             
             desired_pv = self.gui.radardata_product_versions[self.dsg.radar_dataset]
             pv = desired_pv if desired_pv in filenames_per_pv else pvs[0]
@@ -389,6 +738,12 @@ class Source_DWD():
         self.products_per_fileid, self.fileids_per_product, self.files_per_product_per_fileid = {}, {}, {}
         for f in filenames:
             product_str =  f.split('_')[-2 if self.get_extension() == 'hd5' else 2]
+
+            # DWD-HD5: TV is handled separately in get_data() when Z + Shift+U + V-pol is requested.
+            # It must not become part of the normal velocity file lists.
+            if self.get_extension() == 'hd5' and product_str == 'tv':
+                continue
+
             product = [k for k,v in gv.productnames_DWD[self.get_extension()].items() if product_str in ([v] if type(v) is str else v)][0]
             product_str = '_'+product_str+'_'
             idx = f.index(product_str)+len(product_str)
@@ -401,7 +756,19 @@ class Source_DWD():
             self.products_per_fileid[fileid].append(product)
             self.fileids_per_product[product].append(fileid)
             self.files_per_product_per_fileid[product][fileid].append(f)
-        
+
+        if self.get_extension() == 'hd5' and 'p' in self.fileids_per_product:
+            # DWD does not publish a native KDP file. KDP is instead derived from PHIDP, so here 'k' is
+            # aliased onto exactly the same underlying files as 'p' -- the actual KDP retrieval (smoothing
+            # + differentiation of PHIDP) happens in nlr_importdata.py (DWD_odimh5.read_data), which checks
+            # for i_p == 'k' and computes it from the PHIDP data it reads out of these same files.
+            self.fileids_per_product['k'] = list(self.fileids_per_product['p'])
+            self.files_per_product_per_fileid['k'] = {fid: list(files) for fid, files in
+                                                        self.files_per_product_per_fileid['p'].items()}
+            for fid in self.fileids_per_product['k']:
+                if 'k' not in self.products_per_fileid[fid]:
+                    self.products_per_fileid[fid].append('k')
+
     def get_scans_information(self):
         self.get_file_availability_info()
     
@@ -417,22 +784,81 @@ class Source_DWD():
         
     def get_data(self, j): #j is the panel
         self.get_file_availability_info()
-         
-        i_p = gv.i_p[self.crd.products[j]]
-        if i_p in self.fileids_per_product:
+
+        requested_product = self.crd.products[j]
+        extension = self.get_extension()
+
+        # DWD HD5 reflectiviteit:
+        # - Z zonder Shift+U gebruikt normale DBZH.
+        # - Shift+U + Z gebruikt TH bij H-pol en TV bij V-pol.
+        # Beide worden als product 'z' ingelezen, zodat de gewone reflectivity-kleurtabel actief blijft.
+        if extension == 'hd5' and self.crd.productunfiltered[j] and requested_product == 'z':
+            i_p = 'z'
             fileid = self.dsg.scannumbers_all[i_p][self.crd.scans[j]][0]
-            extension = self.get_extension()
+            marker = '_tv_' if self.crd.polarization[j] == 'V' else '_th_'
+            refl_files = []
+
+            for f in self.dsg.files_datetime:
+                if marker not in f:
+                    continue
+                try:
+                    idx = f.index(marker) + len(marker)
+                    fid = int(f[idx:f.index('-20')]) if '-20' in f else float(f[idx+15:-11])
+                except Exception:
+                    continue
+                if fid == fileid:
+                    refl_files.append(f)
+
+            if refl_files:
+                filepaths = [opa(os.path.join(self.crd.directory, f)) for f in refl_files]
+                self.import_classes[extension].get_data(filepaths, j, 'z')
+                self.crd.using_unfilteredproduct[j] = True
+                self.crd.using_verticalpolarization[j] = self.crd.polarization[j] == 'V'
+                return
+
+            raise Exception('Product not available')
+
+        # DWD HD5: Shift+U heeft geen effect op andere producten dan Z.
+        # Voor oude/niet-HD5 formaten blijft de bestaande uV-logica behouden.
+        if extension != 'hd5' and self.crd.productunfiltered[j] and requested_product == 'v':
+            requested_product = 'uv'
+
+        i_p = gv.i_p.get(requested_product, requested_product)
+
+        # SRV ('s') gebruikt velocity ('v'). Bij DWD HD5 nooit naar uV/TV schakelen.
+        file_product = requested_product
+
+        if requested_product == 's':
+            file_product = 'uv' if extension != 'hd5' and self.crd.productunfiltered[j] else 'v'
+
+        if file_product in self.fileids_per_product:
+            fileid = self.dsg.scannumbers_all[i_p][self.crd.scans[j]][0]
+
             if extension == 'hd5':
-                # When combining data for the 2 product versions, both filenames need to be supplied
-                filepaths = [opa(os.path.join(self.crd.directory, i)) for i in self.files_per_product_per_fileid[i_p][fileid]]
-                self.import_classes[extension].get_data(filepaths, j)
+                files = self.files_per_product_per_fileid[file_product][fileid]
+
+                # DWD-HD5: normal velocity/SRV must use VRADH only.
+                # TV is loaded only by the explicit TV reflectivity route above.
+                if file_product == 'v':
+                    vradh_files = [i for i in files if '_vradh_' in i.lower()]
+                    if vradh_files:
+                        files = vradh_files
+
+                filepaths = [opa(os.path.join(self.crd.directory, i)) for i in files]
+                self.import_classes[extension].get_data(filepaths, j, file_product)
             else:
-                filepath = opa(os.path.join(self.crd.directory, self.files_per_product_per_fileid[i_p][fileid][0]))
+                filepath = opa(os.path.join(
+                    self.crd.directory,
+                    self.files_per_product_per_fileid[file_product][fileid][0]
+                ))
                 self.import_classes[extension].get_data(filepath, j)
+
+            self.crd.using_unfilteredproduct[j] = requested_product in ('uz', 'uv') and extension != 'hd5'
+            self.crd.using_verticalpolarization[j] = False
+
         else:
             raise Exception('Product not available')
 
-    
     def get_data_multiple_scans(self,product,scans,productunfiltered=False,polarization='H',apply_dealiasing=True,max_range=None):
         self.get_file_availability_info()
         extension = self.get_extension()

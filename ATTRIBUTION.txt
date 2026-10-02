@@ -1,0 +1,19 @@
+NLradar - data sources and attribution
+======================================
+
+NLradar downloads publicly available data directly from the providers below, on the user's own initiative.
+It does not redistribute this data. Please respect each provider's terms and give credit when you publish
+images made with NLradar.
+
+- Weather radar data: KNMI (Royal Netherlands Meteorological Institute, own free API key required),
+  DWD (Deutscher Wetterdienst, open data), and EUMETNET OPERA / Open Radar Data via MeteoGate
+  (CC BY 4.0, with exceptions noted in the data's metadata; data remain the property of the radar operator,
+  e.g. RMI/KMI Belgium).
+- Freezing-level / temperature profiles: weather data by Open-Meteo.com (https://open-meteo.com),
+  licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/). Free for non-commercial use only.
+- Fallback for older dates: radiosonde soundings from the University of Wyoming, Department of
+  Atmospheric Science (https://weather.uwyo.edu).
+- Background map: the bundled local map tiles. No online map services are used.
+
+NLradar is originally developed by Bram van 't Veen and distributed under the GNU GPL v3 (see LICENSE).
+This is an unofficial, modified version.

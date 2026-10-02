@@ -318,7 +318,19 @@ class Change_RadarData(QObject):
         This means that we switch to the next directory string for which data is available for self.selected_date. 
         If there is no other directory string for which data is available for self.selected_date, then the index is not changed.
         """
-        radar_dataset, dir_string_list = self.dsg.get_variables(self.selected_radar, self.selected_dataset)[:2]
+        # self.selected_dataset reflects which dataset (Z or V) NLradar is currently navigating
+        # datetimes/directories for -- it's not necessarily the same as which dataset the user is currently
+        # looking at, and can legitimately differ from it (see this class's docstring on self.selected_dataset
+        # vs. self.dataset: it can get set to whichever dataset happens to be available at a given moment).
+        # For Jabbeke specifically, the only radar for which CTRL+D currently has more than 1 directory to
+        # switch between (see Source_MeteoGate in nlr_currentdata.py and self.gui.radardata_dirs['Jabbeke_Z']
+        # in nlr.py), that distinction only exists for 'Z' -- 'Jabbeke_V' always has just 1 directory, so
+        # blindly using self.selected_dataset here can end up resolving to 'Jabbeke_V' (1 directory, nothing
+        # to switch to) even while the user is looking at a 'Z' panel, making CTRL+D silently do nothing.
+        # Force 'Z' here for Jabbeke -- it's the only dataset this distinction is meaningful for anyway, so
+        # there's no ambiguity in choosing it explicitly rather than deferring to self.selected_dataset.
+        dataset_for_dir_switch = 'Z' if self.selected_radar == 'Jabbeke' else self.selected_dataset
+        radar_dataset, dir_string_list = self.dsg.get_variables(self.selected_radar, dataset_for_dir_switch)[:2]
         n_dirs=len(dir_string_list)
                                             
         dir_index = self.gui.radardata_dirs_indices[radar_dataset]
@@ -342,11 +354,32 @@ class Change_RadarData(QObject):
                 
         if new_dir_index != dir_index:
             self.gui.radardata_dirs_indices[radar_dataset] = new_dir_index
+            if self.selected_radar == 'Jabbeke':
+                # process_datetimeinput (called right below) starts by resetting self.selected_dataset to
+                # self.save_selected_dataset (see that function: "if self.selected_radar in
+                # gv.radars_with_datasets: self.selected_dataset=self.save_selected_dataset") -- so if THAT
+                # still holds the dataset from before this switch (e.g. 'V', if the user's last dataset
+                # interaction happened to leave it there), the subsequent directory lookup inside
+                # process_datetimeinput / determine_list_filedatetimes would use 'V' again, silently
+                # resolving back to 'Jabbeke_V' (which only ever has 1 directory) instead of the
+                # newly-selected 'Jabbeke_Z' directory -- even though dataset_for_dir_switch above correctly
+                # forced 'Z' just for picking radar_dataset/new_dir_index. Setting both here ensures the
+                # newly-selected Jabbeke_Z directory index actually takes effect for what gets displayed,
+                # not just for the index value itself.
+                self.selected_dataset = self.save_selected_dataset = 'Z'
                 
             self.changing_subdataset=True
             self.process_datetimeinput()
             self.changing_subdataset=False
-            
+            if self.selected_radar == 'Jabbeke':
+                # The regular set_newdata()->set_titles() refresh, triggered above via process_datetimeinput(),
+                # doesn't reliably pick up the new Jabbeke short/long-range indicator ('(150 km)'/'(300 km)') --
+                # the underlying data does switch correctly, but the title text can stay stale until some other
+                # action (resize, panel layout change, app restart) forces a fresh set_titles() call. Force that
+                # here explicitly, so the title is guaranteed to be in sync right after CTRL+D, regardless of why
+                # the normal refresh path doesn't already do this reliably.
+                self.pb.set_titles()
+
     def change_product_version(self):
         """Update the product version in self.gui.radardata_product_versions[radar_dataset].
         This means that we switch to the next product version if there is more than one available.
@@ -377,6 +410,16 @@ class Change_RadarData(QObject):
         
     def change_productunfiltered(self):
         if pytime.time()-self.end_time<self.gui.sleeptime_after_plotting: return
+
+        # DWD: Shift+U wordt alleen gebruikt voor reflectiviteit Z -> TH/TV.
+        # Bij V, SRV, W, ZDR, CC, enz. mag Shift+U niets doen.
+        dwd = gv.data_sources.get(self.radar) == 'DWD'
+        if dwd and self.products[self.pb.panel] != 'z':
+            self.productunfiltered[self.pb.panel] = False
+            self.using_unfilteredproduct[self.pb.panel] = False
+            self.end_time = pytime.time()
+            return
+
         self.productunfiltered[self.pb.panel] = not self.productunfiltered[self.pb.panel] #True implies filtered product, False unfiltered product
         if self.plot_mode=='Row':
             self.productunfiltered, panellist_change=self.change_variable_in_row(self.productunfiltered)
@@ -388,7 +431,18 @@ class Change_RadarData(QObject):
             panellist_change=self.pb.panellist
         else:
             panellist_change=[self.pb.panel]
-            
+
+        if dwd:
+            # Alleen Z-panelen mogen door Shift+U aangepast worden.
+            panellist_change = [j for j in panellist_change if self.products[j] == 'z']
+            for j in self.pb.panellist:
+                if self.products[j] != 'z':
+                    self.productunfiltered[j] = False
+                    self.using_unfilteredproduct[j] = False
+            if not panellist_change:
+                self.end_time = pytime.time()
+                return
+
         self.pb.set_newdata(panellist_change)
         self.end_time=pytime.time()
 
@@ -804,6 +858,21 @@ class Change_RadarData(QObject):
     def desired_timestep_minutes(self):
         return self.gui.desired_timestep_minutes if not self.gui.desired_timestep_minutes == 'V' else self.volume_timestep_m
            
+    def _max_scan_for_panel(self, panel):
+        """Returns the highest valid scan index for the given panel's radar+product combination. Normally
+        this is just len(self.dsg.scanangles_all['z']) (used throughout this file as a general stand-in for
+        'the number of scans in this volume', since almost all radars have the same scan count for every
+        product). Jabbeke is now an exception: after combining its 2 Z files into one continuous 15-elevation
+        list, Z has more scans (15) than V (9) -- previously Z had only 6 or 9 (depending on which of the 2
+        original files CTRL+D had selected), which happened to be close to V's own count, so this mismatch
+        was barely noticeable before. Selecting scan 10+ on a Jabbeke V panel doesn't have a matching scan to
+        show, correctly resulting in an '(OLD)' indicator -- correct behavior, but avoidable by capping V's
+        own max scan count here to what it actually has.
+        """
+        if self.radar == 'Jabbeke' and gv.i_p.get(self.products[panel]) == 'v' and 'v' in self.dsg.scanangles_all:
+            return len(self.dsg.scanangles_all['v'])
+        return len(self.dsg.scanangles_all['z'])
+
     def process_keyboardinput(self,leftright_step=0,downup_step=0,new_scan=0,new_product='0',call_ID=None,from_timer=True): 
         # from cProfile import Profile
         # profiler = Profile()
@@ -970,16 +1039,24 @@ class Change_RadarData(QObject):
                 if self.plot_mode=='All':
                     downup_step=new_scan-self.scans[self.pb.panel]; new_scan=0
                 else:
-                    self.scans[self.pb.panel]=new_scan
+                    self.scans[self.pb.panel]=min(new_scan, self._max_scan_for_panel(self.pb.panel))
                               
             if abs(downup_step)==1.1 and self.products[self.pb.panel] not in gv.plain_products: 
-                self.scans[self.pb.panel] = min(max(1, self.scans[self.pb.panel]+int(downup_step)), len(self.dsg.scanangles_all['z']))
+                self.scans[self.pb.panel] = min(max(1, self.scans[self.pb.panel]+int(downup_step)), self._max_scan_for_panel(self.pb.panel))
             elif downup_step!=0 and self.scans_currentlyvisible_notplain:
                 step=downup_step
+                # Same reasoning as _max_scan_for_panel above: this used to always use
+                # len(self.dsg.scanangles_all['z']) as the upper bound for every panel here, which is wrong
+                # for a Jabbeke V panel now that Z has more scans (15) than V (9) -- pressing UP while
+                # already on V's highest scan (25 degrees) would compute a 'valid' step based on Z's larger
+                # count, resulting in an out-of-range scan getting set for the V panel. Use the tightest
+                # (smallest) per-panel bound among all currently-visible non-plain panels instead, so the
+                # step can never overshoot whichever panel has the least room.
+                max_scan_bound = min(self._max_scan_for_panel(j) for j in self.pb.panellist if self.products[j] not in gv.plain_products)
                 if min(self.scans_currentlyvisible_notplain)<=-downup_step and downup_step<0: 
                     step=1-min(self.scans_currentlyvisible_notplain)
-                elif max(self.scans_currentlyvisible_notplain)+downup_step>len(self.dsg.scanangles_all['z']) and downup_step>0: 
-                    step=len(self.dsg.scanangles_all['z'])-max(self.scans_currentlyvisible_notplain)
+                elif max(self.scans_currentlyvisible_notplain)+downup_step>max_scan_bound and downup_step>0: 
+                    step=max_scan_bound-max(self.scans_currentlyvisible_notplain)
                                 
                 """It is possible that there is a scan pair of which one scan has a large range and low Nyquist velocity, and one has a smaller range
                 and higher Nyquist velocity. In this case it can be desired to show both scans of this scan pair, with e.g. scan 1 for the 

@@ -34,7 +34,7 @@ def get_closest_datetime(datetimes, datetime):
 
 
 station_ids = {'De Bilt':'260','Den Helder':'235','Herwijnen':'356'}
-dir_sfcobs = gv.programdir+'/Generated_files/sfc_obs'
+dir_sfcobs = gv.userdir+'/Generated_files/sfc_obs'
 if not os.path.exists(dir_sfcobs):
     os.makedirs(dir_sfcobs)
     
@@ -94,7 +94,7 @@ class SfcObsKNMI():
         self.obs['station_coords'] = [self.f['lat'][index], self.f['lon'][index]]
         self.obs['dist'] = 0
         
-        with open('stations_KNMI.txt', 'w') as f:
+        with open(os.path.join(gv.userdir+'/Generated_files', 'stations_KNMI.txt') if gv.frozen else 'stations_KNMI.txt', 'w') as f:
             l = max([len(self.f['stationname'][i]) for i in range(len(self.f['stationname']))])
             for i in range(len(self.f['station'])):
                 f.write(self.f['stationname'][i]+' '*(l-len(self.f['stationname'][i]))+'\t'+str(self.f['lat'][i])+', '+str(self.f['lon'][i]))
@@ -438,7 +438,7 @@ class SfcObsKMI():
         # obs['Td'] = None
         obs['datetime'] = datetime
         
-        with open('stations_KMI.txt', 'w') as f:
+        with open(os.path.join(gv.userdir+'/Generated_files', 'stations_KMI.txt') if gv.frozen else 'stations_KMI.txt', 'w') as f:
             l = max([len(j[4]) for j in stns_list])
             for i,j in enumerate(stns_list):
                 f.write(j[4]+' '*(l-len(j[4]))+'\t'+str(stns_coords[i][0])+', '+str(stns_coords[i][1]))

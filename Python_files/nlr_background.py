@@ -180,7 +180,7 @@ def set_colortables(colortables_dirs_filenames,products,productunits): #Is not r
             if float(productvalues[0])<float(productvalues[-1]): data=data[::-1]
 
             cmapfilename_add='colortable_'+j+'_added.csv'
-            np.savetxt(opa(os.path.join(gv.programdir+'/Generated_files',cmapfilename_add)),data,fmt='%s',newline='\r\n',delimiter=',')
+            np.savetxt(opa(os.path.join(gv.userdir+'/Generated_files',cmapfilename_add)),data,fmt='%s',newline='\r\n',delimiter=',')
             
     return tickslim_modified, ticks_steps, excluded_values_for_ticks, included_values_for_ticks, changed_colortables, productunits
 
@@ -1199,12 +1199,12 @@ def string_size(string):
         s += char_size(string[i:i+2])
     return s-sum([char_size(char) for char in string[1:-1]])
 
-def get_titles(relwidth,fontsizes_main_titles,radar,panels,panellist,panelnumber_to_plotnumber,plotnumber_to_panelnumber,data_empty,using_olddata,products,date,scantimes,scanangles,using_unfilteredproduct,using_verticalpolarization,apply_dealiasing,productunits,stormmotion,PP_parameter_values,PP_parameters_panels,show_vvp):
+def get_titles(relwidth,fontsizes_main_titles,radar,panels,panellist,panelnumber_to_plotnumber,plotnumber_to_panelnumber,data_empty,using_olddata,products,date,scantimes,scanangles,using_unfilteredproduct,using_verticalpolarization,apply_dealiasing,productunits,stormmotion,PP_parameter_values,PP_parameters_panels,show_vvp,jabbeke_range_km=None):
     if all([data_empty[j] for j in panellist]):
         #No title_top in this case
         return '','',{}
     date_formatted = ft.format_date(date,'YYYYMMDD->YYYY-MM-DD')
-    title_top=radar+'  '+date_formatted
+    title_top=radar+'  '+date_formatted+('  ('+str(jabbeke_range_km)+' km)' if jabbeke_range_km is not None else '')
     title_bottom = gv.data_sources[radar]
     
     if (stormmotion[1] != 0. or 's' in products.values()) and not show_vvp:
@@ -1215,11 +1215,16 @@ def get_titles(relwidth,fontsizes_main_titles,radar,panels,panellist,panelnumber
         product = products[panelnumber]
         paneltitle=''
         
-        if using_unfilteredproduct[panelnumber]: 
-            paneltitle += 'u'
-        paneltitle += gv.productnames[product]
-        if using_verticalpolarization[panelnumber]: 
-            paneltitle+='v'
+        if gv.data_sources.get(radar) == 'DWD' and product == 'z' and using_unfilteredproduct[panelnumber]:
+            # DWD HD5: Shift+U on reflectivity displays TH (H-pol) or TV (V-pol).
+            # Keep this as a display-only change; internally it remains product 'z'.
+            paneltitle += 'TV' if using_verticalpolarization[panelnumber] else 'TH'
+        else:
+            if using_unfilteredproduct[panelnumber]: 
+                paneltitle += 'u'
+            paneltitle += gv.productnames[product]
+            if using_verticalpolarization[panelnumber]: 
+                paneltitle+='v'
         if product in ('v','s') and apply_dealiasing[panelnumber]: 
             paneltitle += '*'
         if product not in gv.plain_products:

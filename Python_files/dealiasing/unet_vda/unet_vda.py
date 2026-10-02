@@ -8,6 +8,14 @@ import numpy as np
 import time as pytime
 import tensorflow as tf
 tf.debugging.disable_traceback_filtering()
+# FIX (6 juli 2026): forceert deterministische (reproduceerbare) uitkomsten van TensorFlow-operaties.
+# Zonder dit kan TensorFlow op de CPU berekeningen (bv. sommaties/reducties) in een net-iets andere volgorde
+# over meerdere rekenkernen verdelen bij herhaalde, inhoudelijk identieke aanroepen -- door afrondingsverschillen
+# bij kommagetallen geeft dat dan een net-iets ander resultaat per keer. Waargenomen (via losse diagnostische
+# logging, 6 juli 2026): bij exact dezelfde ruwe Herwijnen-scan gaf de dealiasing bij herhaling waarden tussen
+# ca. 20.4 en 23.6 m/s in plaats van steeds hetzelfde getal -- een aannemelijke verklaring voor de willekeurige,
+# moeilijk te reproduceren foute velocity-weergave. Moet voor elk gebruik van TensorFlow-operaties gezet worden.
+tf.config.experimental.enable_op_determinism()
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 gpus = tf.config.experimental.list_physical_devices('GPU')
@@ -131,11 +139,19 @@ class Unet_VDA():
         The latter is more computationally efficient, and is the default (self.run_only_once_for_na_gt_1 = True). In the latter
         case correction factors for the actual data rows are obtained obtained by comparing their potentially aliased velocities
         with the dealiased velocities from the model.
+
+        BELANGRIJK (6 juli 2026): alle tussenresultaten die hier vroeger via self.data/self.orig_data/self.orig_vn werden
+        doorgegeven, zijn nu lokale variabelen / functie-argumenten en return-waarden geworden. Reden: Unet_VDA is een
+        SINGLE, gedeeld object (zie module-niveau 'VDA = vda' in nlr_datasourcegeneral.py), dus als run_model() voor
+        paneel/scan A wordt aangeroepen terwijl een nog lopende aanroep voor paneel/scan B deze instance-variabelen nog
+        nodig heeft, overschrijft de een de ander -- wat een aannemelijke verklaring is voor de willekeurige, moeilijk
+        te reproduceren verkeerde velocity-waarden die vooral optraden bij snel wisselen tussen panelen/producten.
         """
         remap_data = data_shape[0]%360 != 0
         # Azimuthal dimension should be an integer multiple of 360. If not, then certain rows are either repeated or skipped, in order
         # to arrive at the desired dimension.
         _data_shape, remap_indices = data_shape, tf.constant(0)
+        orig_data, orig_vn = data, vn
         if remap_data:
             remap_indices, data, vn, _data_shape = self.remap_azi_dim(data, vn, data_shape)
             
@@ -161,11 +177,11 @@ class Unet_VDA():
             dealiased_vel = self.run_vda(v_mean, vn_mean, _data_shape)
             
             n = tf.round((tf.repeat(dealiased_vel, na, axis=0)-data)/(2*vn))
-            self.data = data+2*n*vn
+            result_data = data+2*n*vn
         else:
-            self.data = [self.run_vda(data[::na], vn[::na], _data_shape),
+            result_data = [self.run_vda(data[::na], vn[::na], _data_shape),
                          self.run_vda(data[1::na], vn[1::na], _data_shape)]
-            self.data = tf.reshape(tf.stack(self.data, axis=1), _data_shape)
+            result_data = tf.reshape(tf.stack(result_data, axis=1), _data_shape)
             
         # Restore original azimuthal dimension, now that velocity is dealiased. In the case that the number of rows had to be reduced to
         # arrive at the desired dimension, some data rows will not have been dealiased yet. For these a correction factor is obtained by
@@ -173,15 +189,15 @@ class Unet_VDA():
         # This is done before performing extra dealiasing, since using the reference velocity might not work well in regions of strong azimuthal
         # shear. Resulting errors can then be corrected by the extra dealiasing procedure.
         if remap_data:
-            self.data, vn = self.restore_azi_dim(remap_indices, data_shape)
+            result_data, vn = self.restore_azi_dim(remap_indices, data_shape, result_data, orig_data, orig_vn)
                
         if extra_dealias and vn[0,0] > 10:
-            self.data = self.perform_extra_dealiasing(vn, data_shape)
+            result_data = self.perform_extra_dealiasing(vn, data_shape, result_data)
 
-        return self.data
+        return result_data
     
     def remap_azi_dim(self, data, vn, data_shape):
-        self.orig_data, self.orig_vn, orig_n_azi = data, vn, tf.cast(data_shape[0], 'float32')
+        orig_n_azi = tf.cast(data_shape[0], 'float32')
         n_azi = tf.cast(tf.round(data_shape[0]/360)*360, 'float32')
         remap_indices = tf.cast(tf.range(0.5, n_azi, dtype='float32')*orig_n_azi/n_azi, 'int32')[:, None]
         data = tf.gather_nd(data, remap_indices)
@@ -189,20 +205,20 @@ class Unet_VDA():
         _data_shape = tf.stack((tf.cast(n_azi, 'int32'), data_shape[1]))
         return remap_indices, data, vn, _data_shape
     
-    def restore_azi_dim(self, remap_indices, data_shape):
-        data = tf.scatter_nd(remap_indices, self.data, data_shape)
+    def restore_azi_dim(self, remap_indices, data_shape, result_data, orig_data, orig_vn):
+        data = tf.scatter_nd(remap_indices, result_data, data_shape)
         if len(remap_indices) > data_shape[0]:
             indices_counts = tf.cast(tf.unique_with_counts(remap_indices[:,0])[2], 'float32')
             # Without division by indices_counts, velocity values will be doubled when remap_indices contains a repeated index
             data /= indices_counts[:,None]
-        vn = self.orig_vn
+        vn = orig_vn
         
         select = tf.concat((remap_indices[1:,0]-remap_indices[:-1,0] == 2, [False]), axis=0)
         i = tf.boolean_mask(remap_indices, select)+1
         im1, ip1 = i-1, (i+1) % data_shape[0]
         
         v_ref = 0.5*(tf.gather_nd(data, im1)+tf.gather_nd(data, ip1))
-        v_i, vn_i = tf.gather_nd(self.orig_data, i), tf.gather_nd(vn, i)
+        v_i, vn_i = tf.gather_nd(orig_data, i), tf.gather_nd(vn, i)
         n = tf.round((v_ref-v_i)/(2*vn_i))
         update = v_i+2*n*vn_i
         data = tf.tensor_scatter_nd_update(data, i, update)
@@ -231,14 +247,14 @@ class Unet_VDA():
         out = self.vda(inp)
         return out['dealiased_vel'][0,pad_deg:-pad_deg,:n_rad,0]
     
-    def perform_extra_dealiasing(self, vn, data_shape):
+    def perform_extra_dealiasing(self, vn, data_shape, result_data):
         n_azi, n_rad = data_shape[0], data_shape[1]
         rows = tf.transpose(tf.tile([tf.range(n_azi)], (n_rad, 1)))
         
-        mask = ~tf.math.is_nan(self.data)
+        mask = ~tf.math.is_nan(result_data)
         mask.set_shape((None, None))
         mask_indices = tf.cast(tf.where(mask), 'int32')
-        _data = tf.boolean_mask(self.data, mask)
+        _data = tf.boolean_mask(result_data, mask)
         _rows = tf.boolean_mask(rows, mask)
         
         diff_1d = tf.concat(([0], tf.where(_rows[1:] == _rows[:-1], _data[1:]-_data[:-1], 0.)), axis=0)
@@ -250,7 +266,7 @@ class Unet_VDA():
         corr2, valid_data2 = self.calculate_correction_ints(diff, mask, vn, -1)
                     
         corr = tf.where(valid_data & valid_data2 & (corr != corr2), 0., tf.where(valid_data, corr, corr2))
-        return self.data - 2*vn*corr
+        return result_data - 2*vn*corr
     
     def calculate_correction_ints(self, diff, mask, vn, direction=1):
         s = np.s_[:] if direction == 1 else np.s_[:,::-1]

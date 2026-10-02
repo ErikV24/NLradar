@@ -1,3 +1,28 @@
+# NLradar – continued development (unofficial)
+
+This is an **unofficial continuation** of [NLradar](https://github.com/Bram94/NLradar) by Bram van 't Veen.
+It has been **modified by Erik (last update September 2026)**. The original copyright of Bram van 't Veen
+remains in all source files; this version is, like the original, distributed under the GNU General Public License v3 (see `LICENSE`).
+It is a hobby project and comes **without any warranty** (GPLv3, sections 15-16).
+
+Main additions compared to the original include: hail products (MESH, POSH, POH, SHI), hydrometeor classification (HCLASS),
+ZDR column depth, C-band attenuation correction (ZPHI), PolRGB (incl. an ESSL table option), a 3D volume viewer,
+and a Windows installer build (`build_installer.bat`). Only the bundled local background map is used (no online map services).
+
+**Installation from source (differs from the original):**
+use Python 3.8 and install the exact package versions with `pip install -r requirements.txt`, then run `python nlr.py`
+from the `Python_files` folder. This version uses vispy 0.14.1 from pip; the vispy copy that used to be bundled in
+`Python_files/vispy` has been removed.
+
+API keys (KNMI, etc.) are not included; enter your own under Settings.
+
+Data sources and required attribution are listed in `ATTRIBUTION.txt` (Open-Meteo and EUMETNET OPERA data are CC BY 4.0).
+
+**Known issue:** with vispy 0.14.1 the VWP (vertical wind profile) window works, but its title bar and the purple
+sigma circles in the hodograph are not displayed. The original NLradar with its bundled vispy does not have this problem.
+
+---
+
 <b>Installation/Setup</b>:
 If you use Anaconda, then I suggest creating a new environment with python 3.8.
 In your command line: "<i>conda create -n NLradar python=3.8</i>".

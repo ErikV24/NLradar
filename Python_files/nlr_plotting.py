@@ -1,7 +1,7 @@
 # Copyright (C) 2016-2024 Bram van 't Veen, bramvtveen94@hotmail.com
 # Distributed under the GNU General Public License version 3, see <https://www.gnu.org/licenses/>.
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 
 import vispy
@@ -18,6 +18,7 @@ from OpenGL import GL
 import numpy as np
 from numpy import genfromtxt
 import os
+import re
 opa=os.path.abspath
 import time as pytime
 import copy
@@ -27,8 +28,38 @@ import nlr_background as bg
 import nlr_customvispy as cv
 import nlr_functions as ft
 import nlr_globalvars as gv
+import nlr_hclass as hc
 import nlr_maptiles as mt
+import nlr_maptiles_maptiler as mtt
 from VWP.nlr_plottingvwp import PlottingVWP
+
+# --- MONKEYPATCH voor vispy 0.14.1 (upgrade juli 2026, alleen vispy zelf bijgewerkt, Python 3.8 blijft) ---
+# Bug in vispy zelf: wanneer een gedeelde view van een visual wordt aangemaakt via .view() (zoals
+# hieronder bij self.visuals['map'][j] = self.visuals['map'][0].view()), roept vispy's basisklasse
+# Visual.__init__ intern DIRECT _prepare_transforms(view) aan tijdens het aanmaken van de view -- dus
+# VOORDAT de subclass-specifieke _init_view(view)-hook de kans heeft gehad om per-view instellingen te
+# zetten (bv. ImageVisual._method_used). Resultaat: AttributeError ('VisualView' object has no
+# attribute '_method_used').
+#
+# Generieke fix: elke VisualView/CompoundVisualView houdt een verwijzing (self._visual) bij naar het
+# origineel. Als een ontbrekend attribuut wordt opgevraagd op de view, pakken we het gewoon van het
+# origineel i.p.v. te crashen. Zodra de echte subclass-specifieke _init_view() daarna alsnog draait,
+# wordt de eigen, correcte waarde op de view gezet -- deze fallback voorkomt puur de premature crash
+# tijdens view()-constructie en heeft geen enkel effect op de uiteindelijke rendering.
+from vispy.visuals.visual import BaseVisualView as _BaseVisualView
+_orig_base_getattr = getattr(_BaseVisualView, '__getattr__', None)
+def _patched_base_getattr(self, name):
+    visual = self.__dict__.get('_visual')
+    if visual is not None and name != '_visual':
+        try:
+            return getattr(visual, name)
+        except AttributeError:
+            pass
+    if _orig_base_getattr is not None:
+        return _orig_base_getattr(self, name)
+    raise AttributeError(name)
+_BaseVisualView.__getattr__ = _patched_base_getattr
+# --- EINDE MONKEYPATCH ---
 
 
 
@@ -63,6 +94,7 @@ class Plotting(QObject,app.Canvas):
         self.dp=self.dsg.dp
         self.vwp = PlottingVWP(gui_class=self.gui, pb_class = self)
         self.mt = mt.MapTiles(self)
+        self.mt_maptiler = mtt.MapTilesMapTiler(self)
         
         #Startup settings
         self.wdims = np.array([self.gui.dimensions_main['width'], self.gui.dimensions_main['height']])
@@ -76,6 +108,13 @@ class Plotting(QObject,app.Canvas):
         
         self.data_empty={j:True for j in range(self.max_panels)} #True when self.dsg.data[j] contains no radar data for panel j
         self.data_isold={j:True for j in range(self.max_panels)} #True when self.dsg.data[j] contains data that is not for the current time
+        # Tracks, per (visual type, panel), whether the image visual's GLSL color-transform was last built for RGB
+        # passthrough data (product 'g') or for scalar+colormap data (every other product). vispy's ImageVisual only
+        # rebuilds this function when its cmap *property* is reassigned, which we deliberately skip for 'g'. So when
+        # switching a panel into or out of 'g', we need to detect that here and force the rebuild ourselves (see
+        # set_newdata).
+        self.visual_colortransform_is_rgb={'radar_polar':{j:False for j in range(self.max_panels)},
+                                            'radar_cartesian':{j:False for j in range(self.max_panels)}}
         # Parameters that are valid for the data that is currently shown in the panels. Since a panel might not get updated always, 
         # it is necessary to store these parameters and to not use current values.
         # 'xy_bins', 'res' replace 'radial_bins','radial_res','azimuthal_bins','azimuthal_res' when a plain product is displayed in 
@@ -101,6 +140,30 @@ class Plotting(QObject,app.Canvas):
         self.last_mouse_pos_px=None
         self.gridheightrings_removed=False
         self.radar_mouse_selected=None
+        # A/B line tool state (see set_ab_line_point / draw_ab_line): ab_line_panel is the panel the line was
+        # drawn in, ab_line_a/ab_line_b are its two endpoints in AEQD x/y coordinates (km from the radar), with
+        # ab_line_b staying None until the second Shift+click completes the line.
+        self.ab_line_panel=None
+        self.ab_line_a=None
+        self.ab_line_b=None
+        self.volume3d_rect_panel=None
+        self.volume3d_rect_a=None
+        self.volume3d_rect_b=None
+        self.volume3d_rect_dragging=False
+
+        # Shared cross-section marker (see set_xsection_marker_frac/update_xsection_marker): a single position,
+        # expressed as a fraction along the A/B line (0=A, 1=B), driving BOTH a point on the map's A-B line AND
+        # a vertical line at the matching distance on every currently-open cross-section plot at once, so the
+        # two stay in lockstep as the marker is dragged on either side. self.cross_section_layout holds the
+        # screen-pixel image bounds of each panel's currently-open cross-section (set in show_cross_section,
+        # cleared in hide_cross_section), needed both to draw the plot-side marker and to hit-test clicks/drags
+        # inside the cross-section image. xsection_marker_dragging is None while idle, or a small dict
+        # identifying which side ('plot' or 'map', plus the panel for 'plot') the drag started on -- see
+        # get_xsection_marker_click_frac, on_mouse_press/on_mouse_move/on_mouse_release.
+        self.xsection_marker_frac=None
+        self.cross_section_layout={}
+        self.xsection_marker_dragging=None
+        self.cross_section_active_panels=set()
         self.marker_mouse_selected_index = None
         self.in_view_mask_specs=None
         self.timer_setback_gridheightrings_running=False
@@ -151,7 +214,24 @@ class Plotting(QObject,app.Canvas):
         self.visuals_order=['background','background_map','map','radar_polar','radar_cartesian','map_lines','gh_lines','text_hor1','text_hor2','text_vert1','text_vert2']
         self.visuals_order+=['sm_pos_markers','radar_markers','panel_borders','titles']
         self.visuals_order+=['cbar'+str(j) for j in range(10)]+['cbars_ticks','cbars_reflines','cbars_labels']
-        self.visuals_panels=['map','radar_polar','radar_cartesian','map_lines','gh_lines','text_hor1','text_hor2','text_vert1','text_vert2','sm_pos_markers','radar_markers'] 
+        self.visuals_order+=['polrgb_legend_bar'+str(j)+ch for j in range(self.max_panels) for ch in ('r','g','b')]
+        self.visuals_order+=['polrgb_legend_ticks','polrgb_legend_labels','polrgb_legend_reflines']
+        self.visuals_order+=['hclass_legend_markers','hclass_legend_labels']
+        self.visuals_order+=['ab_line','ab_line_labels','ab_line_marker']
+        # NIEUW (23 juli, op Eriks verzoek): laat een puntje achter op de plek waar de laatste
+        # HCLASS/MESH-pop-up (zie show_extra_info_popup) is opgeroepen, zodat je nog kunt zien
+        # waar je precies had geklikt nadat de pop-up weer weg is. Rechtsklik verbergt het weer
+        # (zie on_mouse_release).
+        self.visuals_order+=['click_marker']
+        self.visuals_order+=['volume3d_rect','volume3d_rect_labels']
+        self.cross_section_interpolation_modes = ('nearest', 'bilinear', 'bicubic') #The 3 pre-built variants
+        #-- see the loop further down that creates one ImageVisual per mode per panel, and cross_section_
+        #visual_key/show_cross_section/hide_cross_section, which switch between them by toggling .visible
+        #rather than creating/mutating a visual at runtime (found to render solid black, see
+        #change_cross_section_interpolation_mode in nlr.py for the history).
+        cross_section_visual_names = ['cross_section_'+m for m in self.cross_section_interpolation_modes]
+        self.visuals_order+=['cross_section_background']+cross_section_visual_names+['cross_section_axislines','cross_section_ticks','cross_section_marker','cross_section_back_frame','cross_section_back','cross_section_title','cross_section_frame','cross_section_toggle_button_frame','cross_section_toggle_button']
+        self.visuals_panels=['map','radar_polar','radar_cartesian','map_lines','gh_lines','text_hor1','text_hor2','text_vert1','text_vert2','sm_pos_markers','radar_markers']+cross_section_visual_names+['cross_section_axislines','cross_section_ticks','cross_section_marker','cross_section_back','cross_section_back_frame','cross_section_title','cross_section_background','cross_section_frame','cross_section_toggle_button','cross_section_toggle_button_frame']
         #Visuals that are created for each panel separately
         self.visuals_global=[j for j in self.visuals_order if not j in self.visuals_panels] #Visuals that are not created for each panel separately
         
@@ -164,11 +244,22 @@ class Plotting(QObject,app.Canvas):
         self.visuals_widgets['left']=['cbar'+str(j) for j in range(5)]+['cbars_ticks','cbars_reflines','cbars_labels']
         self.visuals_widgets['right']=['cbar'+str(j) for j in range(5,10)]+self.visuals_widgets['left'][-3:]
         self.visuals_widgets['bottom']=self.visuals_widgets['top']=['titles']
-        self.visuals_widgets['main']=['background_map']+self.visuals_panels+['panel_borders']
+        polrgb_legend_bar_names = ['polrgb_legend_bar'+str(j)+ch for j in range(self.max_panels) for ch in ('r','g','b')]
+        self.visuals_widgets['main']=['background_map']+self.visuals_panels+polrgb_legend_bar_names+['polrgb_legend_ticks','polrgb_legend_labels','polrgb_legend_reflines']+['hclass_legend_markers','hclass_legend_labels']+['ab_line','ab_line_labels','ab_line_marker']+['click_marker']+['volume3d_rect','volume3d_rect_labels']+['panel_borders']
         
         self.font_sizes = {'text_hor1':'self.gui.gridheightrings_fontsize', 'text_vert1':'self.gui.gridheightrings_fontsize', 
+                           'text_hor2':'self.gui.gridheightrings_fontsize', 'text_vert2':'self.gui.gridheightrings_fontsize',
                            'titles':"self.gui.fontsizes_main['titles']", 'cbars_ticks':"self.gui.fontsizes_main['cbars_ticks']", 
-                           'cbars_labels':"self.gui.fontsizes_main['cbars_labels']"}
+                           'cbars_labels':"self.gui.fontsizes_main['cbars_labels']",
+                           'polrgb_legend_ticks':"self.gui.fontsizes_main['cbars_ticks']*1.5",
+                           'polrgb_legend_labels':"self.gui.fontsizes_main['cbars_labels']*1.4",
+                           'hclass_legend_labels':"self.gui.fontsizes_main['cbars_labels']*1.2",
+                           'ab_line_labels':"self.gui.fontsizes_main['cbars_labels']*1.4",
+                           'volume3d_rect_labels':"self.gui.fontsizes_main['cbars_labels']*1.4",
+                           'cross_section_ticks':"self.gui.fontsizes_main['cbars_ticks']*1.5",
+                           'cross_section_back':"self.gui.fontsizes_main['cbars_labels']",
+                           'cross_section_toggle_button':"self.gui.fontsizes_main['cbars_labels']",
+                           'cross_section_title':"self.gui.fontsizes_main['cbars_labels']*1.6"}
                 
         
         # set self.map_data and self.map_bounds
@@ -214,6 +305,7 @@ class Plotting(QObject,app.Canvas):
         #first plot.
         
         self.map_colorfilter = ColorFilter(self.gui.mapcolorfilter)
+        self.radardata_colorfilter = ColorFilter(self.gui.radardata_colorfilter)
         self.text_hor_top_colorfilter = ColorFilter(np.append(self.gui.gridheightrings_fontcolor['top']/255., 1.))
         self.text_hor_bottom_colorfilter = ColorFilter(np.append(self.gui.gridheightrings_fontcolor['bottom']/255., 1.))
         
@@ -233,6 +325,8 @@ class Plotting(QObject,app.Canvas):
             
             self.visuals['radar_polar'][j] = visuals.ImageVisual(method='auto', cmap=self.cm1[self.crd.products[j]], clim=self.clim_int[self.crd.products[j]])
             self.visuals['radar_cartesian'][j] = visuals.ImageVisual(method='auto', cmap=self.cm1[self.crd.products[j]], clim=self.clim_int[self.crd.products[j]])
+            self.visuals['radar_polar'][j].attach(self.radardata_colorfilter)
+            self.visuals['radar_cartesian'][j].attach(self.radardata_colorfilter)
             self.polar_transforms_individual['scanangle'][j]=cv.Slantrange_to_Groundrange_Transform()
             self.polar_transforms_individual['scale'][j]=STTransform()
             self.polar_transforms_individual['polar'][j]=cv.PolarTransform()
@@ -276,7 +370,84 @@ class Plotting(QObject,app.Canvas):
                 i.visible=False 
             #Set the visibility of the TextVisuals for the ticks and the label to False, to prevent that they are drawn. This is because I don't use them.
             self.visuals['cbar'+str(j)]._label.visible=False
-                    
+
+        # Small per-channel legend bars for the polarimetric RGB composite (product 'g'), shown directly in the
+        # corner of each panel that currently displays 'g' (see set_polrgb_legend). One simple black->color
+        # ColorBarVisual per channel (Z=red, CC=green, ZDR=blue), independent of the general cbar system above,
+        # since that system is built around a single colormap per product, not three simultaneous channels.
+        # Structured as flat, individually-named visuals ('polrgb_legend_bar'+panel+channel), matching the
+        # 'cbar0'..'cbar9' pattern above -- NOT as per-panel dict entries in visuals_panels, since that would
+        # make them inherit the per-panel pan/zoom transform applied to actual radar-image content, which would
+        # break their fixed on-screen positioning whenever the user pans or zooms.
+        polrgb_channel_colors = {'r':(1,0,0,1), 'g':(0,1,0,1), 'b':(0,0,1,1)}
+        self.polrgb_channel_colors = polrgb_channel_colors # re-used in set_polrgb_legend to rebuild the
+        #colormap in reverse when a channel's vmin > vmax (an intentionally inverted mapping, e.g. CC).
+        for j in range(self.max_panels):
+            for ch, channel_color in polrgb_channel_colors.items():
+                # Color order [low-value-color, high-value-color] = [black, full channel color], matching the
+                # low-to-high ordering used by the real product colorbars (self.cm2, see set_cmaps) for a
+                # vertical 'right'-orientation ColorBarVisual -- this renders full color at the top, black at
+                # the bottom. This assumes vmin < vmax; set_polrgb_legend swaps to the reverse colormap
+                # (built from self.polrgb_channel_colors) whenever a channel is configured the other way
+                # around, so the bright end of the bar always lines up with whichever value actually produces
+                # that channel's maximum intensity, not just with a fixed top/bottom position.
+                cmap = color.Colormap([(0,0,0,1), channel_color])
+                bar = visuals.ColorBarVisual(pos=[0,0], size=[1,1], cmap=cmap, orientation='right', clim=[-1,1],
+                                              label_color=(0,0,0,0), border_width=self.scale_pixelsize(1),
+                                              border_color=(1,1,1,0.8))
+                for tick in bar._ticks:
+                    tick.visible = False
+                bar._label.visible = False
+                bar.visible = False
+                self.visuals['polrgb_legend_bar'+str(j)+ch] = bar
+        self.visuals['polrgb_legend_ticks']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['cbars_ticks']),face='OpenSans',anchor_x='left',anchor_y='center')
+        self.visuals['polrgb_legend_labels']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['cbars_labels']),face='OpenSans',anchor_x='left',anchor_y='bottom')
+        self.visuals['polrgb_legend_reflines']=visuals.LineVisual(pos=None,color=(1,1,1,0.8),method='gl',connect='segments',width=self.scale_pixelsize(1))
+
+        # Legenda voor de hydrometeorenclassificatie (HCLASS, product 'j'): een kolom van kleine gekleurde
+        # vierkantjes (een per klasse, zie nlr_hclass.HID_CLASSES/HID_COLORS_RGBA) met daarnaast de klassenaam.
+        # Net als bij de PolRGB-legenda hierboven is dit EEN gedeelde MarkersVisual/TextVisual voor alle panelen
+        # samen (niet per paneel), zodat er niet 10*max_panels aparte visual-objecten nodig zijn -- de
+        # posities/kleuren worden per redraw opnieuw opgebouwd in set_hclass_legend(), net als de PolRGB-tick/
+        # labelteksten hierboven.
+        self.visuals['hclass_legend_markers']=visuals.MarkersVisual(pos=np.array([[-1e6,-1e6]]))
+        self.visuals['hclass_legend_labels']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['hclass_legend_labels']),face='OpenSans',anchor_x='left',anchor_y='center')
+
+        # A/B line tool: a simple two-point distance-measuring line, drawn by holding Shift while clicking (see
+        # set_ab_line_point). One LineVisual for the line itself, and one TextVisual for its three labels ('A',
+        # 'B', and the distance in km, shown at the line's midpoint) -- following the same general pattern as
+        # the PolRGB legend's ticks/reflines above. The cross-section itself is toggled via F2 (all supported
+        # panels at once) or a small per-panel button in the panel's top-right corner (see
+        # cross_section_toggle_button, added alongside the other per-panel cross-section visuals below) --
+        # an earlier version showed a 'Show cross-section >>' text link at the line's midpoint instead, but
+        # that stood out too much against the rest of the interface's understated style.
+        self.visuals['ab_line']=visuals.LineVisual(pos=None,color=(1,1,1,0.9),method='gl',connect='strip',width=self.scale_pixelsize(1.5))
+        self.visuals['ab_line_labels']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['cbars_labels']),face='OpenSans',anchor_x='center',anchor_y='center')
+        # Sleep-rechthoek voor het selecteren van een gebied (bijv. voor de 3D-volumeweergave, CTRL+SHIFT+4
+        # in nlr.py) -- CTRL+SHIFT+links-slepen op de kaart. Een aparte visual/modus i.p.v. de bestaande
+        # ab_line te hergebruiken, omdat Erik expliciet een ECHTE sleep-selectie met live voorvertoning wilde
+        # zien tijdens het slepen zelf, in plaats van pas achteraf (na 2 losse Shift+klikken) te zien welk
+        # gebied ontstaat (zie gesprek met Claude, 5 juli 2026). 5 punten (4 hoeken + terug naar de eerste)
+        # zodat connect='strip' een gesloten rechthoek tekent i.p.v. een open lijn van 4 punten.
+        self.visuals['volume3d_rect']=visuals.LineVisual(pos=None,color=(1,1,0,0.9),method='gl',connect='strip',width=self.scale_pixelsize(2.))
+        self.visuals['volume3d_rect_labels']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='yellow',bold=True,font_size=eval(self.font_sizes['volume3d_rect_labels']),face='OpenSans',anchor_x='center',anchor_y='center')
+        # Shared cross-section marker, map side (see set_xsection_marker_frac/update_xsection_marker): a single
+        # draggable point on the A-B line itself, kept in lockstep with the vertical marker line(s) on whichever
+        # cross-section plot(s) are currently open (self.visuals['cross_section_marker'], one per panel, set up
+        # further below alongside the other per-panel cross-section visuals). A bright, high-contrast yellow
+        # (rather than reusing the plain white of the A/B line itself) so it stands out clearly against both the
+        # dark map and whatever colorful radar data happens to be underneath it.
+        self.visuals['ab_line_marker']=visuals.MarkersVisual(pos=np.array([[0,0]]))
+        self.visuals['ab_line_marker'].visible=False
+
+        # Puntje dat achterblijft op de plek van de laatste HCLASS/MESH-pop-up-klik (23 juli, op
+        # Eriks verzoek - anders is na het wegklikken van de pop-up niet meer te zien waar je
+        # precies had geklikt). Een ander, opvallend rood i.p.v. het geel van ab_line_marker, om
+        # verwarring met de A/B-lijn te voorkomen. Zie show_extra_info_popup (aanzetten) en
+        # on_mouse_release (rechtsklik verbergt 'm weer).
+        self.visuals['click_marker']=visuals.MarkersVisual(pos=np.array([[0,0]]))
+        self.visuals['click_marker'].visible=False
+
         self.visuals['cbars_ticks']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='black',font_size=eval(self.font_sizes['cbars_ticks']),face='OpenSans',anchor_x='center',anchor_y='center')
         self.visuals['cbars_reflines']=visuals.LineVisual(pos=None,color='black',method='gl',connect=None,width=self.scale_pixelsize(1))
         self.visuals['cbars_labels']=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='black',font_size=eval(self.font_sizes['cbars_labels']),bold=True,face='OpenSans',anchor_x='center',anchor_y='top')
@@ -313,6 +484,88 @@ class Plotting(QObject,app.Canvas):
             self.visuals['text_hor1'][i].transform = STTransform(translate=(d,d))*ChainTransform(self.visuals['text_hor1'][i].transform)
             if i in self.panels_vertical_ghtext:
                 self.visuals['text_vert1'][i].transform = STTransform(translate=(d,d))*ChainTransform(self.visuals['text_vert1'][i].transform)
+
+        # Velocity/Reflectivity vertical cross-section view (see show_cross_section/hide_cross_section), one
+        # set of visuals PER PANEL (not a single shared instance) -- multiple panels (e.g. one showing Z,
+        # another V) can each have their own cross-section split-view active at the same time, driven by the
+        # same shared A/B line. Created here, AFTER the clipper/transform-attaching loop above (which the
+        # 'if not i in self.visuals[j]: continue' check causes to skip these names entirely, since they don't
+        # exist in self.visuals[j] yet at that point) -- these visuals deliberately do NOT get the automatic
+        # self.panels_sttransforms[i] pan-zoom chain or self.clippers[i] attachment that every other
+        # self.visuals_panels entry receives, since the cross-section image/labels/frame are positioned with
+        # their own explicit screen-pixel coordinates within the top half of the (now split) panel, independent
+        # of whatever pan/zoom state the panel's normal view happens to be in -- see show_cross_section.
+        for i in range(self.max_panels):
+            # Three separate ImageVisuals are pre-built per panel, one per entry in
+            # self.cross_section_interpolation_modes ('nearest'/'bilinear'/'bicubic'), rather than a single one
+            # whose .interpolation gets changed later -- see change_cross_section_interpolation_mode in nlr.py
+            # and cross_section_visual_key below for why: switching interpolation on an existing/runtime-
+            # created ImageVisual was found to render solid black, most likely because it bypasses the
+            # transforms.configure(canvas=self, viewport=vp) wiring that on_resize normally does for every
+            # visual (see on_resize) -- building all 3 up front here means that wiring happens the normal way
+            # for all of them, and switching mode later is then just a matter of toggling which one is
+            # .visible, never creating or mutating a visual outside of __init__/on_resize.
+            for mode in self.cross_section_interpolation_modes:
+                key = 'cross_section_'+mode
+                self.visuals[key][i]=visuals.ImageVisual(method='auto', cmap=self.cm1['v'], clim=self.clim_int['v'], interpolation=mode)
+                self.visuals[key][i].visible=False
+            self.visuals['cross_section_ticks'][i]=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['cbars_ticks'])*0.8,face='OpenSans',anchor_x='center',anchor_y='center')
+            # Axis line + small perpendicular tick marks along the bottom (distance) and left (height) edges of
+            # the cross-section image -- a plain LineVisual with connect='segments' (each consecutive pair of
+            # points drawn as one disconnected line), the same general approach as the existing cbars_reflines
+            # visual for the normal colorbars' own tick reference lines.
+            self.visuals['cross_section_axislines'][i]=visuals.LineVisual(pos=None,color='white',method='gl',connect=None,width=self.scale_pixelsize(1))
+            self.visuals['cross_section_axislines'][i].visible=False
+            # Plot-side half of the shared cross-section marker (see set_xsection_marker_frac/
+            # update_xsection_marker and self.visuals['ab_line_marker'], its map-side counterpart): a simple
+            # vertical line spanning the full height of THIS panel's cross-section image, at the x position
+            # corresponding to the marker's current distance-along-A-B fraction. Positioned in the same
+            # screen-pixel space as cross_section_axislines/cross_section_ticks (i.e. recomputed on every
+            # show_cross_section call, see self.cross_section_layout), not the data-space image transform, so
+            # it stays correctly aligned regardless of image resolution. Same yellow as ab_line_marker so the
+            # two are visually associated at a glance.
+            self.visuals['cross_section_marker'][i]=visuals.LineVisual(pos=None,color=(1,1,0,0.9),method='gl',connect='strip',width=self.scale_pixelsize(2))
+            self.visuals['cross_section_marker'][i].visible=False
+            self.visuals['cross_section_back'][i]=visuals.TextVisual(text='Back',pos=[-1e6,-1e6],color=(0.85,0.85,0.85,1.0),bold=False,font_size=eval(self.font_sizes['cbars_labels']),face='OpenSans',anchor_x='center',anchor_y='top')
+            self.visuals['cross_section_back'][i].visible=False
+            # Thin rectangular outline around the '< Back' label, same approach as ab_line_show_cs_frame --
+            # gives it a subtle button-like appearance instead of plain, unbounded white text.
+            self.visuals['cross_section_back_frame'][i]=visuals.LineVisual(color=(0.85,0.85,0.85,0.8),method='gl',width=self.scale_pixelsize(1))
+            self.visuals['cross_section_back_frame'][i].visible=False
+            self.visuals['cross_section_title'][i]=visuals.TextVisual(text=startup_string,pos=[-1e6,-1e6],color='white',bold=True,font_size=eval(self.font_sizes['cbars_labels']),face='OpenSans',anchor_x='center',anchor_y='top')
+            self.visuals['cross_section_title'][i].visible=False
+            # Solid dark background behind the cross-section image, covering the top half of the split panel.
+            # The shared map visual (self.visuals['map'][i], a view() of visuals['map'][0]) still renders at
+            # full panel size underneath this (it isn't hidden, since the bottom half still wants the map as
+            # context), so without this opaque rectangle the map/streets would show through wherever the
+            # cross-section raster itself is transparent (e.g. NaN bins with no nearby scan data). Drawn as a
+            # plain colored rectangle rather than reusing e.g. visuals['background'], since this needs to be
+            # sized/positioned per-show_cross_section-call for just the top half of THIS specific panel, not
+            # the whole canvas.
+            self.visuals['cross_section_background'][i]=visuals.RectangleVisual(center=[0,0],color=(0.04,0.04,0.06,1.0))
+            self.visuals['cross_section_background'][i].transform=STTransform()
+            self.visuals['cross_section_background'][i].visible=False
+            # A simple white rectangle outline around each half of the split panel (cross-section on top,
+            # normal radar image cropped to the bottom -- see show_cross_section's clipper-narrowing), drawn
+            # the same way as the existing self.visuals['panel_borders'] (a LineVisual with 5 points per
+            # rectangle, the 5th repeating the 1st, and connect[4::5]=False to keep the two rectangles visually
+            # separate rather than connected by a stray line).
+            self.visuals['cross_section_frame'][i]=visuals.LineVisual(color=(1,1,1,1.0),method='gl',width=self.scale_pixelsize(2))
+            self.visuals['cross_section_frame'][i].visible=False
+            # Small, unobtrusive per-panel button (top-right corner) to toggle the cross-section split-view for
+            # this specific panel -- a less visually prominent alternative to F2 (which toggles every supported
+            # panel at once), and a replacement for an earlier version that showed a bright 'Show cross-section
+            # >>' text link at the A/B line's midpoint, which stood out too much against the rest of this
+            # understated interface. Visible whenever this panel shows a cross-section-capable product AND a
+            # completed A/B line exists -- see update_cross_section_toggle_buttons, called from draw_ab_line
+            # and set_panel_sttransforms_and_clippers (so it also repositions correctly on resize/panel-count
+            # changes, alongside the other panel-corner UI elements).
+            self.visuals['cross_section_toggle_button'][i]=visuals.TextVisual(text='X-section',pos=[-1e6,-1e6],color=(0.85,0.85,0.85,1.0),bold=False,font_size=eval(self.font_sizes['cbars_labels']),face='OpenSans',anchor_x='center',anchor_y='top')
+            self.visuals['cross_section_toggle_button'][i].visible=False
+            self.visuals['cross_section_toggle_button_frame'][i]=visuals.LineVisual(color=(0.85,0.85,0.85,0.8),method='gl',width=self.scale_pixelsize(1))
+            self.visuals['cross_section_toggle_button_frame'][i].visible=False
+            for visual_name in cross_section_visual_names+['cross_section_axislines','cross_section_ticks','cross_section_marker','cross_section_back','cross_section_back_frame','cross_section_title','cross_section_background','cross_section_frame','cross_section_toggle_button','cross_section_toggle_button_frame']:
+                self.visuals[visual_name][i].set_gl_state(depth_test=False, blend=True, blend_func=('src_alpha', 'one_minus_src_alpha'))
                                 
         for j in self.visuals_global:
             #These do not need a pan-zoom transform or clipper
@@ -467,6 +720,12 @@ class Plotting(QObject,app.Canvas):
             self.clippers[j].bounds = tuple(self.panel_bounds[j]*self.gui.screen_pixel_ratio())
             #Shift the geographical location of the center of the panels
             self.panels_sttransforms[j].translate=self.panel_centers[j]+panel_center_shift
+        # Re-position the per-panel cross-section toggle buttons (top-right corner) whenever panel
+        # positions/sizes change. Guarded with a dict-membership check (rather than calling unconditionally)
+        # since this function is also called once during __init__, before the per-panel cross-section visuals
+        # further down in __init__ have been created yet.
+        if 'cross_section_toggle_button' in self.visuals and self.visuals['cross_section_toggle_button']:
+            self.update_cross_section_toggle_buttons()
       
         
     def calculate_vwp_relxdim(self):
@@ -524,6 +783,13 @@ class Plotting(QObject,app.Canvas):
                     
         if self.gui.show_vwp:
             self.vwp.on_resize()
+
+        for panel in list(self.cross_section_active_panels):
+            # Panel pixel bounds (self.panel_corners, used throughout show_cross_section to lay out the split
+            # top/bottom halves) have just been recalculated above via set_panel_sttransforms_and_clippers, so
+            # redo the cross-section layout against the new size rather than leaving it positioned for the old
+            # window size.
+            self.show_cross_section(panel)
                     
         self.set_draw_action('resizing')
         self.update_map_tiles_ondraw = True
@@ -553,17 +819,20 @@ class Plotting(QObject,app.Canvas):
                 self.update_map_tiles(separate_thread=False, draw_map=True)
         self.update_map_tiles_ondraw = False
                 
-        if self.draw_action=='panning_zooming':
-            self.draw_widgets=['main']
-        elif self.draw_action in ('plotting','changing_panels'): #When plotting a VWP it is desired to also plot
-            #the left and right widgets, since the title might extend a bit into those widgets.
-            self.draw_widgets=['main','bottom','top']
-        elif self.draw_action == 'vwp_only':
+        # UITGESCHAKELD (6 juli 2026): deze selectieve draw_widgets-optimalisatie (bv. tijdens pannen/zoomen
+        # alleen 'main' opnieuw tekenen, kleurenbalken/titel overslaan) was origineel alleen visueel stabiel
+        # dankzij GL.glDrawBuffer(GL.GL_FRONT_AND_BACK) verderop in on_draw(), die ervoor zorgde dat een
+        # eenmalige tekenbeurt op BEIDE OpenGL-buffers tegelijk belandde (waardoor overgeslagen widgets bij
+        # de volgende buffer-wissel niet verdwenen). Nu die aanroep op dit systeem faalt (GL_INVALID_OPERATION,
+        # stil afgeschermd verderop), zorgt het overslaan van widgets voor zichtbaar geflikker tijdens
+        # pannen/zoomen (kleurenbalken/titel die aan/uit knipperen). Simpelste robuuste fix: altijd ALLES
+        # opnieuw tekenen, ongeacht draw_action -- iets minder snel tijdens interactief pannen/zoomen, maar
+        # zonder geflikker.
+        self.draw_widgets=self.widgets.copy()
+        if self.gui.show_vwp:
+            self.draw_widgets += ['vwp']
+        if self.draw_action == 'vwp_only':
             self.draw_widgets = ['vwp']
-        else: 
-            self.draw_widgets=self.widgets.copy() #Draw all widgets
-            if self.gui.show_vwp:
-                self.draw_widgets += ['vwp']
             
         if not self.gui.use_scissor: self.draw_widgets=self.widgets
                              
@@ -576,8 +845,20 @@ class Plotting(QObject,app.Canvas):
         self.visuals['background'].draw()
                  
         if self.starting or self.draw_action in ('resizing',None) or self.draw_widgets!=self.draw_widgets_before:
+            # TERUGGEDRAAID (6 juli 2026): dit was tijdelijk onvoorwaardelijk gemaakt (bij elke wijziging
+            # van draw_widgets) in een poging het titel-positieprobleem op te lossen, maar dat bleek een
+            # NIEUW, EIGEN probleem te veroorzaken: tijdens pannen/zoomen wordt draw_widgets bewust
+            # verkleind tot enkel ['main'] (voor snelheid, de kleurenbalken links/rechts hoeven dan niet
+            # opnieuw getekend te worden) -- een onvoorwaardelijke witte clear veegt dan het HELE canvas
+            # wit, inclusief die kleurenbalken, wat zichtbaar was als geflikker tijdens het slepen. Het
+            # titel-positieprobleem zelf is inmiddels apart opgelost via een y-positie-correctie in
+            # set_titles() (zie _title_font_px hieronder in die functie), dus deze clear kan gewoon weer
+            # beperkt worden tot alleen de allereerste tekenbeurt.
             if self.starting: gloo.clear('white')
-            GL.glDrawBuffer(GL.GL_FRONT_AND_BACK)
+            try:
+                GL.glDrawBuffer(GL.GL_FRONT_AND_BACK)
+            except Exception:
+                pass
                         
             
         #Only plot visuals in the widgets for the main radar window here, not those in other windows such as the vwp window.
@@ -611,7 +892,7 @@ class Plotting(QObject,app.Canvas):
         for j in self.panellist:
             if self.data_attr['proj'].get(j, None) == 'pol' and j not in self.ref_radial_bins:
                 # These reference values are needed in self.set_newdata when changing the scale of the polar image transform
-                self.ref_azimuthal_bins[j], self.ref_radial_bins[j] = self.dsg.data[j].shape
+                self.ref_azimuthal_bins[j], self.ref_radial_bins[j] = self.dsg.data[j].shape[:2]
             
         if 'vwp' in self.draw_widgets:
             #Plot the vwp visuals
@@ -747,9 +1028,18 @@ class Plotting(QObject,app.Canvas):
         rel_pos=pos-self.panel_centers[selected_panel]
         for j in range(self.max_panels): #Zooming the transforms for all panels is necessary, to ensure that all panels keep showing the same area
             self.panels_sttransforms[j].zoom((zoomfactor,zoomfactor),center=self.panel_centers[j]+rel_pos,mapped=True)
-            
+
         self.dsg.time_last_panzoom=pytime.time()
-        
+
+        if self.ab_line_panel is not None:
+            # The A/B line's screen position (self.visuals['ab_line'], plus the shared cross-section marker
+            # riding on it -- see update_xsection_marker) is recomputed from its stored AEQD x/y coordinates
+            # every time draw_ab_line() runs; it doesn't update on its own just because self.panels_sttransforms
+            # changed above. Click-drag panning and right-click zoom already call draw_ab_line() after touching
+            # the transforms (see on_mouse_move) -- mouse-wheel zoom was missing the same call, which is why the
+            # line (and, now, the marker) drifted out of place specifically when scrolling to zoom.
+            self.draw_ab_line()
+
         if any([j in self.gui.lines_show for j in ('grid','heightrings')]) and self.firstplot_performed: 
             if self.gui.showgridheightrings_panzoom: 
                 #This is needed to ensure that updating the heightrings occurs after the zooming has been performed
@@ -765,6 +1055,725 @@ class Plotting(QObject,app.Canvas):
         self.update_map_tiles_ondraw = True
         self.update()
         
+    def set_ab_line_point(self, screen_pos):
+        """Handles a Shift+click for the A/B line tool (see on_mouse_press). The first click sets point A; the
+        second sets point B and draws the finished line with its length label. A further click after that
+        starts a fresh line from scratch, discarding the old one.
+
+        Points are stored as AEQD x/y coordinates (km from the radar, the same coordinate system
+        screencoord_to_xy already converts to) rather than raw screen pixels, so the line stays correctly
+        anchored to the actual displayed location across panning/zooming -- exactly like the underlying radar
+        data itself, instead of drifting along with mouse-pixel space.
+        """
+        panel = self.get_panel_for_position(screen_pos)
+        xy = self.screencoord_to_xy(np.array(screen_pos), panel)
+
+        if self.ab_line_panel is None or self.ab_line_b is not None:
+            # Starting a fresh line (either the very first click ever, or a new line after a completed one).
+            self.ab_line_panel = panel
+            self.ab_line_a = xy
+            self.ab_line_b = None
+        elif panel != self.ab_line_panel:
+            # Clicking in a different panel restarts the line there, rather than mixing coordinate systems
+            # from two different panels into one line.
+            self.ab_line_panel = panel
+            self.ab_line_a = xy
+            self.ab_line_b = None
+        else:
+            self.ab_line_b = xy
+
+        self.draw_ab_line()
+
+    def draw_ab_line(self):
+        if self.ab_line_a is None:
+            self.visuals['ab_line'].visible = False
+            self.visuals['ab_line_labels'].text = []
+            self.update_cross_section_toggle_buttons()
+            self.update()
+            return
+
+        panel = self.ab_line_panel
+        screen_a = self.xycoord_to_screen(panel, self.ab_line_a)
+        labels_text, labels_pos = ['A'], [screen_a]
+
+        if self.ab_line_b is not None:
+            screen_b = self.xycoord_to_screen(panel, self.ab_line_b)
+            distance_km = np.linalg.norm(self.ab_line_a-self.ab_line_b)
+            mid_screen = 0.5*(screen_a+screen_b)
+            self.visuals['ab_line'].set_data(pos=np.array([screen_a, screen_b]))
+            self.visuals['ab_line'].visible = True
+            labels_text += ['B', str(ft.rifdot0(ft.r1dec(distance_km)))+' km']
+            labels_pos += [screen_b, mid_screen]
+        else:
+            # Only point A has been set so far -- show just that marker/label, no line yet.
+            self.visuals['ab_line'].visible = False
+
+        self.visuals['ab_line_labels'].text = labels_text
+        self.visuals['ab_line_labels'].pos = np.array(labels_pos)
+        # Whether each panel's small top-right cross-section toggle button should be visible/clickable depends
+        # on whether a completed A/B line now exists (see update_cross_section_toggle_buttons), so refresh
+        # those buttons' visibility every time the line itself changes.
+        self.update_cross_section_toggle_buttons()
+        # The map-side marker's screen position depends on the panel's current pan/zoom (see
+        # update_xsection_marker), so keep it in sync whenever the line itself gets redrawn -- in particular
+        # while panning/zooming the panel the line lives in (see on_mouse_move), not just after an explicit
+        # drag of the marker itself.
+        self.update_xsection_marker()
+        self.update()
+
+    def draw_volume3d_rect(self):
+        """Tekent/werkt de sleep-rechthoek bij (zie volume3d_rect_a/b, gezet via CTRL+SHIFT+links-slepen in
+        on_mouse_press/move/release). Zelfde opzet als draw_ab_line hierboven, maar dan voor een rechthoek
+        (4 hoeken, gesloten via connect='strip' met het beginpunt herhaald aan het eind) i.p.v. een lijn.
+
+        BIJGESTELD (8 juli 2026, op Eriks verzoek: "zou dat ook een cirkel kunnen zijn" + "zie ik dan wel
+        vooraf welk gebied in de 3D cirkel komt?"): als self.gui.volume3d_circular_area aanstaat, wordt hier
+        een ELLIPS getekend die precies in de rechthoek past (i.p.v. de rechthoek zelf), zodat de 2D-
+        voorvertoning altijd exact overeenkomt met wat er straks in 3D als data-gebied wordt gebruikt (zie
+        de bijbehorende maskering in nlr.py's _render_volume_3d_scene). Het label met de afmetingen blijft
+        de afmetingen van de OMSCHRIJVENDE rechthoek tonen (dus de volledige breedte/hoogte), niet van de
+        ellips zelf, voor consistentie met hoe het kader/de assen in 3D dat ook doen."""
+        if self.volume3d_rect_a is None or self.volume3d_rect_b is None:
+            self.visuals['volume3d_rect'].visible = False
+            self.visuals['volume3d_rect_labels'].text = []
+            self.update()
+            return
+
+        panel = self.volume3d_rect_panel
+        x1, y1 = self.volume3d_rect_a
+        x2, y2 = self.volume3d_rect_b
+        if getattr(self.gui, 'volume3d_circular_area', False):
+            cx, cy = (x1+x2)/2., (y1+y2)/2.
+            a, b = abs(x2-x1)/2., abs(y2-y1)/2.
+            theta = np.linspace(0, 2*np.pi, 72)
+            xy_ellipse = [(cx+a*np.cos(t), cy+b*np.sin(t)) for t in theta]
+            screen_corners = [self.xycoord_to_screen(panel, np.array(c)) for c in xy_ellipse]
+            # De ellips-puntenreeks is al gesloten (begin- en eindhoek van linspace vallen op hetzelfde
+            # punt), dus geen extra herhaling van het beginpunt nodig zoals bij de rechthoek hieronder.
+        else:
+            xy_corners = [(min(x1, x2), min(y1, y2)), (max(x1, x2), min(y1, y2)),
+                          (max(x1, x2), max(y1, y2)), (min(x1, x2), max(y1, y2))]
+            screen_corners = [self.xycoord_to_screen(panel, np.array(c)) for c in xy_corners]
+            screen_corners.append(screen_corners[0]) # Sluit de rechthoek (terug naar de eerste hoek).
+        self.visuals['volume3d_rect'].set_data(pos=np.array(screen_corners))
+        self.visuals['volume3d_rect'].visible = True
+
+        width_km, height_km = abs(x2-x1), abs(y2-y1)
+        mid_screen = self.xycoord_to_screen(panel, np.array([(x1+x2)/2., (y1+y2)/2.]))
+        self.visuals['volume3d_rect_labels'].text = [f"{ft.rifdot0(ft.r1dec(width_km))} x "
+                                                       f"{ft.rifdot0(ft.r1dec(height_km))} km"]
+        self.visuals['volume3d_rect_labels'].pos = np.array([mid_screen])
+        self.update()
+
+    def set_xsection_marker_frac(self, frac):
+        """Sets the shared cross-section marker's position, expressed as a fraction along the A/B line
+        (0.0 = point A, 1.0 = point B), and redraws both halves of it -- see update_xsection_marker. Passing
+        None hides the marker (used when there's no completed A/B line, or no cross-section open anywhere to
+        show it on)."""
+        self.xsection_marker_frac = None if frac is None else float(np.clip(frac, 0., 1.))
+        self.update_xsection_marker()
+
+    def update_xsection_marker(self):
+        """Redraws the shared cross-section marker at the current self.xsection_marker_frac: a point on the
+        A-B line on the map (self.visuals['ab_line_marker']) AND, simultaneously, a vertical line at the
+        matching distance on EVERY panel that currently has its cross-section split-view open
+        (self.visuals['cross_section_marker'][panel], see self.cross_section_layout) -- so dragging either one
+        moves both at once. Hides both sides if there's no marker position set, or no completed A/B line to
+        place it on."""
+        frac = self.xsection_marker_frac
+        have_line = self.ab_line_panel is not None and self.ab_line_b is not None
+        if frac is None or not have_line:
+            self.visuals['ab_line_marker'].visible = False
+            for panel in self.cross_section_layout:
+                self.visuals['cross_section_marker'][panel].visible = False
+            return
+
+        # Map side: linear interpolation between A and B in AEQD x/y km (the same coordinate system the line's
+        # own endpoints are stored in -- see set_ab_line_point), converted to screen pixels the same way
+        # draw_ab_line positions the line itself.
+        xy = self.ab_line_a+frac*(self.ab_line_b-self.ab_line_a)
+        screen_xy = self.xycoord_to_screen(self.ab_line_panel, xy)
+        self.visuals['ab_line_marker'].set_data(pos=np.array([screen_xy]), face_color=(1,1,0,1),
+            edge_color=(0,0,0,1), edge_width=self.scale_pixelsize(1.5), size=self.scale_pixelsize(11))
+        self.visuals['ab_line_marker'].visible = True
+
+        # Plot side: a vertical line at the corresponding x position, in every panel with an open cross-section
+        # at once (there can be more than one, e.g. a Z panel and a V panel side by side -- see
+        # show_cross_sections_for_ab_line), so the same distance-along-the-line is highlighted everywhere
+        # simultaneously.
+        for panel, layout in self.cross_section_layout.items():
+            x = layout['img_left']+frac*(layout['img_right']-layout['img_left'])
+            self.visuals['cross_section_marker'][panel].set_data(
+                pos=np.array([[x, layout['img_top']], [x, layout['img_bottom']]], dtype='float32'))
+            self.visuals['cross_section_marker'][panel].visible = True
+
+    def get_xsection_marker_click_frac(self, screen_pos):
+        """Hit-tests a mouse-press position against both halves of the shared cross-section marker's
+        interactive area -- the currently-open cross-section image(s) and the A-B line on the map -- and, if
+        it's a hit, returns (frac, drag_info) where frac is the corresponding distance-along-A-B fraction and
+        drag_info records which side the drag should track for subsequent mouse-move events (see
+        on_mouse_press/on_mouse_move). Returns (None, None) if the position doesn't hit either, or if there's
+        no completed A/B line to begin with.
+
+        Cross-section images are checked first: clicking anywhere inside an open cross-section's image
+        (not just exactly on the current marker line) jumps the marker straight to that distance, which is a
+        much easier target to hit than the thin marker line itself, and matches how one would expect a
+        'click to move the marker here' plot to behave. The map's A-B line, being only ever a thin line (not
+        an area), instead uses a small perpendicular-distance threshold around the line itself.
+        """
+        if self.ab_line_panel is None or self.ab_line_b is None:
+            return None, None
+        pos = np.array(screen_pos, dtype='float64')
+
+        for panel, layout in self.cross_section_layout.items():
+            if (layout['img_left'] <= pos[0] <= layout['img_right'] and
+            layout['img_top'] <= pos[1] <= layout['img_bottom']):
+                frac = (pos[0]-layout['img_left'])/(layout['img_right']-layout['img_left'])
+                return float(np.clip(frac, 0., 1.)), {'mode':'plot', 'panel':panel}
+
+        screen_a = self.xycoord_to_screen(self.ab_line_panel, self.ab_line_a)
+        screen_b = self.xycoord_to_screen(self.ab_line_panel, self.ab_line_b)
+        ab = screen_b-screen_a
+        ab_len_sq = float(np.dot(ab, ab))
+        if ab_len_sq > 0:
+            t = float(np.dot(pos-screen_a, ab)/ab_len_sq)
+            t_clipped = np.clip(t, 0., 1.)
+            closest_point = screen_a+t_clipped*ab
+            hit_radius = self.scale_pixelsize(12) # Generous click target, doesn't need to exactly match the
+            #thin rendered line width itself -- same general approach as the cross-section '< Back'/toggle
+            #button hit-tests elsewhere in this class.
+            if np.linalg.norm(pos-closest_point) < hit_radius:
+                return t_clipped, {'mode':'map'}
+
+        return None, None
+
+    def clear_ab_line(self):
+        """Clears the current A/B line (its line, A/B/distance labels, and the per-panel cross-section toggle
+        buttons that depend on it), and also closes any cross-section split-views that happen to be open --
+        since those are driven by this same line, leaving them open after the line itself disappears would be
+        confusing (a split-view with no way to re-derive what line it was showing). Bound to Delete (see
+        nlr.py), as a single, predictable way to back out of the whole A/B-line/cross-section workflow at once.
+        """
+        self.hide_all_cross_sections() # Also resets the shared marker's state, since it has no line left to sit on.
+        self.xsection_marker_dragging = None
+        self.ab_line_panel = None
+        self.ab_line_a = None
+        self.ab_line_b = None
+        self.draw_ab_line()
+        self.update()
+        # Force an IMMEDIATE repaint here, rather than only requesting one via self.update() (which just
+        # schedules a redraw for the next regular Qt paint cycle) -- on at least one tested system, that
+        # scheduled redraw wasn't visibly applied until some unrelated event (e.g. a scroll) came through and
+        # forced a repaint anyway, leaving the 'A' label looking stuck on screen for longer than expected.
+        # self.native is the underlying Qt widget for this vispy canvas; repaint() processes synchronously
+        # instead of merely scheduling, and processEvents() flushes the Qt event queue so this doesn't have to
+        # wait for whatever else is already pending.
+        try:
+            self.native.repaint()
+            QApplication.processEvents()
+        except Exception:
+            pass
+
+    def clear_volume3d_rect(self):
+        """Wist de 3D-selectierechthoek (zie volume3d_rect_a/b) zonder een nieuwe te hoeven tekenen. Bound
+        to CTRL+SHIFT+Delete (zie nlr.py) -- gewone Delete is al voor de A/B-lijn/cross-section in gebruik."""
+        self.volume3d_rect_panel = None
+        self.volume3d_rect_a = None
+        self.volume3d_rect_b = None
+        self.volume3d_rect_dragging = False
+        self.draw_volume3d_rect()
+        self.update()
+
+    def toggle_cross_section(self, panel):
+        if panel in self.cross_section_active_panels:
+            self.hide_cross_section(panel)
+        else:
+            self.show_cross_section(panel)
+
+    def toggle_cross_sections_for_ab_line(self):
+        """Toggles the cross-section split-view for every panel with cross-section support (see
+        cross_section_product_for_panel) at once -- used by the F2 keyboard shortcut, which (unlike a mouse
+        click on a specific panel's '< Back'/'Show cross-section >>' label) has no single panel to target.
+        If ANY supported panel currently has its cross-section open, this hides all of them; otherwise it
+        shows all of them."""
+        if self.cross_section_active_panels:
+            self.hide_all_cross_sections()
+        else:
+            self.show_cross_sections_for_ab_line()
+
+    def show_cross_sections_for_ab_line(self):
+        """Activates the cross-section split-view for EVERY currently-displayed panel whose product has cross-
+        section support (currently 'z' Reflectivity and 'v' Velocity -- see cross_section_product_for_panel),
+        all driven by the single, shared A/B line (see set_ab_line_point). This is what the 'Show cross-section
+        >>' click actually calls; show_cross_section(panel) itself only handles one panel at a time, so that it
+        can also be used for re-showing/refreshing a single panel's cross-section independently (e.g. from the
+        per-panel animation hook in set_newdata, or a possible future per-panel toggle)."""
+        if self.ab_line_panel is None or self.ab_line_b is None:
+            return
+        for panel in self.panellist:
+            if self.cross_section_product_for_panel(panel) is not None:
+                self.show_cross_section(panel)
+
+    def cross_section_product_for_panel(self, panel):
+        """Returns the cross-section data product ('z' or 'v') appropriate for the product currently shown in
+        the given panel, or None if that panel's product has no cross-section support. Currently a direct 1:1
+        mapping (a 'z' panel gets a Reflectivity cross-section, a 'v' panel gets a Velocity cross-section), but
+        kept as a separate lookup (rather than inlining 'self.crd.products[panel] in (\"z\",\"v\")' everywhere)
+        in case support for additional products is added later.
+        """
+        # self.crd.products is a plain list/sequence indexed by panel number (like self.crd.scans), not a
+        # dict -- it has no .get() method. An earlier version of this code assumed it was a dict (it isn't,
+        # see e.g. self.crd.products[j] used throughout the rest of this file with plain index access), which
+        # raised an AttributeError on every click of 'Show cross-section >>'.
+        try:
+            product = self.crd.products[panel]
+        except (IndexError, KeyError):
+            return None
+        return product if product in ('z', 'v') else None
+
+    def update_cross_section_toggle_buttons(self):
+        """Positions and shows/hides the small per-panel cross-section toggle button (top-right corner of each
+        panel) -- see self.visuals['cross_section_toggle_button'/'cross_section_toggle_button_frame'], set up
+        in __init__. A button is shown for panel j only when BOTH: (1) j's current product has cross-section
+        support (see cross_section_product_for_panel), and (2) a completed A/B line exists to drive it. Called
+        from draw_ab_line (whenever the line itself changes) and from set_panel_sttransforms_and_clippers
+        (whenever panel positions/sizes change, e.g. window resize or changing the panel count), so the
+        buttons always end up in the correct top-right corner regardless of what changed.
+        """
+        have_line = self.ab_line_panel is not None and self.ab_line_b is not None
+        for panel in range(self.max_panels):
+            if panel not in self.visuals['cross_section_toggle_button']:
+                continue # Can happen before __init__'s per-panel setup loop has run for this panel index.
+            show_button = have_line and panel in self.panellist and self.cross_section_product_for_panel(panel) is not None
+            if not show_button:
+                self.visuals['cross_section_toggle_button'][panel].visible = False
+                self.visuals['cross_section_toggle_button_frame'][panel].visible = False
+                continue
+            panel_corners = self.panel_corners[panel]
+            # panel_corners order is [topleft, bottomleft, bottomright, topright] (see set_panel_info's
+            # comment: "First corner is the top left one, and the other 3 are listed in counterclockwise
+            # order"), so index 3 is the top-right corner.
+            topright = panel_corners[3]
+            margin = self.scale_pixelsize(8)
+            btn_size = np.array([self.scale_pixelsize(100), self.scale_pixelsize(26)])
+            # Plain text, no border/frame, matching the rest of the understated NLradar interface.
+            btn_pos = topright+np.array([-margin-0.5*btn_size[0], margin])
+            # Zelfde correctie als bij set_titles()/cbars_labels (6 juli 2026): anchor_y='top' wordt in
+            # vispy 0.14.1 niet zuiver als bovenkant-ankerpunt behandeld, waardoor deze tekst te hoog stond.
+            btn_pos = btn_pos + np.array([0, 1.5*self.scale_pointsize(eval(self.font_sizes['cbars_labels']))])
+            self.visuals['cross_section_toggle_button'][panel].pos = btn_pos
+            self.visuals['cross_section_toggle_button'][panel].visible = True
+            self.visuals['cross_section_toggle_button_frame'][panel].visible = False
+
+    def cross_section_visual(self, panel):
+        """Returns the pre-built ImageVisual for the given panel matching the CURRENT
+        self.gui.cross_section_interpolation_mode (see the 3-variants-per-panel setup in __init__) -- the
+        single point every other method goes through to get/show/hide 'the' cross-section image, so that
+        switching interpolation mode (see change_cross_section_interpolation_mode in nlr.py) never needs to
+        create or mutate a visual, just pick a different, already-fully-wired one. getattr guards against an
+        older stored_settings.pkl predating this setting."""
+        mode = getattr(self.gui, 'cross_section_interpolation_mode', 'bicubic')
+        if mode not in self.cross_section_interpolation_modes:
+            mode = 'bicubic' # Guard against a corrupted/unrecognized stored value.
+        return self.visuals['cross_section_'+mode][panel]
+
+    def hide_other_cross_section_interpolation_visuals(self, panel):
+        """Hides the OTHER (currently-unused) interpolation-mode visuals for this panel, so that at most one
+        of the 3 pre-built variants (see cross_section_visual) is ever visible at once -- called from
+        show_cross_section (right before showing the currently-selected one) and from
+        change_cross_section_interpolation_mode (right after switching mode), so a stale, previously-visible
+        variant from a different mode never lingers on screen underneath/behind the newly-selected one."""
+        current = self.cross_section_visual(panel)
+        for mode in self.cross_section_interpolation_modes:
+            visual = self.visuals['cross_section_'+mode][panel]
+            if visual is not current:
+                visual.visible = False
+
+    def show_cross_section(self, panel):
+        """Activates the vertical cross-section view (Reflectivity or Velocity, depending on this panel's
+        current product -- see cross_section_product_for_panel) along the current, shared A/B line (see
+        set_ab_line_point) for the given panel specifically, splitting that one panel into a top half (the
+        cross-section image) and bottom half (the normal radar view, cropped rather than replaced -- see
+        further down) until hide_cross_section(panel) is called for it. Does nothing if no completed A/B line
+        exists yet, or if this panel's product has no cross-section support."""
+        if self.ab_line_panel is None or self.ab_line_b is None:
+            return
+        product = self.cross_section_product_for_panel(panel)
+        if product is None:
+            return
+        n_samples = max(100, int(getattr(self.gui, 'cross_section_n_samples', 2000)))
+        points = self.dsg.get_cross_section(product, self.ab_line_a, self.ab_line_b, n_samples=n_samples)
+        if len(points) == 0:
+            self.gui.set_textbar("No data found along this line.", 'red', 1)
+            return
+
+        distances, heights, values = (np.array([p[i] for p in points]) for i in range(3))
+        # A flat 15% headroom margin on top of the 99th-percentile height (rather than using that percentile
+        # directly as the top of the scale) gives a tall storm's overshooting top some empty space above it in
+        # the rendered image, instead of being squeezed into just the topmost row or two of the n_height_bins
+        # raster -- which is what made a genuinely tall, gradually-built-up tower (NOT a stray outlier; see the
+        # per-column diagnostics, which show a smoothly rising sequence over many consecutive columns rather
+        # than an isolated spike) appear to cut off abruptly right where the data actually just ran out of
+        # vertical room to be drawn in.
+        headroom_factor = 1. + max(0., getattr(self.gui, 'cross_section_height_headroom_percent', 15.))/100.
+        max_height_km = max(8., np.percentile(heights, 99)*headroom_factor) # At least 8 km of headroom, but extend
+        #further if genuinely high-altitude echo is present (e.g. a tall convective cell), so the
+        #cross-section isn't needlessly cropped right at the top of a strong storm.
+        line_length_km = np.linalg.norm(self.ab_line_b-self.ab_line_a)
+
+        # Re-apply the current colormap/clim every time the cross-section is (re)shown, rather than relying
+        # solely on the clim passed once at ImageVisual construction time (see __init__). self.clim_int[product]
+        # can change at runtime (e.g. it depends on the current scan's Nyquist velocity for V, which differs
+        # between scans/radars/moments), so a stale clim from whenever the app started would make the
+        # cross-section's colors disagree with the normal panel right next to it -- in the most visible case,
+        # real values well within the normal panel's range could end up clipped to the extreme end of a too-
+        # narrow stale clim, making most of the image render as the same saturated end-of-scale color.
+        # Re-assigning the cmap property (not just clim) also matters here: per the PolRGB color-transform fix
+        # elsewhere in this codebase, vispy's ImageVisual only rebuilds its internal GLSL color-transform
+        # function when the cmap property itself is reassigned, not merely when set_data/clim change -- so
+        # skipping this would risk the visual keeping whatever color-transform function happened to be built
+        # for its previous use.
+        self.cross_section_visual(panel).cmap = self.cm1[product]
+        self.cross_section_visual(panel).clim = self.clim_int[product]
+
+        # Bin the scattered (distance, height, value) points onto a regular raster, since ImageVisual needs
+        # a 2D grid, not a scattered point cloud. Resolution can't be pushed arbitrarily high, because the
+        # number of available (distance, height) samples is limited by the number of elevation scans times
+        # n_samples along the line -- a too-fine raster just produces a sparse, speckled result with mostly
+        # empty bins (this was the root cause of the original "stray horizontal dashes" bug: back when
+        # n_samples was still 300, a 400x200=80000-bin raster fed by only ~2000-2300 points was at best ~3%
+        # filled, so nearly the whole image was empty/transparent except for a handful of isolated filled
+        # pixels, which -- stretched across the full main-widget area -- looked like scattered dashed lines
+        # rather than a filled cross-section). n_samples in get_velocity_cross_section/get_cross_section was
+        # since raised to 2000 (see nlr_datasourcegeneral.py), giving far more raw points per elevation scan
+        # than back then, which is what makes doubling the raster here (150x80 -> 300x160) safe to do without
+        # reintroducing that same sparse/speckled look -- if the raster is ever pushed higher still, re-check
+        # the per-column fill percentage (see filled_counts below) rather than assuming it stays fine.
+        # Base 150x80 raster, scaled by the live-adjustable cross_section_resolution_factor (Settings ->
+        # Miscellaneous -- see settings_tabmiscellaneous/change_cross_section_resolution_factor in nlr.py, the
+        # same "tunable without editing code" pattern used for polrgb_params). getattr with a 1.0 fallback
+        # guards against an older stored_settings.pkl that predates this setting.
+        resolution_factor = getattr(self.gui, 'cross_section_resolution_factor', 1.0)
+        n_dist_bins = max(1, int(round(150*resolution_factor)))
+        n_height_bins = max(1, int(round(80*resolution_factor)))
+        dist_bin = np.clip((distances/line_length_km*n_dist_bins).astype('int64'), 0, n_dist_bins-1)
+        height_bin = np.clip((heights/max_height_km*n_height_bins).astype('int64'), 0, n_height_bins-1)
+
+        raster = np.full((n_height_bins, n_dist_bins), np.nan, dtype='float32')
+        # Where multiple points land in the same bin (more likely at long range, where beams from different
+        # elevations can be close together), just keep the last one written -- a simple, cheap resolution
+        # strategy that's good enough for this first version of the feature.
+        raster[height_bin, dist_bin] = values
+
+        # Vertical interpolation between scans: each elevation scan contributes a roughly-horizontal band of
+        # filled bins (mostly empty above/below it). Linearly interpolating, per distance column, between the
+        # nearest filled bin above and below any given empty bin turns those gaps into a smooth transition
+        # between adjacent scans' values -- much closer to how a "real" vertical cross-section reads in other
+        # radar software, instead of leaving hard physical gaps between every scan's band. Only the space
+        # *between* the lowest and highest filled bin in a column is interpolated; above the highest scan and
+        # below the lowest scan there's no bracketing data to interpolate from, so those stay empty (no
+        # extrapolation -- we don't want to invent values where there's genuinely no nearby measurement).
+        height_axis = np.arange(n_height_bins)
+        # Diagnostic only: per-column count of filled rows and the topmost filled row BEFORE interpolation,
+        # to distinguish a genuine scan-coverage edge (count drops to 0-1 and stays there) from a binning
+        # artifact (count fluctuates/drops only briefly). Printed as a compact table rather than per-column,
+        # to keep the console output readable.
+        filled_counts = np.array([np.count_nonzero(~np.isnan(raster[:, col])) for col in range(n_dist_bins)])
+        top_filled_row = np.array([
+            (np.nonzero(~np.isnan(raster[:, col]))[0].min() if filled_counts[col] > 0 else -1)
+            for col in range(n_dist_bins)])
+
+        # Outlier filtering: a column whose topmost filled bin is far HIGHER (much higher row index, since at
+        # this point in the code -- before the later raster[::-1] flip -- a higher row index means higher
+        # altitude) than its neighbouring columns' tops almost certainly reflects a single noisy/stray point
+        # (e.g. a second-trip echo or a mis-binned sample) rather than a real, physically-continuous high-
+        # altitude feature -- a genuine tall convective cell shows up as a gradual rise over many columns, not
+        # an isolated few-column spike that jumps far above the surrounding columns and then drops straight
+        # back down (see the diagnostic above: a real run of e.g. '5,5,5,5,5' surrounded by an isolated
+        # '53,54,54,54,55' before returning to '9,5,5,5,5' is exactly this pattern, and produced a hard,
+        # physically-impossible-looking vertical 'step' in the rendered cross-section).
+        #
+        # For each column, compare its top against the MEDIAN top of a window of neighbouring columns. This is
+        # done iteratively, excluding columns already flagged as outliers from later neighbour-median
+        # calculations -- otherwise a multi-column-wide cluster of outliers (as in the example above, 5 columns
+        # wide) would count each other as 'normal' neighbours and never get flagged, since the local median
+        # would itself be dragged up by the very outliers it's trying to detect. The window is wide enough to
+        # comfortably extend past such a cluster to reach genuinely unaffected columns on either side.
+        window = 10 # Columns on each side to use for the local median.
+        outlier_threshold = 8*n_height_bins//80 # Row-index difference beyond which a column's top is treated
+        #as a stray outlier rather than a genuine local rise -- expressed relative to n_height_bins (originally
+        #tuned as 8 rows out of 80) so it keeps representing the same physical height jump (roughly 1-2 km) if
+        #n_height_bins is ever changed, rather than becoming twice as strict/lenient as intended. Chosen to
+        #comfortably exceed the normal column-to-column variation seen in the diagnostic above (typically 1-3
+        #rows out of 80) while still catching genuine jumps of several km.
+        valid_cols = np.nonzero(top_filled_row >= 0)[0]
+        is_outlier_col = np.zeros(n_dist_bins, dtype=bool)
+        for _pass in range(3): # A few passes so a flagged outlier no longer pollutes its neighbours' medians.
+            changed = False
+            for col in valid_cols:
+                if is_outlier_col[col]:
+                    continue
+                neighbour_idx = valid_cols[(valid_cols >= col-window) & (valid_cols <= col+window) & (valid_cols != col)]
+                neighbour_idx = neighbour_idx[~is_outlier_col[neighbour_idx]]
+                if neighbour_idx.size < 3:
+                    continue # Too few reliable neighbours (e.g. right at the start/end of the line) to judge.
+                local_median_top = np.median(top_filled_row[neighbour_idx])
+                if top_filled_row[col] > local_median_top+outlier_threshold:
+                    is_outlier_col[col] = True
+                    changed = True
+            if not changed:
+                break
+
+        # Only ever removes data -- it can't invent any. For each flagged column, drop bins above (i.e. with a
+        # higher row index than) a freshly-recomputed local median (now excluding ALL flagged outlier columns,
+        # not just the ones found before this particular column in the loop above), so the interpolation below
+        # follows the surrounding, locally-consistent trend instead of jumping out to the stray point.
+        for col in np.nonzero(is_outlier_col)[0]:
+            neighbour_idx = valid_cols[(valid_cols >= col-window) & (valid_cols <= col+window) & (valid_cols != col)]
+            neighbour_idx = neighbour_idx[~is_outlier_col[neighbour_idx]]
+            if neighbour_idx.size == 0:
+                continue
+            local_median_top = np.median(top_filled_row[neighbour_idx])
+            cutoff_row = int(round(local_median_top))
+            raster[cutoff_row+1:, col] = np.nan
+
+        for col in range(n_dist_bins):
+            column = raster[:, col]
+            filled_rows = np.nonzero(~np.isnan(column))[0]
+            if filled_rows.size < 2:
+                continue # Nothing to interpolate between with 0 or 1 filled bins in this column.
+            lo, hi = filled_rows.min(), filled_rows.max()
+            raster[lo:hi+1, col] = np.interp(height_axis[lo:hi+1], filled_rows, column[filled_rows])
+
+        # Gap-fill: a final, light touch-up for any remaining isolated empty bins not resolved by the vertical
+        # interpolation above (e.g. right at the left/right edge of a scan's azimuthal coverage, or a column
+        # that had too few filled bins to interpolate). A few rounds of "fill empty bin from a filled neighbour"
+        # closes these small gaps, without smearing data across genuinely large empty regions (e.g. above the
+        # highest scan's coverage, which intentionally stays empty after the interpolation step above too).
+        for _ in range(3):
+            nan_mask = np.isnan(raster)
+            if not nan_mask.any():
+                break
+            filled = raster.copy()
+            # Average over up/down/left/right neighbours that do have data; leave bins untouched if none of
+            # their neighbours are filled either (so large gaps shrink gradually instead of being bridged in
+            # one step, and truly empty regions -- e.g. far above the radar's highest scan -- stay empty).
+            neighbour_sum = np.zeros_like(raster); neighbour_count = np.zeros_like(raster)
+            for shift, axis in ((1,0), (-1,0), (1,1), (-1,1)):
+                shifted = np.roll(raster, shift, axis=axis)
+                valid = ~np.isnan(shifted)
+                # np.roll wraps around; mask off the wrapped-around edge so it doesn't pull data from the
+                # opposite side of the raster.
+                if axis == 0:
+                    if shift == 1: valid[0, :] = False
+                    else: valid[-1, :] = False
+                else:
+                    if shift == 1: valid[:, 0] = False
+                    else: valid[:, -1] = False
+                neighbour_sum[valid] += shifted[valid]
+                neighbour_count[valid] += 1
+            fillable = nan_mask & (neighbour_count > 0)
+            filled[fillable] = neighbour_sum[fillable]/neighbour_count[fillable]
+            raster = filled
+
+        raster = raster[::-1] # Row 0 should be the TOP (highest height) for image display, matching every
+        #other image visual's top-to-bottom = high-to-low-y convention used throughout this codebase.
+
+        raster_uint = self.dsg.convert_dtype_float_to_uint(np.where(np.isnan(raster), self.mask_values.get(product, -1e6), raster), product)
+        self.cross_section_visual(panel).set_data(raster_uint)
+
+        # Split-panel layout: the panel area is divided 50/50 into a top half (this cross-section image) and a
+        # bottom half (self.visuals['cross_section_overview'], the normal radar image for this panel/scan --
+        # see further down). A small gap between the two halves keeps the white frame lines (cross_section_frame,
+        # set up below) from visually touching.
+        panel_corners = self.panel_corners[panel]
+        panel_topleft, panel_bottomright = panel_corners[0], panel_corners[2]
+        panel_w, panel_h = panel_bottomright-panel_topleft
+        half_gap = self.scale_pixelsize(4)
+        top_half_topleft = panel_topleft
+        top_half_bottomright = panel_topleft+np.array([panel_w, panel_h/2-half_gap/2])
+        bottom_half_topleft = panel_topleft+np.array([0, panel_h/2+half_gap/2])
+        bottom_half_bottomright = panel_bottomright
+
+        topleft, bottomright = top_half_topleft, top_half_bottomright
+        panel_w, panel_h = bottomright-topleft
+        margin = self.scale_pixelsize(75) # Room for the axis line, tick marks, and tick labels around the
+        #cross-section image itself -- enlarged from an earlier, narrower margin that let height label text
+        #(e.g. '10 km') extend into the image area on the left side.
+
+        # Solid dark background for the entire top half (see self.visuals['cross_section_background'] in
+        # __init__), covering the shared map visual so streets/place names don't show through wherever the
+        # cross-section raster itself is transparent (e.g. empty/NaN bins with no nearby scan data).
+        self.visuals['cross_section_background'][panel].transform.translate = 0.5*(topleft+bottomright)
+        self.visuals['cross_section_background'][panel].transform.scale = (abs(panel_w), abs(panel_h))
+        self.visuals['cross_section_background'][panel].visible = True
+
+        self.cross_section_visual(panel).transform = STTransform(
+            scale=((abs(panel_w)-2*margin)/n_dist_bins, (abs(panel_h)-2*margin)/n_height_bins),
+            translate=(topleft[0]+margin, topleft[1]+margin))
+        # Hide the other 2 (currently-unselected) interpolation-mode variants for this panel BEFORE showing
+        # the selected one, so switching mode never briefly leaves 2 overlapping images visible at once.
+        self.hide_other_cross_section_interpolation_visuals(panel)
+        self.cross_section_visual(panel).visible = True
+
+        # Axis labels: ticks every 12.5% along both axes (9 ticks total per axis), plus a short axis-name label
+        # past each end, for easier reading of intermediate values without having to interpolate by eye between
+        # widely-spaced ticks. Also draws a simple axis line with small perpendicular tick marks along the
+        # bottom (distance) and left (height) edges of the cross-section image -- without these, the numbers
+        # were floating with no clear reference to which exact row/column they belonged to, and with the
+        # previous, narrower margin the height labels' text could extend into the image area itself rather
+        # than staying in the margin beside it.
+        tick_fracs = np.linspace(0, 1, 9)
+        ticks_text, ticks_pos = [], []
+        axislines_pos = []
+        tick_len = self.scale_pixelsize(5) # Length of each small perpendicular tick mark.
+        img_left, img_right = topleft[0]+margin, topleft[0]+margin+(abs(panel_w)-2*margin)
+        img_top, img_bottom = topleft[1]+margin, topleft[1]+margin+(abs(panel_h)-2*margin)
+
+        # Remember this panel's image bounds in screen-pixel space, for the shared cross-section marker (see
+        # set_xsection_marker_frac/update_xsection_marker): needed both to draw its vertical line at the right
+        # x position and to hit-test clicks/drags inside the image (see get_xsection_marker_click_frac). Kept
+        # up to date on every (re)show of the cross-section, e.g. after a panel resize.
+        self.cross_section_layout[panel] = dict(img_left=img_left, img_right=img_right, img_top=img_top, img_bottom=img_bottom)
+
+        # X axis (distance): a horizontal line just below the image, with a short tick mark hanging down from
+        # it at every tick_frac position, and the distance labels below those. The unit (km) is given once, in
+        # the axis-name label, rather than repeated after every individual number.
+        axislines_pos += [[img_left, img_bottom], [img_right, img_bottom]] # The axis line itself.
+        for frac in tick_fracs:
+            d_km = frac*line_length_km
+            x = img_left+frac*(img_right-img_left)
+            axislines_pos += [[x, img_bottom], [x, img_bottom+tick_len]] # One tick mark.
+            ticks_text.append(str(ft.rifdot0(ft.r1dec(d_km))))
+            ticks_pos.append([x, img_bottom+tick_len+self.scale_pixelsize(14)])
+        ticks_text.append('Distance along A-B (km)')
+        ticks_pos.append([0.5*(img_left+img_right), img_bottom+self.scale_pixelsize(36)])
+
+        # Y axis (height): a vertical line just left of the image, with a short tick mark sticking out to the
+        # left at every tick_frac position, and the height labels further left of those (clear of the image).
+        axislines_pos += [[img_left, img_top], [img_left, img_bottom]] # The axis line itself.
+        height_label_x = img_left-tick_len-self.scale_pixelsize(16)
+        for frac in tick_fracs:
+            h_km = frac*max_height_km
+            y = img_top+(1-frac)*(img_bottom-img_top)
+            axislines_pos += [[img_left, y], [img_left-tick_len, y]] # One tick mark.
+            ticks_text.append(str(ft.rifdot0(ft.r1dec(h_km))))
+            ticks_pos.append([height_label_x, y])
+        ticks_text.append('Height (km)')
+        ticks_pos.append([height_label_x, img_top-self.scale_pixelsize(20)])
+
+        self.visuals['cross_section_ticks'][panel].text = ticks_text
+        self.visuals['cross_section_ticks'][panel].pos = np.array(ticks_pos)
+        self.visuals['cross_section_axislines'][panel].set_data(pos=np.array(axislines_pos, dtype='float32'), connect='segments')
+        self.visuals['cross_section_axislines'][panel].visible = True
+
+        # Back button: plain text, no border/frame, matching the rest of the understated NLradar interface
+        # (e.g. the height/distance axis labels use the same approach -- bare text, no box around it).
+        back_size = np.array([self.scale_pixelsize(80), self.scale_pixelsize(26)])
+        back_center = topleft+np.array([self.scale_pixelsize(8)+0.5*back_size[0], self.scale_pixelsize(8)])
+        # Zelfde correctie als bij set_titles()/cbars_labels (6 juli 2026): anchor_y='top' compensatie.
+        back_center = back_center + np.array([0, 1.5*self.scale_pointsize(eval(self.font_sizes['cbars_labels']))])
+        self.visuals['cross_section_back'][panel].pos = back_center
+        self.visuals['cross_section_back'][panel].visible = True
+        self.visuals['cross_section_back_frame'][panel].visible = False
+
+        # Title/timestamp above the cross-section image, e.g. "Velocity cross-section  17:03:47Z" -- mirroring
+        # the HH:MM:SSZ-style time format used by the normal panel titles (see self.scantimes[j], a
+        # 'HH:MM:SS-HH:MM:SS' start-end string; only the start time is shown here, matching how e.g. the cursor
+        # readout in the main title bar abbreviates it elsewhere). Positioned just INSIDE the top edge of the
+        # panel (anchor_y='top', a small positive offset down from topleft[1]) -- placing it above topleft[1]
+        # (i.e. outside the panel) put it in the main title bar's own space, where it was invisible/clipped.
+        scantime_str = self.dsg.scantimes.get(panel, '')
+        scantime_short = scantime_str.split('-')[0]+'Z' if scantime_str else ''
+        product_title = {'v': 'Velocity', 'z': 'Reflectivity'}.get(product, gv.productnames.get(product, product))
+        title_text = product_title+' cross-section'+((' '*2+scantime_short) if scantime_short else '')
+        self.visuals['cross_section_title'][panel].text = title_text
+        # Zelfde correctie als bij set_titles()/cbars_labels (6 juli 2026): anchor_y='top' compensatie.
+        self.visuals['cross_section_title'][panel].pos = np.array([0.5*(topleft[0]+bottomright[0]), topleft[1]+self.scale_pixelsize(4)+2.0*self.scale_pointsize(eval(self.font_sizes['cbars_labels']))])
+        self.visuals['cross_section_title'][panel].visible = True
+
+        # Bottom half: simply clip the existing, normal radar_polar/radar_cartesian/map visuals for this panel
+        # down to the bottom half, rather than hiding them and building a separate overview image. This keeps
+        # the panel's actual pan/zoom state (self.panels_sttransforms[panel]) completely untouched -- panning
+        # and zooming the bottom half therefore works exactly like it always does on a normal, non-split panel,
+        # since nothing about that machinery changed; only the visible CROP changes. Four earlier attempts at
+        # rebuilding an independent overview (via composed vispy transforms, then via a from-scratch CPU-side
+        # raster) tried to make the bottom half show the data scaled/positioned to fit -- each approach put it
+        # at a visibly wrong location for reasons that resisted explanation even after algebraic and empirical
+        # verification, or (the CPU-side raster) ended up showing a fixed, non-scrollable view unrelated to the
+        # current pan/zoom, which doesn't match what's actually wanted: the same scrollable, correctly
+        # positioned map/radar view the panel already had, just cropped to the smaller area.
+        #
+        # self.clippers[panel] is shared by every visual in self.visuals_panels for this panel (map,
+        # radar_polar, radar_cartesian, grid/heightring lines, etc. -- see the .attach() calls in __init__), so
+        # narrowing it affects all of them together, which is fine here since none of those other elements are
+        # being used differently while the cross-section is shown.
+        panel_bounds_bottom_half = np.array([
+            bottom_half_topleft[0], self.size[1]-bottom_half_bottomright[1],
+            bottom_half_bottomright[0]-bottom_half_topleft[0], bottom_half_bottomright[1]-bottom_half_topleft[1]])
+        self.clippers[panel].bounds = tuple(panel_bounds_bottom_half*self.gui.screen_pixel_ratio())
+
+        # White frame lines around both halves (LineVisual with 2 separate rectangles, 5 points each -- the same
+        # pattern used by self.visuals['panel_borders'], see set_panel_borders).
+        def rect_points(tl, br):
+            return [np.array([tl[0],tl[1]]), np.array([tl[0],br[1]]), np.array([br[0],br[1]]), np.array([br[0],tl[1]]), np.array([tl[0],tl[1]])]
+        frame_pos = np.array(rect_points(top_half_topleft, top_half_bottomright)+rect_points(bottom_half_topleft, bottom_half_bottomright), dtype='float32')
+        frame_connect = np.ones(10, dtype='bool')
+        frame_connect[4] = False
+        frame_connect[9] = False
+        self.visuals['cross_section_frame'][panel].set_data(pos=frame_pos, connect=frame_connect)
+        self.visuals['cross_section_frame'][panel].visible = True
+
+        self.cross_section_active_panels.add(panel)
+
+        # Show the shared cross-section marker right away, defaulting to the midpoint of the line the very
+        # first time it appears (rather than requiring an initial click just to make it visible at all) --
+        # see set_xsection_marker_frac/update_xsection_marker. If a marker position was already set (e.g. this
+        # is a second panel's cross-section opening while one is already shown elsewhere, or a resize re-running
+        # show_cross_section), that existing position is kept instead of being reset to the middle again.
+        if self.xsection_marker_frac is None:
+            self.xsection_marker_frac = 0.5
+        self.update_xsection_marker()
+
+        self.update()
+
+    def hide_cross_section(self, panel):
+        if panel in self.cross_section_active_panels:
+            for radar_image in ('radar_polar', 'radar_cartesian'):
+                if panel in self.visuals[radar_image]:
+                    self.visuals[radar_image][panel].visible = (self.data_attr['proj'].get(panel) ==
+                        ('pol' if radar_image == 'radar_polar' else 'car'))
+            # Restore the clipper to the panel's full bounds (see show_cross_section, which narrows it to just
+            # the bottom half) -- otherwise the panel would stay cropped to that half even after leaving the
+            # cross-section view.
+            self.clippers[panel].bounds = tuple(self.panel_bounds[panel]*self.gui.screen_pixel_ratio())
+            self.cross_section_active_panels.discard(panel)
+        for mode in self.cross_section_interpolation_modes:
+            self.visuals['cross_section_'+mode][panel].visible = False
+        self.visuals['cross_section_ticks'][panel].text = []
+        self.visuals['cross_section_axislines'][panel].visible = False
+        self.visuals['cross_section_marker'][panel].visible = False
+        self.visuals['cross_section_back'][panel].visible = False
+        self.visuals['cross_section_back_frame'][panel].visible = False
+        self.visuals['cross_section_title'][panel].visible = False
+        self.visuals['cross_section_background'][panel].visible = False
+        self.visuals['cross_section_frame'][panel].visible = False
+        self.cross_section_layout.pop(panel, None)
+        if not self.cross_section_layout:
+            # No panel has a cross-section open anymore -- hide the map-side marker too and forget its
+            # position, so a freshly (re)opened cross-section later starts back at the midpoint default
+            # (see show_cross_section) rather than resuming some now-stale, possibly off-screen position.
+            self.xsection_marker_frac = None
+            self.xsection_marker_dragging = None
+            self.visuals['ab_line_marker'].visible = False
+        self.update()
+
+    def hide_all_cross_sections(self):
+        """Hides the cross-section split-view for every panel where it's currently active (e.g. for the '< Back'
+        click, which should leave every split panel -- not just one -- back in its normal, unsplit state)."""
+        for panel in list(self.cross_section_active_panels):
+            self.hide_cross_section(panel)
+
     def on_mouse_press(self, ev):
         if not ft.point_inside_rectangle(ev.pos,self.wpos['main'])[0] and not (
         self.gui.show_vwp and ft.point_inside_rectangle(ev.pos,self.wpos['vwp'])[0]):
@@ -775,7 +1784,82 @@ class Plotting(QObject,app.Canvas):
         if self.gui.show_vwp and ft.point_inside_rectangle(ev.pos,self.wpos['vwp'])[0]:
             #No more steps needed in this case
             return
-        
+
+        for panel in list(self.cross_section_active_panels):
+            if self.visuals['cross_section_back'][panel].visible:
+                # back_pos is the text's own anchor point: anchor_x='center'/anchor_y='top', so it's the
+                # top-center point of the button (see show_cross_section, which draws the box symmetrically
+                # around this same point) -- the hit-test box below must use the same convention.
+                back_pos = np.array(self.visuals['cross_section_back'][panel].pos).flatten()[:2]
+                # Zelfde ruimere klikzone als bij de X-section-knop hierboven (6 juli 2026).
+                back_size = np.array([self.scale_pixelsize(100), self.scale_pixelsize(50)])
+                back_hit_center_offset = np.array([0, 0.5*back_size[1]-self.scale_pixelsize(15)])
+                hit = np.all(np.abs(np.array(ev.pos)-back_pos-back_hit_center_offset) < 0.5*back_size)
+                if hit:
+                    self.hide_cross_section(panel)
+                    return
+
+        # Small per-panel cross-section toggle button, top-right corner of each panel that currently has a
+        # cross-section-capable product (Z or V) shown and a completed A/B line to work from -- see
+        # update_cross_section_toggle_buttons. Checked for every panel in panellist, not just ones with an
+        # active cross-section, since this is also how the cross-section gets turned ON in the first place.
+        for panel in self.panellist:
+            if panel in self.visuals['cross_section_toggle_button'] and self.visuals['cross_section_toggle_button'][panel].visible:
+                # btn_pos is the text's own anchor point: anchor_x='center'/anchor_y='top' (see
+                # update_cross_section_toggle_buttons, which draws the box symmetrically around this same
+                # point), so the hit-test box needs no x-offset, only a y-offset to its vertical center.
+                btn_pos = np.array(self.visuals['cross_section_toggle_button'][panel].pos).flatten()[:2]
+                # Klikzone ruimer gemaakt (6 juli 2026): na de anchor_y-positiecorrectie bleek de klik net
+                # buiten de oorspronkelijk kleine hit-box te vallen (~10-20 px verschil). In plaats van het
+                # exacte pixel-verschil te blijven najagen, is de klikzone zelf simpelweg vergroot, met wat
+                # extra marge naar boven toe (waar de klikken structureel net buiten vielen).
+                btn_size = np.array([self.scale_pixelsize(120), self.scale_pixelsize(50)])
+                btn_hit_center_offset = np.array([0, 0.5*btn_size[1]-self.scale_pixelsize(15)])
+                hit = np.all(np.abs(np.array(ev.pos)-btn_pos-btn_hit_center_offset) < 0.5*btn_size)
+                if hit:
+                    self.toggle_cross_section(panel)
+                    return
+
+        modifiers = QApplication.keyboardModifiers()
+        if ev.button==1 and bool(modifiers & Qt.ShiftModifier) and bool(modifiers & Qt.ControlModifier):
+            # Sleep-rechthoek (bijv. voor de 3D-volumeweergave, CTRL+SHIFT+4 in nlr.py): CTRL+SHIFT+links-
+            # klik-en-slepen. Gecontroleerd VOOR de gewone Shift-only A/B-lijn hieronder, want een bitwise
+            # check op alleen Qt.ShiftModifier (zoals die A/B-lijn-check gebruikt) is ook True wanneer Ctrl
+            # ernaast wordt ingedrukt -- zonder deze volgorde zou CTRL+SHIFT+klik dus per ongeluk de A/B-lijn
+            # activeren in plaats van de sleep-rechthoek.
+            panel = self.get_panel_for_position(ev.pos)
+            xy = self.screencoord_to_xy(np.array(ev.pos), panel)
+            self.volume3d_rect_panel = panel
+            self.volume3d_rect_a = xy
+            self.volume3d_rect_b = xy # Zelfde punt als startwaarde, zodat er meteen (een nulgroot) een
+            #rechthoek bestaat om live bij te werken tijdens het slepen, i.p.v. pas na de eerste move.
+            self.volume3d_rect_dragging = True
+            self.draw_volume3d_rect()
+            return
+
+        if ev.button==1 and bool(modifiers & Qt.ShiftModifier):
+            # A/B line tool: first Shift+click sets point A, second sets point B (and finalizes the line).
+            # A further Shift+click after that starts a fresh line, discarding the old one -- simpler and more
+            # predictable than requiring an explicit 'clear' action for what's meant to be a quick, lightweight
+            # measuring tool.
+            # Using a bitwise check here (rather than strict equality with Qt.ShiftModifier) so this still
+            # registers even if Qt reports Shift alongside some other incidental modifier flag.
+            self.set_ab_line_point(ev.pos)
+            return
+
+        # Shared cross-section marker (see set_xsection_marker_frac/get_xsection_marker_click_frac): a plain,
+        # non-Shift left click/drag either inside an open cross-section image or near the A-B line on the map
+        # grabs (and, via on_mouse_move, drags) the marker instead of starting the usual pan. Checked only
+        # without Shift held, so Shift+click always keeps its existing meaning (setting a new A/B line point)
+        # even if it happens to land close to the marker or line.
+        if ev.button==1 and not bool(modifiers & Qt.ShiftModifier):
+            frac, drag_info = self.get_xsection_marker_click_frac(ev.pos)
+            if frac is not None:
+                self.xsection_marker_dragging = drag_info
+                self.set_xsection_marker_frac(frac)
+                self.update()
+                return
+
         if ev.button==1: self.mouse_hold_left=True; self.gridheightrings_removed=False
         else: self.mouse_hold_right=True
         self.mouse_hold=True
@@ -786,6 +1870,21 @@ class Plotting(QObject,app.Canvas):
         self.panel=self.get_panel_for_position(ev.pos)
         
     def on_mouse_release(self, ev):     
+        if self.volume3d_rect_dragging:
+            # Rondt het slepen af: volume3d_rect_a/b blijven staan (net als een afgeronde A/B-lijn) totdat
+            # een nieuwe CTRL+SHIFT-sleep begint, zodat nlr.py (test_volume_grid_export/show_volume_3d_viewer)
+            # ze kan uitlezen. mouse_hold_left/right/mouse_hold werden voor deze press niet True gezet (de
+            # vroege 'return' in on_mouse_press slaat dat over), dus er is verder niets te herstellen.
+            self.volume3d_rect_dragging = False
+            return
+
+        if self.xsection_marker_dragging is not None:
+            # Ends a marker drag started in on_mouse_press (see get_xsection_marker_click_frac/on_mouse_move).
+            # mouse_hold_left/right/mouse_hold were never set to True for this press in the first place (the
+            # early 'return' there skips that), so there's nothing else for this release to undo.
+            self.xsection_marker_dragging = None
+            return
+
         self.mouse_hold_left=False; self.mouse_hold_right=False; self.mouse_hold=False
         
         if self.firstplot_performed and any([j in self.gui.lines_show for j in ('grid','heightrings')]) and\
@@ -796,7 +1895,19 @@ class Plotting(QObject,app.Canvas):
                 self.set_timer_setback_gridheightrings()
                 
         self.update_data_readout()
-        
+
+        # NIEUW (23 juli, op Eriks verzoek, vervangt het eerdere zwevende tooltipje): toon een
+        # echt pop-up-venster met de HCLASS/MESH-brongegevens bij een gewone, "schone" klik -
+        # geen sleep (mouse_moved_after_press), geen Shift/Ctrl (die hebben al hun eigen
+        # betekenis, zie on_mouse_press), en niet vlak bij een radar-markering (die heeft zijn
+        # eigen click-gedrag hieronder). self.hclass_tooltip_text/self.mesh_tooltip_text zijn
+        # net gevuld door de aanroep van update_data_readout() hierboven.
+        modifiers = QApplication.keyboardModifiers()
+        if (ev.button == 1 and not self.mouse_moved_after_press
+                and modifiers == Qt.NoModifier
+                and self.radar_mouse_selected in (None, self.crd.selected_radar)):
+            self.show_extra_info_popup(ev.pos)
+
         #button=1 refers to the left mouse button, 2 to the right one
         if ev.button==1:
             self.mouse_hold_left=False
@@ -808,6 +1919,10 @@ class Plotting(QObject,app.Canvas):
                     self.crd.change_radar(self.radar_mouse_selected)
         elif ev.button==2:
             self.mouse_hold_right=False
+            # AANGEPAST (23 juli): het verbergen van het click_marker-puntje gebeurt niet meer
+            # hier, maar centraal in showrightclickMenu zelf (nlr.py) - die functie wordt namelijk
+            # OOK rechtstreeks door Qt's eigen customContextMenuRequested-signaal aangeroepen, dus
+            # een check alleen hier bleek niet voldoende (zie de uitgebreide toelichting daar).
             if self.gui.need_rightclickmenu: 
                 self.gui.showrightclickMenu(self.gui.rightmouseclick_Qpos)
  
@@ -817,13 +1932,48 @@ class Plotting(QObject,app.Canvas):
             return
         self.previous_mouse_position=np.array(ev.pos)
         self.mouse_moved_after_press=True
-        
+
+        if self.volume3d_rect_dragging:
+            # Actief slepen van de 3D-selectierechthoek (gestart in on_mouse_press): alleen punt B bijwerken
+            # en opnieuw tekenen, geen normale pan/zoom-afhandeling -- vroege return net als bij
+            # xsection_marker_dragging hieronder.
+            self.volume3d_rect_b = self.screencoord_to_xy(np.array(ev.pos), self.volume3d_rect_panel)
+            self.draw_volume3d_rect()
+            return
+
+        if self.xsection_marker_dragging is not None:
+            # Actively dragging the shared cross-section marker (started in on_mouse_press -- see
+            # get_xsection_marker_click_frac), on whichever side ('plot' or 'map') the drag began on. Unlike
+            # the initial press, this deliberately does NOT re-run the same hit-test / re-check whether the
+            # cursor is still strictly inside the image or within the line's hit radius -- once grabbed, the
+            # marker should keep following the cursor smoothly even if it briefly strays slightly outside
+            # those bounds while dragging, exactly like e.g. a slider handle would.
+            mode = self.xsection_marker_dragging['mode']
+            if mode == 'plot':
+                panel = self.xsection_marker_dragging['panel']
+                layout = self.cross_section_layout.get(panel)
+                if layout is not None: # Guards against the cross-section having been closed mid-drag.
+                    frac = (ev.pos[0]-layout['img_left'])/(layout['img_right']-layout['img_left'])
+                    self.set_xsection_marker_frac(frac)
+            elif mode == 'map' and self.ab_line_panel is not None and self.ab_line_b is not None:
+                screen_a = self.xycoord_to_screen(self.ab_line_panel, self.ab_line_a)
+                screen_b = self.xycoord_to_screen(self.ab_line_panel, self.ab_line_b)
+                ab = screen_b-screen_a
+                ab_len_sq = float(np.dot(ab, ab))
+                if ab_len_sq > 0:
+                    t = float(np.dot(np.array(ev.pos, dtype='float64')-screen_a, ab)/ab_len_sq)
+                    self.set_xsection_marker_frac(t)
+            self.update()
+            return
+
         if self.mouse_hold_left:
             for j in self.panellist:
                 if j == 0:
                     self.panels_sttransforms[0].move(np.array(ev.pos)-ev.last_event.pos)
                 else:
                     self.panels_sttransforms[j].translate = self.panels_sttransforms[0].translate[:2]+(self.panel_centers[j]-self.panel_centers[0])
+            if self.ab_line_panel is not None:
+                self.draw_ab_line()
 
         elif self.mouse_hold_right:
             p1c = np.array(ev.last_event.pos)[:2]
@@ -836,6 +1986,8 @@ class Plotting(QObject,app.Canvas):
             rel_pos=pos-self.panel_centers[selected_panel]
             for j in range(self.max_panels): #Zooming the transforms for all panels is necessary, to ensure that all panels keep showing the same area
                 self.panels_sttransforms[j].zoom((zoomfactor,zoomfactor),center=self.panel_centers[j]+rel_pos,mapped=True)
+            if self.ab_line_panel is not None:
+                self.draw_ab_line()
                                 
         if self.mouse_hold:
             #Used in the function self.dsg.check_need_scans_change.
@@ -861,6 +2013,41 @@ class Plotting(QObject,app.Canvas):
             self.check_presence_near_pos_markers(ev.pos)
             self.update_data_readout()
             
+    def show_extra_info_popup(self, pos):
+        """Toont een klein, echt pop-up-venster met de HCLASS- of MESH-brongegevens (Z/ZDR/KDP/
+        CC/0C/-20C/roosterpunt/temperatuurbron/tijd) - vervangt sinds 23 juli (op Eriks verzoek)
+        het eerdere zwevende QToolTip-tooltipje, dat na meerdere pogingen (leaveEvent-hook, vaste
+        zichtbaarheidsduur) niet naar tevredenheid bleef werken. Wordt aangeroepen vanuit
+        on_mouse_release bij een gewone, niet-gesleepte klik. self.hclass_tooltip_text/
+        self.mesh_tooltip_text worden gevuld door update_data_readout(), die daar vlak voor deze
+        aanroep al is uitgevoerd - als geen van beide iets bevat (bv. geklikt buiten een geldige
+        HCLASS/MESH-classificatie, of een ander product), gebeurt hier niets.
+
+        pos: het scherm-coordinaat van de klik (ev.pos uit on_mouse_release), voor het
+        achterblijvende puntje (self.visuals['click_marker'] - zie __init__ en on_mouse_release
+        voor het weer verbergen via een rechtsklik).
+        """
+        tekst = self.hclass_tooltip_text if self.hclass_tooltip_text is not None else (
+            self.mesh_tooltip_text if self.mesh_tooltip_text is not None else (
+            self.posh_tooltip_text if self.posh_tooltip_text is not None else (
+            self.poh_tooltip_text if self.poh_tooltip_text is not None else self.shi_tooltip_text)))
+        if tekst is None:
+            return
+        titel = 'HCLASS' if self.hclass_tooltip_text is not None else (
+            'MESH' if self.mesh_tooltip_text is not None else (
+            'POSH' if self.posh_tooltip_text is not None else (
+            'POH' if self.poh_tooltip_text is not None else 'SHI')))
+
+        # Puntje op de kliklocatie neerzetten VOOR het (modale) pop-up-venster wordt geopend, zodat
+        # het al zichtbaar is terwijl je de pop-up leest, en blijft staan nadat je 'm hebt weggeklikt.
+        self.visuals['click_marker'].set_data(pos=np.array([pos]), face_color=(1,0,0,1),
+            edge_color=(1,1,1,1), edge_width=self.scale_pixelsize(1.5), size=self.scale_pixelsize(11))
+        self.visuals['click_marker'].visible = True
+        self.update()
+
+        msgbox = QMessageBox(QMessageBox.NoIcon, titel, tekst, QMessageBox.Ok, self.native)
+        msgbox.exec_()
+
     def update_data_readout(self):
         pos = self.last_mouse_pos_px
         if pos is None:
@@ -873,6 +2060,19 @@ class Plotting(QObject,app.Canvas):
         
         radius=np.linalg.norm(xy_coord)
         
+        polrgb_text = None
+        hclass_text = None
+        # OMBOUW (23 juli, op Eriks verzoek): waren lokale variabelen (hclass_tooltip_text/
+        # mesh_tooltip_text), alleen gebruikt voor het zwevende QToolTip-tooltipje hieronder.
+        # Erik wilde af van dat tooltipje (bleef ondanks meerdere pogingen niet prettig
+        # verdwijnen/verschijnen) - vervangen door een echt pop-up-venster bij een klik (zie
+        # on_mouse_release). Als instance-attributen opgeslagen zodat on_mouse_release ze na
+        # deze aanroep nog kan uitlezen.
+        self.hclass_tooltip_text = None
+        self.mesh_tooltip_text = None
+        self.posh_tooltip_text = None
+        self.poh_tooltip_text = None
+        self.shi_tooltip_text = None
         if self.firstplot_performed:
             try:
                 product=self.data_attr['product'][panel]
@@ -884,6 +2084,13 @@ class Plotting(QObject,app.Canvas):
                     azimuthal_res=self.data_attr['azimuthal_res'][panel]
                     azimuth=ft.azimuthal_angle(xy_coord, deg=True)
                     row=int(np.floor(np.mod(azimuth-self.dsg.data_azimuth_offset[panel], 360)/azimuthal_res))
+                    # row_rawdata: index voor polrgb_raw_data/hclass_raw_data (nlr_datasourcegeneral.py),
+                    # die WEL dezelfde azimutale binning hebben maar NIET de onderstaande +1-rij-padding,
+                    # omdat die caches al gevuld worden vóórdat die padding verderop wordt toegepast op
+                    # self.dsg.data[panel] zelf. Zonder deze aparte index zou de uitlezing structureel een
+                    # rij verschoven zijn t.o.v. het getoonde beeld (gemeld door Erik, 22 juli: hagel op het
+                    # scherm gaf "Rain" in de tooltip).
+                    row_rawdata = row
                     if self.dsg.data[panel].shape[0] > self.data_attr['azimuthal_bins'][panel]:
                         row += 1 #+1 for the added radials for interpolation
                     
@@ -904,6 +2111,173 @@ class Plotting(QObject,app.Canvas):
                 self.cursor_elevation='--'
                 
             try:
+                if product == 'g':
+                    data_z, data_cc, data_zdr = self.dsg.polrgb_raw_data[panel]
+                    z_val, cc_val, zdr_val = data_z[row_rawdata, col], data_cc[row_rawdata, col], data_zdr[row_rawdata, col]
+                    z_text = '--' if np.isnan(z_val) else '%.5s' % str(np.round(z_val, 1))
+                    cc_text = '--' if np.isnan(cc_val) else '%.5s' % str(np.round(cc_val, 1))
+                    zdr_text = '--' if np.isnan(zdr_val) else '%.5s' % str(np.round(zdr_val, 1))
+                    polrgb_text = 'Z='+z_text+' dBZ, CC='+cc_text+' %, ZDR='+zdr_text+' dB'
+                    raise Exception('Polarimetric RGB composite has no single scalar value to show in the normal way')
+                if product == 'j':
+                    hid, data_z, data_zdr, data_kdp, data_cc, data_t, data_h0, data_h20, data_gridix = self.dsg.hclass_raw_data[panel]
+                    class_id = hid[row_rawdata, col]
+                    class_name = hc.HID_CLASSES[class_id-1] if class_id in hc.HID_COLORS_RGBA else '--'
+                    z_val, zdr_val, kdp_val, cc_val = data_z[row_rawdata,col], data_zdr[row_rawdata,col], data_kdp[row_rawdata,col], data_cc[row_rawdata,col]
+                    z_text = '--' if np.isnan(z_val) else '%.5s' % str(np.round(z_val, 1))
+                    zdr_text = '--' if np.isnan(zdr_val) else '%.5s' % str(np.round(zdr_val, 1))
+                    kdp_text = '--' if np.isnan(kdp_val) else '%.5s' % str(np.round(kdp_val, 2))
+                    cc_text = '--' if np.isnan(cc_val) else '%.5s' % str(np.round(cc_val, 1))
+                    # 0C-/-20C-hoogte (uit het gedeelde temperatuurrooster) die voor DEZE bin is gebruikt
+                    # voor de temperatuurschatting. Vervangt sinds 22 juli de losse 0C/-20C-balk in nlr.py
+                    # (op Eriks verzoek verwijderd, ten gunste van meer ruimte voor de textbar) - hier
+                    # staat de waarde nu direct bij de rest van de HCLASS-details. data_h0/data_h20 zijn
+                    # None als het rooster niet beschikbaar was (bv. netwerkfout) toen dit paneel werd
+                    # berekend, of NaN voor een bin waarvan het dichtstbijzijnde roosterpunt zelf mislukte.
+                    if data_h0 is not None and data_h20 is not None:
+                        h0_val, h20_val = data_h0[row_rawdata, col], data_h20[row_rawdata, col]
+                        h0_text = '--' if np.isnan(h0_val) else '%.0f m' % h0_val
+                        h20_text = '--' if np.isnan(h20_val) else '%.0f m' % h20_val
+                    else:
+                        h0_text = h20_text = '--'
+                    # Roosterpunt (nlr_hclass.NL_GRID_POINTS) dat voor DEZE bin is gebruikt - teruggezet
+                    # op Eriks verzoek (22 juli), naast de 0C/-20C-regel, niet in plaats ervan.
+                    if data_gridix is not None:
+                        grid_idx = int(data_gridix[row_rawdata, col])
+                        grid_lat, grid_lon = hc.NL_GRID_POINTS[grid_idx]
+                        grid_text = '%.1f' % grid_lat + u'\xb0N, ' + '%.1f' % grid_lon + u'\xb0O'
+                        # ZICHTBAARHEID (23 juli, op Eriks verzoek): datum/tijd waarvoor deze
+                        # temperatuurdata daadwerkelijk geldt - kan afwijken van de scantijd
+                        # (bv. Wyoming-sounding van een ander uur). Zelfde gedeelde
+                        # roosterresultaat als calculate_MESH gebruikt, hier per-bin opgehaald
+                        # via dezelfde grid_idx als de HCLASS-classificatie zelf al gebruikte.
+                        grid_results = getattr(self.dsg, 'melting_level_grid_results', None)
+                        if grid_results is not None:
+                            dt_used_str = grid_results[grid_idx].get('datetime_used')
+                            tijd_text = dt_used_str.replace('T', ' ')+' UTC' if dt_used_str else '--'
+                        else:
+                            tijd_text = '--'
+                    else:
+                        grid_text = '--'
+                        tijd_text = '--'
+                    # Korte tekst voor de altijd-zichtbare (smalle) balk bovenin: alleen de klassenaam.
+                    hclass_text = class_name
+                    # Uitgebreide, meerregelige tekst voor het zwevende tooltip bij de muis (zie onderaan
+                    # deze functie) - daar is wel ruimte voor alle brongegevens.
+                    self.hclass_tooltip_text = (class_name+'\n'
+                                            'Z='+z_text+' dBZ, ZDR='+zdr_text+' dB\n'
+                                            'KDP='+kdp_text+u'\xb0/km, CC='+cc_text+' %\n'
+                                            '0'+u'\xb0'+'C: '+h0_text+'   -20'+u'\xb0'+'C: '+h20_text+'\n'
+                                            'roosterpunt: '+grid_text+'\n'
+                                            'temperatuurdata van: '+tijd_text)
+                    raise Exception('HCLASS composite has no single scalar value to show in the normal way')
+                if product == 'o':
+                    # ZICHTBAARHEID (23 juli, op Eriks verzoek): toon welke temperatuurbron/welk
+                    # station en welke 0C/-20C-waarden voor dit MESH-paneel zijn gebruikt. In
+                    # tegenstelling tot HCLASS/PolRGB hierboven wordt hier GEEN Exception gegooid -
+                    # de normale numerieke mm-waarde (data_text hieronder) moet gewoon getoond
+                    # blijven worden; dit voegt alleen een extra, zwevend tooltipje toe.
+                    info = getattr(self.dsg, 'mesh_source_info', None)
+                    if info is not None:
+                        h0_val, h20_val = info.get('h0_m'), info.get('h_minus20_m')
+                        h0_text = '--' if h0_val is None else '%.0f m' % h0_val
+                        h20_text = '--' if h20_val is None else '%.0f m' % h20_val
+                        source, model = info.get('source'), info.get('model')
+                        if source == 'wyoming_sounding':
+                            # model is 'station_06260' (De Bilt), 'station_10304' (Meppen),
+                            # 'station_10410' (Essen) of 'station_10113' (Norderney)
+                            station_naam = {'station_06260': 'De Bilt', 'station_10304': 'Meppen',
+                                            'station_10410': 'Essen', 'station_10113': 'Norderney'}.get(
+                                model, model)
+                            bron_text = 'Wyoming-archief, station ' + str(station_naam)
+                        elif source in ('forecast_api', 'archive_api'):
+                            bron_text = 'Open-Meteo (' + (model or 'automatisch') + ')'
+                        else:
+                            bron_text = '--'
+                        dt_used_str = info.get('datetime_used')
+                        tijd_text = dt_used_str.replace('T', ' ')+' UTC' if dt_used_str else '--'
+                        self.mesh_tooltip_text = ('MESH\n'
+                                             'temperatuurbron: ' + bron_text + '\n'
+                                             '0' + u'\xb0' + 'C: ' + h0_text + '   -20' + u'\xb0' + 'C: ' + h20_text + '\n'
+                                             'temperatuurdata van: ' + tijd_text)
+                if product == 'b':
+                    # Zelfde zichtbaarheid als MESH hierboven, maar dan voor POSH - gebruikt
+                    # self.dsg.posh_source_info (zie calculate_POSH in nlr_derived_plain.py),
+                    # dat op dezelfde manier is opgebouwd als mesh_source_info.
+                    info = getattr(self.dsg, 'posh_source_info', None)
+                    if info is not None:
+                        h0_val, h20_val = info.get('h0_m'), info.get('h_minus20_m')
+                        h0_text = '--' if h0_val is None else '%.0f m' % h0_val
+                        h20_text = '--' if h20_val is None else '%.0f m' % h20_val
+                        source, model = info.get('source'), info.get('model')
+                        if source == 'wyoming_sounding':
+                            station_naam = {'station_06260': 'De Bilt', 'station_10304': 'Meppen',
+                                            'station_10410': 'Essen', 'station_10113': 'Norderney'}.get(
+                                model, model)
+                            bron_text = 'Wyoming-archief, station ' + str(station_naam)
+                        elif source in ('forecast_api', 'archive_api'):
+                            bron_text = 'Open-Meteo (' + (model or 'automatisch') + ')'
+                        else:
+                            bron_text = '--'
+                        dt_used_str = info.get('datetime_used')
+                        tijd_text = dt_used_str.replace('T', ' ')+' UTC' if dt_used_str else '--'
+                        self.posh_tooltip_text = ('POSH\n'
+                                             'temperatuurbron: ' + bron_text + '\n'
+                                             '0' + u'\xb0' + 'C: ' + h0_text + '   -20' + u'\xb0' + 'C: ' + h20_text + '\n'
+                                             'temperatuurdata van: ' + tijd_text)
+                if product == 'uh':
+                    # Zelfde soort zichtbaarheid als MESH/POSH hierboven, maar dan voor POH - gebruikt
+                    # self.dsg.poh_source_info (zie calculate_POH in nlr_derived_plain.py). POH gebruikt
+                    # ALLEEN het 0C-niveau (geen -20C, in tegenstelling tot MESH/POSH - POH is een simpel
+                    # lineair verband met het 45dBZ-echo t.o.v. het 0C-niveau, geen SHI-integraal), dus
+                    # de -20C-regel wordt hier weggelaten.
+                    info = getattr(self.dsg, 'poh_source_info', None)
+                    if info is not None:
+                        h0_val = info.get('h0_m')
+                        h0_text = '--' if h0_val is None else '%.0f m' % h0_val
+                        source, model = info.get('source'), info.get('model')
+                        if source == 'wyoming_sounding':
+                            station_naam = {'station_06260': 'De Bilt', 'station_10304': 'Meppen',
+                                            'station_10410': 'Essen', 'station_10113': 'Norderney'}.get(
+                                model, model)
+                            bron_text = 'Wyoming-archief, station ' + str(station_naam)
+                        elif source in ('forecast_api', 'archive_api'):
+                            bron_text = 'Open-Meteo (' + (model or 'automatisch') + ')'
+                        else:
+                            bron_text = '--'
+                        dt_used_str = info.get('datetime_used')
+                        tijd_text = dt_used_str.replace('T', ' ')+' UTC' if dt_used_str else '--'
+                        self.poh_tooltip_text = ('POH\n'
+                                             'temperatuurbron: ' + bron_text + '\n'
+                                             '0' + u'\xb0' + 'C: ' + h0_text + '\n'
+                                             'temperatuurdata van: ' + tijd_text)
+                if product == 'si':
+                    # Zelfde soort zichtbaarheid als MESH/POSH/POH hierboven, maar dan voor SHI zelf -
+                    # gebruikt self.dsg.shi_source_info (zie calculate_SHI in nlr_derived_plain.py),
+                    # dat op dezelfde manier is opgebouwd als mesh_source_info/posh_source_info (met
+                    # zowel het 0C- als -20C-niveau, want SHI gebruikt net als MESH/POSH de volledige
+                    # kolomintegraal tussen die twee niveaus).
+                    info = getattr(self.dsg, 'shi_source_info', None)
+                    if info is not None:
+                        h0_val, h20_val = info.get('h0_m'), info.get('h_minus20_m')
+                        h0_text = '--' if h0_val is None else '%.0f m' % h0_val
+                        h20_text = '--' if h20_val is None else '%.0f m' % h20_val
+                        source, model = info.get('source'), info.get('model')
+                        if source == 'wyoming_sounding':
+                            station_naam = {'station_06260': 'De Bilt', 'station_10304': 'Meppen',
+                                            'station_10410': 'Essen', 'station_10113': 'Norderney'}.get(
+                                model, model)
+                            bron_text = 'Wyoming-archief, station ' + str(station_naam)
+                        elif source in ('forecast_api', 'archive_api'):
+                            bron_text = 'Open-Meteo (' + (model or 'automatisch') + ')'
+                        else:
+                            bron_text = '--'
+                        dt_used_str = info.get('datetime_used')
+                        tijd_text = dt_used_str.replace('T', ' ')+' UTC' if dt_used_str else '--'
+                        self.shi_tooltip_text = ('SHI\n'
+                                             'temperatuurbron: ' + bron_text + '\n'
+                                             '0' + u'\xb0' + 'C: ' + h0_text + '   -20' + u'\xb0' + 'C: ' + h20_text + '\n'
+                                             'temperatuurdata van: ' + tijd_text)
                 n_bits=gv.products_data_nbits[product]
                 pm_lim=gv.products_maxrange_masked[product]
                 cursor_datavalue_int=self.dsg.data[panel][row,col]
@@ -914,8 +2288,32 @@ class Plotting(QObject,app.Canvas):
                     self.cursor_datavalue*=self.scale_factors[product]
                     if product=='r':
                         self.cursor_datavalue=10**self.cursor_datavalue
+                if product == 'o' and self.mesh_tooltip_text is not None:
+                    # ZICHTBAARHEID (23 juli, op Eriks verzoek): de hageldikte op de kliklocatie
+                    # zelf (self.cursor_datavalue, hierboven al berekend voor de balk bovenin)
+                    # ook in de pop-up tonen, niet alleen de temperatuurbron. Moet HIER staan
+                    # (na de berekening van cursor_datavalue hierboven), niet bij de rest van
+                    # mesh_tooltip_text verderop, want die wordt AL opgebouwd voordat
+                    # cursor_datavalue bekend is.
+                    mesh_text = '--' if self.cursor_datavalue == '--' else '%.1f mm' % self.cursor_datavalue
+                    self.mesh_tooltip_text = 'MESH: ' + mesh_text + '\n' + self.mesh_tooltip_text[len('MESH\n'):]
+                if product == 'b' and self.posh_tooltip_text is not None:
+                    # Zelfde constructie als bij MESH hierboven, maar dan het POSH-percentage.
+                    posh_text = '--' if self.cursor_datavalue == '--' else '%.0f%%' % self.cursor_datavalue
+                    self.posh_tooltip_text = 'POSH: ' + posh_text + '\n' + self.posh_tooltip_text[len('POSH\n'):]
+                if product == 'uh' and self.poh_tooltip_text is not None:
+                    # Zelfde constructie als bij MESH/POSH hierboven, maar dan het POH-percentage.
+                    poh_text = '--' if self.cursor_datavalue == '--' else '%.0f%%' % self.cursor_datavalue
+                    self.poh_tooltip_text = 'POH: ' + poh_text + '\n' + self.poh_tooltip_text[len('POH\n'):]
+                if product == 'si' and self.shi_tooltip_text is not None:
+                    # Zelfde constructie als bij MESH/POSH/POH hierboven, maar dan de ruwe SHI-waarde
+                    # (J/m/s) zelf - geen sqrt/ln-omzetting, in tegenstelling tot MESH/POSH.
+                    shi_text = '--' if self.cursor_datavalue == '--' else '%.1f J/m/s' % self.cursor_datavalue
+                    self.shi_tooltip_text = 'SHI: ' + shi_text + '\n' + self.shi_tooltip_text[len('SHI\n'):]
             except Exception: self.cursor_datavalue='--'   
             try:
+                if product in ('g', 'j'):
+                    raise Exception('Polarimetric RGB / HCLASS composite has no single scalar value to show')
                 min_value, max_value = [ft.convert_uint_to_float(j, n_bits, pm_lim)*self.scale_factors[product] for j in self.get_min_max_in_view(panel)]
             except Exception:
                 min_value, max_value = '--', '--'
@@ -932,16 +2330,32 @@ class Plotting(QObject,app.Canvas):
         x_text, y_text = '%5.5s' % xy_coord[0], '%5.5s' % xy_coord[1]
         r_text='%5.5s' % str(np.around(self.cursor_radius*1000)/1000)
         h_text='%5.5s' % str(np.around(self.cursor_elevation*1000)/1000) if self.cursor_elevation!='--' else '%5.5s' % self.cursor_elevation
-        factor=1000 if self.cursor_datavalue!='--' and np.abs(self.cursor_datavalue)<0.01 else 100
-        data_text='%5.5s' % (str(np.around(self.cursor_datavalue*factor)/factor) if self.cursor_datavalue!='--' else self.cursor_datavalue)+'/'+\
-                  '%5.5s' % (str(np.around(min_value*factor)/factor) if min_value!='--' else min_value)+'/'+\
-                  '%5.5s' % (str(np.around(max_value*factor)/factor) if max_value!='--' else max_value)
-        try: #An error occurs when product is not defined, as is the case when self.data_attr['product'][panel] does not exist.
-            product_unit = self.productunits[product]
-        except: product_unit = ''
+        if polrgb_text is not None:
+            data_text = polrgb_text
+            product_unit = ''
+        elif hclass_text is not None:
+            data_text = hclass_text
+            product_unit = ''
+        else:
+            factor=1000 if self.cursor_datavalue!='--' and np.abs(self.cursor_datavalue)<0.01 else 100
+            data_text='%5.5s' % (str(np.around(self.cursor_datavalue*factor)/factor) if self.cursor_datavalue!='--' else self.cursor_datavalue)+'/'+\
+                      '%5.5s' % (str(np.around(min_value*factor)/factor) if min_value!='--' else min_value)+'/'+\
+                      '%5.5s' % (str(np.around(max_value*factor)/factor) if max_value!='--' else max_value)
+            try: #An error occurs when product is not defined, as is the case when self.data_attr['product'][panel] does not exist.
+                product_unit = self.productunits[product]
+            except: product_unit = ''
         self.datareadout_text='('+lat_text+', '+lon_text+'), ('+x_text+', '+y_text+'), r='+r_text+' km, h='+h_text+' km, '+data_text+' '+product_unit
         self.gui.set_textbar()
-            
+
+        # VIERDE FIX (23 juli, op Eriks verzoek): het zwevende QToolTip-tooltipje (Z/ZDR/KDP/CC/
+        # 0C/-20C/roosterpunt/tijd voor HCLASS, temperatuurbron/0C/-20C/tijd voor MESH) bleek na
+        # meerdere pogingen (leaveEvent-hook, vaste duur van 2s dan 15s) nog steeds niet prettig
+        # te werken - Erik wilde er helemaal vanaf. Vervangen door een echt pop-up-venster dat
+        # verschijnt bij een KLIK op de kaart (zie on_mouse_release/show_extra_info_popup)
+        # i.p.v. continu bij hoveren. self.hclass_tooltip_text/self.mesh_tooltip_text worden
+        # hierboven al gevuld (of op None gezet) bij elke aanroep van deze functie, en blijven
+        # als instance-attribuut staan totdat on_mouse_release ze na een klik uitleest.
+
     def screencoord_to_xy(self, pos, panel=None):
         if len(pos.shape)>1:
             xy_coord=[]
@@ -960,7 +2374,7 @@ class Plotting(QObject,app.Canvas):
                 screen_coord.append(self.coordmaps[panel](j*np.array([1,-1]))[:2]) # reverse y-coordinate.
             return np.array(screen_coord)
         else:
-            return np.array(self.coordimaps[panel](pos*np.array([1,-1]))[:2]) # reverse y-coordinate.
+            return np.array(self.coordmaps[panel](pos*np.array([1,-1]))[:2]) # reverse y-coordinate.
         
     def get_in_view_mask_specs(self, data, panel):
         specs = str(self.corners[panel])+str(data.shape)+str(self.data_attr['radial_res'][panel] if self.data_attr['proj'][panel] == 'pol' else
@@ -1316,8 +2730,30 @@ class Plotting(QObject,app.Canvas):
                 self.visuals[other_radar_image][j].visible = False
                 
                 if data_changed[j]:
-                    if self.visuals[radar_image][j].cmap != self.cm1[self.data_attr['product'][j]] or\
-                    list(map(int, self.visuals[radar_image][j].clim)) != self.clim_int[self.data_attr['product'][j]]:
+                    is_rgb_product = self.data_attr['product'][j] in ('g', 'j') # 'g'=PolRGB, 'j'=HCLASS:
+                    # beide leveren al kant-en-klare RGBA-data (zie _calculate_polrgb/_calculate_hclass in
+                    # nlr_datasourcegeneral.py), dus geen scalaire kleurtransform maar passthrough.
+                    # UITBREIDING (6 juli 2026): voorheen werd de GLSL-kleurtransform-rebuild alleen
+                    # afgedwongen bij het wisselen tussen PolRGB en een gewoon product (zie hieronder,
+                    # oorspronkelijk commentaar van Bram). Als hetzelfde soort "oude shader-status blijft
+                    # hangen"-probleem zich ook kan voordoen bij andere wisselingen (bv. van radarstation,
+                    # met hetzelfde product) -- wat zou passen bij waargenomen gedrag waarbij de juiste
+                    # waarde/kleur-koppeling correct berekend is (3D-weergave klopt) maar de 2D-weergave
+                    # soms een oude, niet-passende kleurtoewijzing blijft tonen na het wisselen -- dan is de
+                    # veiligste aanpak om dit ALTIJD af te dwingen bij nieuwe data, i.p.v. alleen in dit ene
+                    # specifieke geval. Kost vermoedelijk verwaarloosbaar veel extra tijd t.o.v. de eerdere,
+                    # fragiele voorwaardelijke aanpak verderop.
+                    self.visuals[radar_image][j]._need_colortransform_update = True
+                    if is_rgb_product != self.visual_colortransform_is_rgb[radar_image][j]:
+                        # Switching into or out of the polarimetric RGB composite: the GLSL color-transform function
+                        # (scalar+colormap lookup vs. RGB passthrough) must be rebuilt, since vispy normally only does
+                        # this when the cmap *property* is reassigned (see ImageVisual.cmap setter), which we don't
+                        # touch for 'g'. Without this, the visual keeps using whichever color-transform was built for
+                        # the previous product on this panel, applied to the new (differently-shaped) data.
+                        self.visual_colortransform_is_rgb[radar_image][j] = is_rgb_product
+                    if not is_rgb_product and (
+                    self.visuals[radar_image][j].cmap != self.cm1[self.data_attr['product'][j]] or
+                    list(map(int, self.visuals[radar_image][j].clim)) != self.clim_int[self.data_attr['product'][j]]):
                         # Changing the image attributes unnecessarily for every panel is relatively slow.
                         self.visuals[radar_image][j].cmap=self.cm1[self.data_attr['product'][j]]
                         self.visuals[radar_image][j].clim=self.clim_int[self.data_attr['product'][j]]
@@ -1331,7 +2767,7 @@ class Plotting(QObject,app.Canvas):
                             radial_res=self.data_attr['radial_res'][j]
                             azimuthal_res=self.data_attr['azimuthal_res'][j]
                             scanangle=self.data_attr['scanangle'][j]
-                        azimuthal_bins, radial_bins = self.dsg.data[j].shape
+                        azimuthal_bins, radial_bins = self.dsg.data[j].shape[:2]
                         rbr_product = radial_bins*radial_res
                         abr_product = azimuthal_bins*azimuthal_res
                         
@@ -1359,14 +2795,26 @@ class Plotting(QObject,app.Canvas):
                     #Ensure that the reference number of radial bins is correct when the first image that is viewed after starting 
                     #the program is 'empty' (or in fact a 362*1 invisible array).
                     print(self.dsg.data[j].shape, 'ref_shape')
-                    self.ref_azimuthal_bins[j], self.ref_radial_bins[j] = self.dsg.data[j].shape
-            
+                    self.ref_azimuthal_bins[j], self.ref_radial_bins[j] = self.dsg.data[j].shape[:2]
+
+            # Keep every active cross-section split-view in sync with the normal animation/time-navigation:
+            # a new scan/timestep arriving for a panel changes what its cross-section should show (new data
+            # along the same A/B line), so show_cross_section needs to be re-run to recompute the raster for
+            # the new moment. This only fires for panels whose data actually changed (data_changed[panel]), so
+            # panels without an active cross-section, or timesteps where a given panel's data didn't change,
+            # don't trigger an unnecessary recomputation.
+            for panel in list(self.cross_section_active_panels):
+                if panel in panellist and data_changed.get(panel, False):
+                    self.show_cross_section(panel)
+
             self.products_before = self.crd.products.copy()
             self.scans_before = self.crd.scans.copy()
                     
             self.set_interpolation()
             self.set_titles()
             update_cbars_products = self.set_cbars(set_cmaps=False) #The colormaps have already been set.
+            self.set_polrgb_legend()
+            self.set_hclass_legend()
             
             plot_vwp = self.gui.show_vwp and (self.vwp.data_name != self.vwp.get_current_data_name() or 
                                               self.gui.switch_to_case_running)
@@ -1477,11 +2925,21 @@ class Plotting(QObject,app.Canvas):
         lon_min, lon_max = latlon[:,1].min(), latlon[:,1].max()
         return lat_min, lat_max, lon_min, lon_max
         
+    def get_active_mt(self):
+        """Returns the currently active map-tile source object (local bundled tiles, or live MapTiler tiles),
+        based on self.gui.basemap_source. Both expose the same interface (isRunning/quit/start/
+        set_radar_and_mapbounds/run_outside_thread/finished_signal), so callers can use this method without
+        needing to know which source is active."""
+        return self.mt_maptiler if self.gui.basemap_source == 'MapTiler' else self.mt
+
     def update_map_tiles(self, xy_bounds = None, separate_thread = True, draw_map = False):
         if not self.gui.mapvisibility and not self.starting: return
         
-        if self.mt.isRunning():
-            self.mt.quit()
+        active_mt = self.get_active_mt()
+        # Stop the *other* source's thread too, in case a switch happened while it was still running.
+        for mt_obj in (self.mt, self.mt_maptiler):
+            if mt_obj.isRunning():
+                mt_obj.quit()
             
         lat_min, lat_max, lon_min, lon_max = self.get_latlon_bounds(xy_bounds)
         try:
@@ -1492,11 +2950,11 @@ class Plotting(QObject,app.Canvas):
             update_map = True
             
         if update_map:
-            self.mt.set_radar_and_mapbounds(self.crd.radar, lat_min, lat_max, lon_min, lon_max)
+            active_mt.set_radar_and_mapbounds(self.crd.radar, lat_min, lat_max, lon_min, lon_max)
             if separate_thread: 
-                self.mt.start()
+                active_mt.start()
             else:
-                self.map_data, self.map_bounds = self.mt.run_outside_thread()
+                self.map_data, self.map_bounds = active_mt.run_outside_thread()
                 if draw_map:
                     self.draw_map_tiles()
         
@@ -1509,13 +2967,27 @@ class Plotting(QObject,app.Canvas):
         self.timer_update_map_tiles=QTimer()
         self.timer_update_map_tiles.setSingleShot(True)
         self.timer_update_map_tiles.timeout.connect(self.update_map_tiles)
-        self.timer_update_map_tiles.start(int(self.gui.maptiles_update_time*1000)) #s to ms
+        # MapTiler tiles require a network fetch + CPU reprojection, both far slower than reading the bundled
+        # local tiles from disk. With the same short delay used for local tiles, a continuous pan/zoom gesture
+        # keeps restarting this timer (see the .stop() above) before the previous fetch has even finished,
+        # which shows up as stuttering during the gesture rather than a clean, single update once it ends.
+        delay = self.gui.maptiles_update_time if self.gui.basemap_source != 'MapTiler' else max(self.gui.maptiles_update_time, 0.5)
+        self.timer_update_map_tiles.start(int(delay*1000)) #s to ms
         
     def draw_map_tiles(self, tiles_map = None, tiles_bounds = None):
         if not tiles_map is None:
             self.map_data = tiles_map; self.map_bounds = tiles_bounds
             self.map_panels_scale_before = self.panels_sttransforms[0].scale
         self.visuals['map'][0].set_data(self.map_data)
+        # ImageVisual.set_data() does NOT re-trigger a colortransform rebuild on its own -- that decision
+        # (RGB-passthrough vs. scalar/colormap path, the latter of which averages R+G+B into a single
+        # luminance value) is made once, the first time data is ever bound to this visual, and then stays
+        # fixed regardless of what shape later set_data() calls supply. Force it to be re-evaluated here so a
+        # bad first-startup binding (e.g. from a failed local-tile fetch returning oddly-shaped data) can't
+        # permanently darken/desaturate every subsequent basemap, including a perfectly fine 3-channel
+        # MapTiler image.
+        self.visuals['map'][0]._need_colortransform_update = True
+        self.visuals['map'][0].update()
 
         (scale_x, scale_y), (t_x, t_y) = self.get_map_sttransform_parameters()
         self.map_transforms['st'].scale = (scale_x, scale_y)
@@ -1531,14 +3003,26 @@ class Plotting(QObject,app.Canvas):
         # During the switch to another day, it could happen that some scans are for the previous day, and others for the next. In that case show the
         # date that is most common in the panels.
         date = max(set(scandates), key=scandates.count) if scandates else self.crd.date
-        title_top, title_bottom, paneltitles=bg.get_titles(relwidth,self.gui.fontsizes_main['titles'],self.crd.radar,self.panels,self.panellist,self.panelnumber_to_plotnumber,self.plotnumber_to_panelnumber,self.data_empty,self.data_isold,self.data_attr['product'],date,self.data_attr['scantime'],self.data_attr['scanangle'],self.crd.using_unfilteredproduct,self.crd.using_verticalpolarization,self.crd.apply_dealiasing,self.productunits,self.gui.stormmotion,self.gui.PP_parameter_values,self.gui.PP_parameters_panels,self.gui.show_vwp)
-        
+        jabbeke_range_km = None
+        if self.crd.radar == 'Jabbeke':
+            jabbeke_range_km = 150 if self.gui.radardata_dirs_indices.get('Jabbeke_Z', 0) == 1 else 300
+        title_top, title_bottom, paneltitles=bg.get_titles(relwidth,self.gui.fontsizes_main['titles'],self.crd.radar,self.panels,self.panellist,self.panelnumber_to_plotnumber,self.plotnumber_to_panelnumber,self.data_empty,self.data_isold,self.data_attr['product'],date,self.data_attr['scantime'],self.data_attr['scanangle'],self.crd.using_unfilteredproduct,self.crd.using_verticalpolarization,self.crd.apply_dealiasing,self.productunits,self.gui.stormmotion,self.gui.PP_parameter_values,self.gui.PP_parameters_panels,self.gui.show_vwp,jabbeke_range_km)
+
         titles_text_top=[title_top]+[paneltitles[j] for j in paneltitles if j<5 or self.panels==2]
         titles_text_bottom=[title_bottom]+[paneltitles[j] for j in paneltitles if j>=5 and self.panels!=2]
         
         dy_bottom = dy_top = self.scale_pixelsize(2)
         dy_bottom += 0.5*self.scale_pixelsize(self.panel_borders_width) # For the bottom panel borders
         titles_top_ypos = self.wpos['top'][0,1]+dy_top; titles_bottom_ypos = self.wpos['bottom'][0,1]+dy_bottom
+        # TIJDELIJKE CORRECTIE (6 juli 2026): in vispy 0.14.1 lijkt anchor_y='top' bij TextVisual niet meer
+        # zuiver de bovenkant van de tekst als ankerpunt te nemen (zoals de rest van deze code aanneemt),
+        # maar eerder de baseline/het midden -- waardoor de tekst ca. een fontgrootte omhoog verschuift
+        # t.o.v. de bedoelde positie (zichtbaar als een stukje titel dat boven het canvas uitsteekt, en
+        # 'KNMI' dat in de kaart terechtkomt i.p.v. in de witte balk eronder). Compenseer door de
+        # berekende y-positie met ongeveer de fontgrootte naar beneden te verschuiven.
+        _title_font_px = self.scale_pointsize(eval(self.font_sizes['titles']))
+        titles_top_ypos += 1.5*_title_font_px
+        titles_bottom_ypos += 1.5*_title_font_px
         xleft=self.wpos['top'][0,0]; xright=self.wpos['top'][-1,0]
         xdim_1p=(xright-xleft)/self.ncolumns
         
@@ -1646,7 +3130,7 @@ class Plotting(QObject,app.Canvas):
 
             if product in changed_colortables:
                 product_cbar=product
-                cbar_colors = np.flipud(genfromtxt(opa(os.path.join(gv.programdir+'/Generated_files','colortable_'+product_cbar+'_added.csv')), delimiter=','))
+                cbar_colors = np.flipud(genfromtxt(opa(os.path.join(gv.userdir+'/Generated_files','colortable_'+product_cbar+'_added.csv')), delimiter=','))
                 scale = self.scale_factors[product]
                 self.data_values_colors[product]=cbar_colors[:,0]/scale
                 step=ticks_steps[product_cbar]
@@ -1801,6 +3285,247 @@ class Plotting(QObject,app.Canvas):
         self.cmaps_minvalues_before=self.gui.cmaps_minvalues.copy(); self.cmaps_maxvalues_before=self.gui.cmaps_maxvalues.copy()
         return changed_colortables
 
+    def set_polrgb_legend(self):
+        """Show a small Bram-style 3-segment legend (Z=red, CC=green, ZDR=blue), stacked vertically (Z on top,
+        ZDR at the bottom) in the top-left corner of every panel that currently displays the polarimetric RGB
+        composite (product 'g'), reflecting the current Settings -> PolRGB values. Hides the legend for every
+        other panel. A reference line (with its value) is added partway through a segment only when that
+        segment's value range is wide enough that an intermediate value is actually useful to show -- for a
+        narrow range (e.g. ZDR's default 0-3 dB) the min/max ticks already convey the scale clearly enough."""
+        params = self.gui.polrgb_params
+        # FIX (16 september 2026, na Eriks screenshot: legende toonde nog -10/60/70/100/0/3 -- de
+        # passthrough-standaardwaarden -- terwijl ESSL_MODE aanstond en de daadwerkelijke rendering dus de
+        # ESSL-tabel gebruikte). Sinds dezelfde sessie is die ESSL-tabel zelf ook instelbaar geworden (keys
+        # ESSL_Z_MIN/ESSL_Z_MAX/ESSL_CC_MIN/ESSL_CC_MAX/ESSL_ZDR_MIN/ESSL_ZDR_MAX/ESSL_ALPHA_Z/ESSL_ALPHA_V
+        # in polrgb_params, default = de poster's eigen waarden -- zie _essl_polrgb_channels in
+        # nlr_datasourcegeneral.py en settings_tabpolrgb/change_polrgb_essl_range hieronder in nlr.py). De
+        # legende las tot nu toe altijd rechtstreeks params['Z_MIN'] etc., ongeacht ESSL_MODE -- die
+        # parameters worden in ESSL-modus genegeerd door de berekening zelf, maar de legende wist daar niets
+        # van. CC is in ESSL-modus omgekeerd (laag CC=hoog groen, i.p.v. de standaard hoog CC=hoog groen) --
+        # weergegeven door vmin/vmax om te draaien, zelfde patroon als de bestaande vmin>vmax-omkeerlogica
+        # hieronder al ondersteunt voor een handmatig omgekeerd geconfigureerd kanaal.
+        essl_mode = bool(params.get('ESSL_MODE', False))
+        if essl_mode:
+            essl_z_min, essl_z_max = params['ESSL_Z_MIN'], params['ESSL_Z_MAX']
+            essl_cc_min, essl_cc_max = params['ESSL_CC_MIN'], params['ESSL_CC_MAX']
+            essl_zdr_min, essl_zdr_max = params['ESSL_ZDR_MIN'], params['ESSL_ZDR_MAX']
+            bar_specs = [
+                ('r', essl_z_min, essl_z_max, 'Z', 'dBZ'),
+                ('g', essl_cc_max, essl_cc_min, u'\u03c1HV', '%'),
+                ('b', essl_zdr_min, essl_zdr_max, 'ZDR', 'dB'),
+            ]
+        else:
+            bar_specs = [
+                ('r', params['Z_MIN'], params['Z_MAX'], 'Z', 'dBZ'),
+                ('g', params['CC_MIN'], params['CC_MAX'], u'\u03c1HV', '%'),
+                ('b', params['ZDR_MIN'], params['ZDR_MAX'], 'ZDR', 'dB'),
+            ]
+        range_threshold_for_midtick = 40 #A segment only gets an intermediate reference line/tick when its
+        #value range (vmax-vmin) exceeds this. Chosen so that e.g. Z's default 80-point range (-10 to 70) gets
+        #one, while CC's default 30-point range and ZDR's default 3-point range don't.
+
+        # Cleared and rebuilt each call (cheap: at most a handful of panels x 3 bars x up to 3 ticks).
+        ticks_text, ticks_pos, labels_text, labels_pos = [], [], [], []
+        reflines_pos = []
+
+        bar_width = self.scale_pixelsize(12) #Smaller dan voorheen, meer zoals ESSL.
+        bar_height_frac = 0.62 #Fraction of the panel's (smaller of width/height) used for the TOTAL stacked
+        #height (label rows + bars + gaps between blocks). Larger than before since each bar itself is also taller.
+        label_row_height = self.scale_pixelsize(16) #Vertical space reserved for the channel+unit label text itself.
+        label_above_gap = self.visuals['polrgb_legend_labels'].font_size*self.scale_pixelsize(1.0) #Gap between the
+        #label text and the top of its bar, sized to roughly one font height so the label doesn't crowd the
+        #tick value (e.g. '60') that sits right at the top of the bar.
+        block_gap = self.scale_pixelsize(36) #Gap between one block's bar (bottom) and the next block's label (top).
+        margin_x = self.scale_pixelsize(40) #Horizontal margin from the panel's left edge.
+        margin_y = self.scale_pixelsize(40) #Vertical margin from the panel's top edge.
+        label_gap = self.scale_pixelsize(6) #Horizontal gap between the bar and its tick-value text.
+        # Z-balk krijgt meer ruimte dan CC en ZDR (vergelijkbaar met ESSL), de andere twee zijn gelijk.
+        # Z_HEIGHT_FACTOR bepaalt hoe veel groter Z is t.o.v. CC/ZDR (2.0 = Z is twee keer zo hoog).
+        Z_HEIGHT_FACTOR = 2.0
+
+        for j in range(self.max_panels):
+            is_polrgb_panel = j in self.panellist and self.data_attr['product'].get(j) == 'g' and not self.data_empty.get(j, True)
+            for ch, *_ in bar_specs:
+                self.visuals['polrgb_legend_bar'+str(j)+ch].visible = is_polrgb_panel
+            if not is_polrgb_panel:
+                continue
+
+            topleft = self.panel_corners[j][0] #(x, y) of the panel's top-left corner, downward-y screen coords -
+            #matching the coordinate convention used elsewhere for un-transformed visuals (e.g. set_individual_cbar).
+            left_x = topleft[0]+margin_x
+            panel_w, panel_h = self.panel_corners[j][2]-self.panel_corners[j][0]
+            total_height = bar_height_frac*min(abs(panel_w), abs(panel_h))
+            # Each of the 3 blocks = label_row_height + label_above_gap + segment_height (the bar itself), with
+            # block_gap of clear space between consecutive blocks (2 such gaps for 3 blocks).
+            fixed_height_per_block = label_row_height+label_above_gap
+            # Z (index 0) krijgt Z_HEIGHT_FACTOR keer de hoogte van CC en ZDR (index 1 en 2).
+            # Totale hoogte = 3*fixed_height + 2*block_gap + Z_segment + 2*small_segment
+            # Z_segment = Z_HEIGHT_FACTOR * small_segment
+            # => total_height - 3*fixed - 2*gap = (Z_HEIGHT_FACTOR + 2) * small_segment
+            small_segment = (total_height - 3*fixed_height_per_block - 2*block_gap) / (Z_HEIGHT_FACTOR + 2)
+            segment_heights = [Z_HEIGHT_FACTOR * small_segment, small_segment, small_segment]
+            # Round to whole pixels before computing the center: a half-pixel offset here would make the GPU
+            # rasterize the bar's left and right border edges with visibly different effective thickness, even
+            # though the border geometry itself is perfectly symmetric (see vispy's border.py) -- this is what
+            # caused the left/right border-thickness mismatch reported earlier.
+            bar_width_px = round(bar_width)
+            bar_center_x = round(left_x)+0.5*bar_width_px
+
+            value_text = lambda v: str(ft.rifdot0(ft.r1dec(v)))
+            current_y = topleft[1]+margin_y
+            for i, (ch, vmin, vmax, label, unit) in enumerate(bar_specs):
+                segment_height = segment_heights[i]
+                block_top_y = current_y
+                label_y = block_top_y+label_row_height
+                seg_top_y = label_y+label_above_gap
+                bar_center_y = seg_top_y+0.5*segment_height
+                current_y = seg_top_y+segment_height+(block_gap if i < 2 else 0)
+                bar = self.visuals['polrgb_legend_bar'+str(j)+ch]
+                bar.pos = np.array([bar_center_x, bar_center_y])
+                bar.size = np.array([segment_height, bar_width_px]) #(major_axis, minor_axis), matching set_individual_cbar's convention
+                bar.border_width = self.scale_pixelsize(1)
+
+                # The bar's own gradient always renders full color at the top / black at the bottom (see the
+                # colormap built in __init__), which only lines up with the tick labels below when vmin <
+                # vmax. When a channel is intentionally configured the other way around (vmin > vmax, e.g.
+                # CC_MIN=100/CC_MAX=70 -- see the PolRGB CC discussion), the value that actually produces
+                # this channel's full intensity (always vmax, regardless of whether vmax is numerically
+                # larger or smaller than vmin) ends up at the BOTTOM label position once sorted below, so the
+                # bar's gradient needs to be reversed too, or the bright end of the bar would visually
+                # contradict which label is next to it.
+                channel_color = self.polrgb_channel_colors[ch]
+                n_steps = 64
+                t = np.linspace(0.0, 1.0, n_steps)
+
+                if ch == 'r':
+                    # Z-kanaal: gamma-gecorrigeerd zodat de balk hetzelfde niet-lineaire verloop toont
+                    # als het echte radarbeeld. Z_GAMMA>1: balk blijft lang donker, wordt pas laat rood.
+                    # In ESSL-modus is het Z-kanaal een gewone lineaire mapping (geen gamma-curve, zie
+                    # _essl_polrgb_channels) -- vandaar hier vast op 1.0 i.p.v. params['Z_GAMMA'].
+                    z_gamma = 1.0 if essl_mode else max(params.get('Z_GAMMA', 2.0), 0.1)
+                    intensity = t ** z_gamma
+                    cr = np.array(channel_color[:3])  # (1,0,0)
+                    if vmin > vmax:
+                        gradient = [tuple(float(v)*cr[k] for k in range(3)) + (1.0,) for v in reversed(intensity)]
+                    else:
+                        gradient = [tuple(float(v)*cr[k] for k in range(3)) + (1.0,) for v in intensity]
+                else:
+                    # CC en ZDR: lineair, maar wél meelopen met de ingestelde grenzen (zwart=vmin, vol=vmax).
+                    cr = np.array(channel_color[:3])
+                    if vmin > vmax:
+                        gradient = [tuple(float(v)*cr[k] for k in range(3)) + (1.0,) for v in reversed(t)]
+                    else:
+                        gradient = [tuple(float(v)*cr[k] for k in range(3)) + (1.0,) for v in t]
+                bar.cmap = color.Colormap(gradient)
+
+                #The larger of the 2 configured values goes at the top of the segment, the smaller at the
+                #bottom -- this must be based on which value is actually larger, not simply on which one is
+                #called vmin/vmax, since a channel's min/max can be intentionally configured with vmin >
+                #vmax (e.g. to invert that channel's mapping). Using vmax/vmin directly here previously
+                #assumed vmax > vmin always, which put the smaller number at the top and larger at the
+                #bottom whenever a channel was configured the other way around.
+                value_top, value_bottom = max(vmin, vmax), min(vmin, vmax)
+                ticks_text.append(value_text(value_top)); ticks_pos.append([bar_center_x+0.5*bar_width_px+label_gap, seg_top_y])
+                ticks_text.append(value_text(value_bottom)); ticks_pos.append([bar_center_x+0.5*bar_width_px+label_gap, seg_top_y+segment_height])
+                if abs(vmax-vmin) > range_threshold_for_midtick:
+                    mid_value = 0.5*(vmin+vmax)
+                    mid_y = seg_top_y+0.5*segment_height
+                    ticks_text.append(value_text(mid_value)); ticks_pos.append([bar_center_x+0.5*bar_width_px+label_gap, mid_y])
+                    #Reference line drawn fully across the segment width, matching the existing cbars_reflines style.
+                    reflines_pos.append([bar_center_x-0.5*bar_width_px, mid_y])
+                    reflines_pos.append([bar_center_x+0.5*bar_width_px, mid_y])
+
+                #Label (with unit) placed directly above the bar, left-aligned with the bar's left edge.
+                labels_text.append(label+(' ('+unit+')' if unit else ''))
+                # Correctie (6 juli 2026): net als anchor_y='top' elders in dit bestand, blijkt anchor_y='bottom'
+                # in vispy 0.14.1 ook niet zuiver als bedoeld ankerpunt behandeld te worden -- de tekst kwam te
+                # laag uit (overlappend met de tick/balk eronder). Deze correctie raakt ALLEEN de tekstpositie
+                # (labels_pos), niet label_y zelf, want die laatste wordt ook gebruikt om de balk-layout
+                # (seg_top_y/bar_center_y) te berekenen -- een eerdere versie paste per ongeluk label_y zelf aan,
+                # waardoor de balkjes zelf ook mee omhoog schoven.
+                label_text_y = label_y - 1.5*self.visuals['polrgb_legend_labels'].font_size*self.scale_pixelsize(1.0)
+                labels_pos.append([bar_center_x-0.5*bar_width_px, label_text_y])
+
+
+        if len(ticks_text) > 0:
+            self.visuals['polrgb_legend_ticks'].text = ticks_text
+            self.visuals['polrgb_legend_ticks'].pos = np.array(ticks_pos)
+        else:
+            self.visuals['polrgb_legend_ticks'].text = []
+        if len(labels_text) > 0:
+            self.visuals['polrgb_legend_labels'].text = labels_text
+            self.visuals['polrgb_legend_labels'].pos = np.array(labels_pos)
+        else:
+            self.visuals['polrgb_legend_labels'].text = []
+        if len(reflines_pos) > 0:
+            self.visuals['polrgb_legend_reflines'].set_data(pos=np.array(reflines_pos), connect='segments', color=(1,1,1,0.8))
+            self.visuals['polrgb_legend_reflines'].visible = True
+        else:
+            self.visuals['polrgb_legend_reflines'].visible = False
+
+    def set_hclass_legend(self):
+        """Toont voor elk paneel dat momenteel de hydrometeorenclassificatie (product 'j', zie
+        DataSource_General._calculate_hclass en nlr_hclass.py) toont een kolom van gekleurde vierkantjes
+        (een per klasse, zie nlr_hclass.HID_CLASSES/HID_COLORS_RGBA) met de klassenaam ernaast, in de
+        linkerbovenhoek van het paneel. Verborgen voor elk ander paneel. Zelfde opzet als
+        set_polrgb_legend hierboven (een gedeelde MarkersVisual/TextVisual voor alle panelen samen,
+        per redraw opnieuw opgebouwd), maar dan voor een categorische in plaats van een continue schaal.
+        """
+        marker_pos, marker_colors = [], []
+        labels_text, labels_pos = [], []
+
+        margin_x = self.scale_pixelsize(10)
+        margin_y = self.scale_pixelsize(20)
+        swatch_size = self.scale_pixelsize(12)
+        row_height = self.scale_pixelsize(16)
+        label_gap = self.scale_pixelsize(6)
+
+        # Volgorde van boven naar beneden: heftig -> licht, consistent met de kleurtabel
+        # (colortable_HCLASS_default.csv, waar dezelfde volgorde van boven (heftig) naar beneden (licht)
+        # wordt gebruikt voor het kleine kleurenbalkje naast het paneel). Afgesproken met Erik (22 juli) na
+        # gesprek over hevigheid en de dubbelzinnige positie van Verticaal ijs (weinig neerslagmassa, maar
+        # wel een actief stormsignaal - vandaar vlak boven IJskristallen i.p.v. helemaal onderaan).
+        # Dit is GEEN wetenschappelijk vastgestelde hevigheidsschaal, puur een redelijke, met Erik afgestemde
+        # inschatting - de interne klasse-nummers (hc.HID_CLASSES-index) blijven ongewijzigd en bepalen niets
+        # aan deze volgorde.
+        severity_order_top_to_bottom = [
+            'Hagel', 'Grote druppels', 'Zware graupel', 'Lichte graupel', 'Natte sneeuw',
+            'Regen', 'Sneeuwvlokken', 'Verticaal ijs', 'IJskristallen', 'Motregen',
+        ]
+        name_to_class_id = {name: i+1 for i, name in enumerate(hc.HID_CLASSES)}
+
+        for j in range(self.max_panels):
+            is_hclass_panel = j in self.panellist and self.data_attr['product'].get(j) == 'j' and not self.data_empty.get(j, True)
+            if not is_hclass_panel:
+                continue
+            topleft = self.panel_corners[j][0] #(x, y) van de linkerbovenhoek van het paneel, zelfde conventie
+            #als bij set_polrgb_legend/set_individual_cbar.
+            swatch_x = topleft[0]+margin_x+0.5*swatch_size
+            current_y = topleft[1]+margin_y+0.5*swatch_size
+            for class_name in severity_order_top_to_bottom:
+                class_id = name_to_class_id[class_name]
+                color_rgba = np.array(hc.HID_COLORS_RGBA[class_id])/255.
+                marker_pos.append([swatch_x, current_y])
+                marker_colors.append(color_rgba)
+                labels_text.append(class_name)
+                labels_pos.append([swatch_x+0.5*swatch_size+label_gap, current_y])
+                current_y += row_height
+
+        if marker_pos:
+            self.visuals['hclass_legend_markers'].set_data(
+                pos=np.array(marker_pos), symbol='square', size=swatch_size,
+                face_color=np.array(marker_colors), edge_color=(1,1,1,0.8),
+                edge_width=self.scale_pixelsize(1))
+            self.visuals['hclass_legend_markers'].visible = True
+        else:
+            self.visuals['hclass_legend_markers'].visible = False
+
+        if labels_text:
+            self.visuals['hclass_legend_labels'].text = labels_text
+            self.visuals['hclass_legend_labels'].pos = np.array(labels_pos)
+        else:
+            self.visuals['hclass_legend_labels'].text = []
+
     def set_individual_cbar(self,product,cbar_posnumber):
         j=cbar_posnumber
         j_side=int(np.mod(j,4))
@@ -1848,8 +3573,22 @@ class Plotting(QObject,app.Canvas):
         self.cbars_labels[j]=[str(self.productunits[product]),str(gv.productnames_cmaps[product])]
         widget_avg_xpos=np.mean(self.wbounds[p][0])
         ts_y=self.wsize['top'][1]
-        self.cbars_labels_pos[j]=np.array([[widget_avg_xpos,cbar_corners[0,1]-ts_y+self.scale_pixelsize(1)],
-                                           [widget_avg_xpos,cbar_corners[1,1]+self.scale_pixelsize(4.5)]])
+        # Zelfde correctie als bij set_titles() (6 juli 2026): anchor_y='top' wordt in vispy 0.14.1 niet
+        # zuiver als bovenkant-ankerpunt behandeld, waardoor deze labels (net als de titel) een fontgrootte
+        # te hoog uitkwamen en over de "-20"/andere tick-labels heen stonden. Zelfde compenserende
+        # verschuiving toegepast.
+        _cbarlabel_font_px = self.scale_pointsize(eval(self.font_sizes['cbars_labels']))
+        # Extra horizontale correctie (6 juli 2026) voor alleen de onderste rij (productnaam, bv. 'PolRGB'):
+        # stond aan de linkerkant iets te ver naar links en aan de rechterkant iets te ver naar rechts --
+        # d.w.z. te ver naar de buitenrand. 's' is -1 voor 'left' en +1 voor 'right' (zie hierboven), dus
+        # -s*bedrag verschuift in beide gevallen juist iets naar het midden toe.
+        # Correctie (6 juli 2026, bijgesteld): deze horizontale verschuiving bleek specifiek nodig voor de
+        # (langere) 'PolRGB'-tekst, maar duwde de korte 'Z'/'V'-productlabels van gewone producten juist uit
+        # hun al-correcte gecentreerde positie. Daarom alleen toepassen voor product 'g' (PolRGB) en 'j'
+        # (HCLASS) - beide hebben een langere naam dan de meeste gewone producten (22 juli).
+        _bottom_label_x_shift = -s*self.scale_pixelsize(15) if product in ('g', 'j') else 0
+        self.cbars_labels_pos[j]=np.array([[widget_avg_xpos,cbar_corners[0,1]-ts_y+self.scale_pixelsize(1)+1.5*_cbarlabel_font_px],
+                                           [widget_avg_xpos+_bottom_label_x_shift,cbar_corners[1,1]+self.scale_pixelsize(4.5)+1.5*_cbarlabel_font_px]])
            
     def set_cbars_ticks_and_labels(self):        
         cbars_ticks=np.concatenate(list(self.cbars_ticks.values()))
@@ -1986,8 +3725,19 @@ class Plotting(QObject,app.Canvas):
         if len(panellist_pp_max_elevations):
             for j in panellist_pp_max_elevations:
                 product = self.data_attr['product'][j]
-                self.heights[j]=np.concatenate((self.dp.meta_PP[product]['elevations_minside'],self.dp.meta_PP[product]['elevations_plusside']))
-                self.radii[j]=self.dp.meta_PP[product]['scans_ranges']
+                # VANGNET (25 juli, na Eriks crash "KeyError: elevations_minside" bij VILD/ALT+L): de
+                # onderliggende oorzaak (waarom self.dp.meta_PP[product] deze sleutels soms mist) is nog
+                # niet gevonden - dit voorkomt in elk geval de crash (geen hoogtecirkel-tekst voor dat
+                # paneel i.p.v. een afgesloten programma) en print een regel zodat de volgende keer
+                # duidelijk is WELK product en WELKE sleutels ontbraken.
+                meta = self.dp.meta_PP.get(product, {})
+                missing = [k for k in ('elevations_minside','elevations_plusside','scans_ranges') if k not in meta]
+                if missing:
+                    print(f'WAARSCHUWING: meta_PP[{product!r}] mist {missing} - geen hoogtecirkel-tekst voor dit paneel')
+                    self.heights[j] = np.array([]); self.radii[j] = np.array([])
+                else:
+                    self.heights[j]=np.concatenate((meta['elevations_minside'],meta['elevations_plusside']))
+                    self.radii[j]=meta['scans_ranges']
         
         self.textangles=bg.determine_textangles(self.corners,self.panels,panellist_nonempty,self.data_attr['product'],self.radii)
                     
@@ -2079,6 +3829,15 @@ class Plotting(QObject,app.Canvas):
         else:
             return False       
     def set_maplineproperties(self,panellist):   
+        if self.gui.basemap_source == 'MapTiler':
+            # The MapTiler basemap already renders its own country/province borders and place labels, so
+            # showing NLradar's own map_lines layer on top would just duplicate them (potentially with a
+            # slightly different, distracting style/position). Hide the whole layer rather than only some
+            # of the configured line types, and leave self.gui.lines_show itself untouched so the previous
+            # selection is restored automatically when switching back to the local tiles.
+            for i in range(self.max_panels):
+                self.visuals['map_lines'][i].visible=False
+            return
         lines = [j for j in self.lines_order[:3] if j in self.gui.lines_show]
         if any([j in self.gui.lines_show for j in lines]):
             for i in range(self.max_panels):
@@ -2120,8 +3879,9 @@ class Plotting(QObject,app.Canvas):
         if len(pos):
             face_color = ['white']*len(self.gui.pos_markers_positions) + (['red'] if self.gui.sm_marker_present else [])
             #-1 because y-coordinate is flipped
+            self.visuals['sm_pos_markers'][0].scaling = False
             self.visuals['sm_pos_markers'][0].set_data(pos=np.array(pos)*np.array([1,-1]),symbol='disc',size=self.scale_pixelsize(9),
-                                                       edge_width=1,face_color=face_color,edge_color='black',scaling=False)
+                                                       edge_width=1,face_color=face_color,edge_color='black')
         for j in range(self.max_panels):
             self.visuals['sm_pos_markers'][j].visible = len(pos) > 0
                                    
@@ -2144,6 +3904,13 @@ class Plotting(QObject,app.Canvas):
             self.update()
         else:
             self.gui.mapcolorfilterw.setText(ft.list_to_string(self.gui.mapcolorfilter))
+
+    def change_radardata_opacity(self, value):
+        alpha = value/100.
+        self.gui.radardata_colorfilter = (1.0, 1.0, 1.0, alpha)
+        self.radardata_colorfilter.filter = self.gui.radardata_colorfilter
+        self.gui.radardata_opacity_label.setText(str(value)+'%')
+        self.update()
             
     def change_radarimage_visibility(self):
         for j in self.panellist:

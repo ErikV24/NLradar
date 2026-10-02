@@ -205,6 +205,14 @@ class Polar():
                     flattened = flattened[sort_indices]
                     
                     indices_unique_orig, flattened_indices_orig, counts = np.unique(indices, return_index=True, return_counts=True)
+                    if counts.size == 0:
+                        # FIX 31 juli 2026: een scan/duplicate die na het NaN-filter hierboven helemaal leeg
+                        # blijkt (bv. een schone-lucht-scan zonder enig echo, of volledig buiten bereik) gaf
+                        # hier voorheen een crash (ValueError: zero-size array to reduction operation maximum).
+                        # Dit is bestaande code van Bram, pas nu voor het eerst geraakt omdat eerder alleen op
+                        # het zware-hagelarchief werd getest (elke scan had daar overal signaal). Een lege scan
+                        # draagt simpelweg niets bij aan Zmax/Zavg - overslaan i.p.v. crashen.
+                        continue
                     count_max = counts.max()
     
                     k = 0
@@ -243,6 +251,67 @@ class Polar():
         print(pytime.time()- t, 'Zmax_and_Zavg_3D_all')
         
 
+    def calculate_ZDRmax_3D(self):
+        """Bouwt self.ZDRmax_3D_all: per scan de MAXIMALE ZDR-waarde op het rooster waarop
+        self.product_data is gedefinieerd (27 juli 2026, voor de ZDR-kolomdiepte, product 'zc').
+
+        Zelfstandige, eigen MAX-only-tegenhanger van calculate_Zmax_and_Zavg_3D hierboven - haalt
+        ZELF de ZDR-data op (via self.dsg.get_data_multiple_scans('d', ...), LOS van self.data_all,
+        dat aan Z vastzit via self.dp.i_p) en hergebruikt daarna ALLEEN LEZEND dezelfde, al-bestaande
+        en al-geteste mapping-tabellen (self.radarbins_unique_all_flat/self.productbins_unique_all_flat,
+        opgebouwd door assign_radarbins_to_productbins/assign_productbins_to_radarbins hierboven, die
+        al voor ELK plain product gedeeld/hergebruikt worden omdat ze puur geometrisch zijn - gebaseerd
+        op scanhoek/radiale resolutie, niet op WELKE fysische grootheid er wordt uitgelezen).
+
+        Bewust GEEN gemiddelde (Zavg-equivalent): voor de kolomdiepte-detectie (drempeloverschrijding)
+        is alleen het MAXIMUM per roostercel relevant, en dat vermijdt de dB->lineair->dB-conversie die
+        specifiek voor logaritmische reflectiviteit is bedoeld en voor ZDR niet van toepassing zou zijn.
+
+        LET OP - bekende vereenvoudiging t.o.v. Z: geen storm-motion-correctie (product 'zc' staat NIET
+        in gv.plain_products_correct_for_SM, dus dit wordt nooit vanuit cartesian.py aangeroepen) - de
+        kolomdiepte wordt altijd in de gewone polaire projectie berekend, ook als storm-motion-correctie
+        voor andere producten aanstaat.
+        """
+        if getattr(self, 'zdr_data_specs', None) == self.get_data_specs():
+            return
+
+        ZDR_empty = -30.
+        length = self.product_azimuthal_bins*self.product_radial_bins_all
+        n = sum([len(self.data_all[j]) for j in self.scans_all])
+        self.ZDRmax_3D_all = np.full((n, length), ZDR_empty, dtype='float32')
+
+        zdr_data_all, _, _, _, _ = self.dsg.get_data_multiple_scans(
+            'd', self.scans_all, productunfiltered=self.dp.productunfiltered)
+
+        for j in self.scans_all:
+            for i in range(len(zdr_data_all[j])):
+                index = self.dp.index_all(j, i)
+                flattened = zdr_data_all[j][i].ravel()
+                n_azi = zdr_data_all[j][i].shape[0]
+
+                if self.product_radial_res <= self.radial_res_all[j]:
+                    indices = self.radarbins_unique_all_flat[j][i]
+                    radial_bins = int(len(indices)/n_azi)
+                    data_array = self.ZDRmax_3D_all[index].reshape((self.product_azimuthal_bins, self.product_radial_bins_all))
+                    data_array[:n_azi, :radial_bins] = np.reshape(flattened[indices], (n_azi, radial_bins))
+                    data_array[np.isnan(data_array)] = ZDR_empty
+                    self.ZDRmax_3D_all[index] = data_array.reshape(length)
+                else:
+                    retain = ~np.isnan(flattened)
+                    flat_valid = flattened[retain]
+                    idx_valid = self.productbins_unique_all_flat[j][i][retain]
+                    # Simpel MAX-fold via np.maximum.at (geen bincount/lineaire-conversie nodig, in
+                    # tegenstelling tot Zavg hierboven - het maximum is schaal-onafhankelijk).
+                    np.maximum.at(self.ZDRmax_3D_all[index], idx_valid, flat_valid)
+
+                if n_azi != self.product_azimuthal_bins:
+                    n_repeat = int(self.product_azimuthal_bins/n_azi)
+                    data = self.ZDRmax_3D_all[index, :int(length/n_repeat)].reshape((n_azi, self.product_radial_bins_all))
+                    self.ZDRmax_3D_all[index, :] = np.repeat(data, n_repeat, axis=0).reshape(length)
+
+        self.ZDRmax_3D_all.shape = (n, self.product_azimuthal_bins, self.product_radial_bins_all)
+        self.zdr_data_specs = self.get_data_specs()
+
     def get_product_heights(self):
         s = self.dp.get_indices_scans()
         self.heights_3D = self.heights_3D_all[(s,)+self.product_slice]
@@ -279,6 +348,12 @@ class Polar():
             
         self.Zmax_3D = self.Zmax_3D_all[(s,)+self.product_slice]
         self.Zavg_3D = self.Zavg_3D_all[(s,)+self.product_slice]
-        
-        self.product_data[key] = {j:self.__dict__[j] for j in ('Zmax_3D', 'Zavg_3D')}
+        cached_attrs = ['Zmax_3D', 'Zavg_3D']
+        if hasattr(self, 'ZDRmax_3D_all'):
+            # Alleen aanwezig/bijgewerkt als calculate_ZDRmax_3D hierboven is aangeroepen (product 'zc',
+            # zie nlr_derived_plain.py) - andere producten slaan dit gewoon over.
+            self.ZDRmax_3D = self.ZDRmax_3D_all[(s,)+self.product_slice]
+            cached_attrs.append('ZDRmax_3D')
+
+        self.product_data[key] = {j:self.__dict__[j] for j in cached_attrs}
         self.product_data_specs[key] = self.get_data_specs()

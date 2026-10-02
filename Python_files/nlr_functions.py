@@ -88,7 +88,7 @@ def from_list_or_nolist(input_, i=0):
     return output
 
 def to_list_or_nolist(input_, index, value, i=0):
-    if type(input_) in (list, np.ndarray):
+    if type(input_[index]) in (list, np.ndarray):
         input_[index][i] = value
     else: 
         input_[index] = value
@@ -790,6 +790,21 @@ def convert_float_to_uint(data,n_bits,data_limits,astype_int=True):
     b=data_limits[0]
     data=a*(data-b)+0.5 #+0.5 ensures that flooring by converting data to integer below produces correct results
     if astype_int:
+        # FIX (6 juli 2026): data.astype(dtype) hieronder geeft bij NaN/inf GEEN foutmelding, maar een
+        # ONGEDEFINIEERDE (feitelijk willekeurige) uitkomst -- vandaar de eerder waargenomen
+        # "RuntimeWarning: invalid value encountered in cast" op exact het moment dat er verkeerde
+        # velocity-kleuren verschenen. Vermoedelijke bron van die NaN: een randgeval in de dealiasing
+        # (bv. niet-convergerende berekening) dat niet opnieuw als "leeg/gemaskeerd" wordt aangemerkt
+        # voordat deze kleurconversie plaatsvindt. In plaats van te vertrouwen op filtering die eerder
+        # in de keten had moeten gebeuren, wordt hier expliciet en veilig geklemd: NaN/inf leveren nu
+        # altijd de laagste geldige waarde op (0), in plaats van willekeurige ruis.
+        if isinstance(data, np.ndarray):
+            invalid = ~np.isfinite(data)
+            if invalid.any():
+                data = data.copy()
+                data[invalid] = 0
+        elif not np.isfinite(data):
+            data = 0
         try:
             data = data.astype(dtype)
         except Exception: 

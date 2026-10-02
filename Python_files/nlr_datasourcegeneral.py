@@ -3,6 +3,7 @@
 
 import sys
 import os
+import datetime as dtime
 opa = os.path.abspath
 import numpy as np
 import time as pytime
@@ -17,6 +18,9 @@ import nlr_importdata as ird
 import nlr_background as bg
 import nlr_functions as ft
 import nlr_globalvars as gv
+import nlr_hclass as hc
+import nlr_meltinglevels as nml
+import nlr_attenuation as att
 
 # Load Unet_VDA in a separate thread, as it takes ~10 seconds to load
 VDA = None
@@ -88,6 +92,14 @@ class DataSource_General():
         self.scannumbers_all = {}; self.scanangles_all = {}; self.scanangles_all_m = {}
         self.nyquist_velocities_all_mps = {}; self.low_nyquist_velocities_all_mps = {}; self.high_nyquist_velocities_all_mps = {}
         self.scannumbers_forduplicates = {} # Specifies which scan will be requested when two or more scans have the same properties
+        # Per-panel cache of the raw (un-normalized) Z/CC/ZDR arrays most recently computed for the polarimetric
+        # RGB composite (product 'g'), used by Plotting.update_data_readout to show the actual physical values
+        # under the mouse cursor instead of just the displayed RGBA color. See DataSource_General._calculate_polrgb.
+        self.polrgb_raw_data = {}
+        # Zelfde soort per-paneel-cache als polrgb_raw_data hierboven, maar dan voor de hydrometeoren-
+        # classificatie (product 'j'): (hid, data_z, data_zdr, data_kdp, data_cc, T). Zie
+        # DataSource_General._calculate_hclass en nlr_hclass.py.
+        self.hclass_raw_data = {}
         self.determined_volume_attributes_radars = {}
         self.scannumbers_forduplicates_radars = {}
         
@@ -152,9 +164,9 @@ class DataSource_General():
                     
         self.scanangles = {}
         
-        self.attributes_descriptions_filename = os.path.join(opa(gv.programdir+'/Generated_files'),'attributes_descriptions.pkl')
-        self.attributes_IDs_filename = os.path.join(opa(gv.programdir+'/Generated_files'),'attributes_IDs.pkl')
-        self.attributes_variable_filename = os.path.join(opa(gv.programdir+'/Generated_files'),'attributes_variable.pkl')
+        self.attributes_descriptions_filename = os.path.join(opa(gv.userdir+'/Generated_files'),'attributes_descriptions.pkl')
+        self.attributes_IDs_filename = os.path.join(opa(gv.userdir+'/Generated_files'),'attributes_IDs.pkl')
+        self.attributes_variable_filename = os.path.join(opa(gv.userdir+'/Generated_files'),'attributes_variable.pkl')
         try:
             if self.gui.reset_volume_attributes: raise Exception
 
@@ -240,6 +252,13 @@ class DataSource_General():
         # Should only be updated when setting data
         self.attrs_before = {j:self.__dict__[j] for j in gv.volume_attributes_all}
         self.attrs_before['scannumbers_forduplicates'] = self.scannumbers_forduplicates
+
+        # De vroegere "1-punts" melting-level-opvraag (radarlocatie zelf, voor de losse 0C/-20C-balk in
+        # nlr.py) is hier verwijderd (22 juli, op Eriks verzoek): de balk is weg, en HCLASS gebruikt al
+        # het nauwkeurigere gedeelde temperatuurrooster (zie ensure_melting_level_grid_current en
+        # _calculate_hclass hieronder), dat per bin het dichtstbijzijnde roosterpunt gebruikt i.p.v. 1
+        # vast punt voor het hele beeld.
+
         # Set update_scanpairs_indices=True here, instead of further down in the 2nd call of this function. Since there
         # the already updated volume attributes would be compared with the old scan choices. 
         self.scanpair_present_before = self.check_presence_large_range_large_nyquistvelocity_scanpair(update_scanpairs_indices=True) if\
@@ -329,7 +348,13 @@ class DataSource_General():
             else:
                 try:
                     if len(self.attrs_before['scannumbers_all']['z']) != len(self.scannumbers_forduplicates):
-                        print('error!!! scannumbers_forduplicates', self.attrs_before['scannumbers_all']['z'])
+                        pass  # Print hier stilgelegd (22 juli, op Eriks verzoek): deze regel is een
+                        # bestaande, onschuldige waarschuwing van Bram (geen crash, geen effect op de
+                        # daadwerkelijke berekening - ook niet op MESH, die intussen gewoon zinnige
+                        # waarden bleef geven). Sinds de komst van product 'o' (MESH) komt deze mismatch
+                        # vaker voor (zie de eerdere KeyError-fix in nlr_derived_plain.py, zelfde
+                        # onderliggende oorzaak: scannumbers_forduplicates krijgt niet altijd via de
+                        # normale weg een entry voor 'o'), en vulde het scherm/logbestand te veel.
                 except Exception:
                     pass
                                                  
@@ -631,8 +656,8 @@ class DataSource_General():
     
     def get_dataspecs_string_panel(self, j, product=None, return_params=False): #j is the panel
         product = self.crd.products[j] if product is None else product
-        productunfiltered = self.crd.using_unfilteredproduct[j]
-        polarization = {True:'V', False:'H'}[self.crd.using_verticalpolarization[j]]
+        productunfiltered = self.crd.using_unfilteredproduct.get(j, False)
+        polarization = {True:'V', False:'H'}[self.crd.using_verticalpolarization.get(j, False)]
         apply_dealiasing = self.crd.apply_dealiasing[j]
         proj = self.dp.meta_PP[product]['proj'] if product in gv.plain_products else None
         dataspecs_string = self.generate_dataspecs_string(product,productunfiltered,polarization,apply_dealiasing,j,proj)
@@ -650,7 +675,7 @@ class DataSource_General():
         dataspecs_string, productunfiltered, polarization, apply_dealiasing, proj = self.get_dataspecs_string_panel(j, product, True)
         # if not data changed we can still use self.crd.using_verticalpolarization[j] etc due to dataspecs_string_requested below
         if self.data_changed[j]:  
-            self.stored_data[dataspecs_string] = {'last_use_time':pytime.time(),'data':self.data[j].copy(),'data_azimuth_offset':self.data_azimuth_offset[j],'data_radius_offset':self.data_radius_offset[j],'scantime':self.scantimes[j],'using_unfilteredproduct':self.crd.using_unfilteredproduct[j],'using_verticalpolarization':self.crd.using_verticalpolarization[j]}
+            self.stored_data[dataspecs_string] = {'last_use_time':pytime.time(),'data':self.data[j].copy(),'data_azimuth_offset':self.data_azimuth_offset[j],'data_radius_offset':self.data_radius_offset[j],'scantime':self.scantimes[j],'using_unfilteredproduct':self.crd.using_unfilteredproduct.get(j, False),'using_verticalpolarization':self.crd.using_verticalpolarization.get(j, False)}
         else:
             self.stored_data[dataspecs_string] = {'last_use_time':pytime.time(),'data':np.zeros((1,1))}
             
@@ -680,6 +705,49 @@ class DataSource_General():
     def check_presence_data_in_memory(self,product,productunfiltered,polarization,apply_dealiasing,panel):
         if self.gui.max_radardata_in_memory_GBs <= 0:
             return
+        if product in ('g', 'j', 'o', 'b', 'uh', 'si', 'zc'):
+            # UITBREIDING (27 juli 2026): de ZDR-kolomdiepte ('zc') hangt net als SHI/MESH/POSH/POH af
+            # van het gedeelde temperatuurrooster (ensure_melting_level_grid_current) - zelfde reden
+            # als 'si' hierboven, dus hier meteen goed toegevoegd i.p.v. achteraf als bugfix.
+            #
+            # UITBREIDING (27 juli 2026): SHI ('si') had PRECIES hetzelfde probleem als MESH/POSH/POH
+            # hieronder beschreven - het was bij de toevoeging van SHI als los product abusievelijk NIET
+            # aan deze uitsluiting toegevoegd. Gevolg: een eerder berekend SHI-resultaat bleef in
+            # self.stored_data hangen, ongeacht latere wijzigingen aan de temperatuurbron. Een latere
+            # kleurtabel-aanpassing (cmaps_maxrange) triggerde via de cmap_lastmodification_time-check
+            # verderop in deze functie WEL een cache-miss en dus een herberekening - waarbij een
+            # inmiddels gewijzigde temperatuurbron (bv. een nieuwere Open-Meteo-modelrun) een ander
+            # resultaat kon geven, ook al was de rekenformule zelf niet aangepast. Exact het patroon dat
+            # Erik meldde: zowel de SHI-waarde als het gekleurde oppervlak veranderden na een
+            # kleurtabel-wijziging, terwijl geen van beide daar rechtstreeks door zou moeten veranderen.
+            #
+            # UITBREIDING (25 juli): POSH ('b') en POH ('uh') hebben PRECIES hetzelfde probleem als
+            # MESH ('o') hierboven beschreven - ook zij hangen af van het gedeelde temperatuurrooster
+            # (ensure_melting_level_grid_current), dus een eerder berekend resultaat voor een tijdstip
+            # kan verouderen zodra de temperatuurbron nadien verandert (automatisch herstel, OF de
+            # handmatige terugvaloptie/ALT+W). Zonder deze uitsluiting bleef dat oude resultaat voor
+            # altijd uit self.stored_data komen, ongeacht latere wijzigingen aan de temperatuurbron -
+            # exact wat Erik meldde voor POH (reageerde nergens op, ook niet op een foutieve
+            # handmatige stationskeuze die tot 'geen data' had moeten leiden).
+            #
+            # Oorspronkelijke toelichting bij MESH ('o'), 22 juli: een tijdstip dat AL eerder is bekeken
+            # (en toen "geen data" gaf, omdat de temperatuur toen nog niet lukte) bleef voor
+            # altijd dat oude, foute resultaat tonen uit self.stored_data, ook nadat de
+            # onderliggende temperatuurbron later wel werkte. Vandaar 'o' hier ook toegevoegd.
+            # FIX (22 juli): PolRGB en HCLASS slaan hun eigen component-arrays op in
+            # self.polrgb_raw_data/self.hclass_raw_data (zie _calculate_polrgb/_calculate_hclass), NIET in
+            # self.stored_data hieronder. Als deze functie bij een cache-hit self.import_data[panel]=False
+            # zet, wordt _calculate_hclass/_calculate_polrgb overgeslagen: het getoonde beeld (self.data[panel])
+            # wordt dan wel correct uit de cache hersteld, maar polrgb_raw_data/hclass_raw_data NIET - die
+            # blijven op hun oude waarde staan (van de laatste keer dat er wel herberekend werd, bv. een
+            # ander, tussentijds bekeken tijdstip). Gevolg: het scherm toont de juiste (gecachete) kleur,
+            # maar de cursor-tooltip leest een verouderde klasse/waarde. Erik reproduceerde dit exact: na
+            # Herwijnen 16 juli (correct: Hail) -> 27 juni -> terug naar 16 juli liet de tooltip weer "Rain"
+            # zien op een plek die nog steeds zichtbaar rood (Hail) was. Door hier vroegtijdig te stoppen
+            # blijft self.import_data[panel] op zijn default (True), en lopen 'g'/'j' altijd via de normale
+            # _calculate_hclass/_calculate_polrgb-weg, zodat hclass_raw_data/polrgb_raw_data nooit kunnen
+            # verouderen t.o.v. wat er staat getekend.
+            return
         derived_nosave = product in gv.products_with_tilts_derived_nosave
         if derived_nosave:
             # In this case import product is saved instead of actual product, since the latter can be cheaply calculated from import product.
@@ -707,10 +775,14 @@ class DataSource_General():
             # An empty array has been saved to memory when attempts to import data were unsuccessful. In this case don't update the data
             # array and attributes, but also don't re-import data, which requires that self.import_data[panel] is still set to False.
             if data_dict['data'].size > 1:
-                self.data[panel] = data_dict['data']
-                if derived_nosave:
-                    # Make a copy of data, since otherwise data of import product will be altered when calculating derived product
-                    self.data[panel] = self.data[panel].copy()
+                # FIX (6 juli 2026): voorheen werd hier alleen een kopie gemaakt als derived_nosave True was.
+                # In alle andere gevallen wees self.data[panel] naar HETZELFDE array-object als de cache
+                # (data_dict['data']), zonder kopie. Verderop wordt op self.data[panel] echter in-place
+                # geklemd/aangepast (zie convert_dtype_float_to_uint), wat dus de GECACHTE data zelf blijvend
+                # kon veranderen -- een aannemelijke oorzaak van willekeurige, moeilijk te reproduceren
+                # verkeerde velocity-waarden bij Herwijnen, vooral bij snel wisselen tussen panelen/producten
+                # (waarbij dezelfde cache-entry vaker kort na elkaar hergebruikt wordt). Nu altijd een kopie.
+                self.data[panel] = data_dict['data'].copy()
                 self.data_azimuth_offset[panel] = data_dict['data_azimuth_offset']
                 self.data_radius_offset[panel] = data_dict['data_radius_offset']
                 self.scantimes[panel] = data_dict['scantime']
@@ -733,6 +805,12 @@ class DataSource_General():
         pm_lim = gv.products_maxrange_masked[product]
             
         if not inverse:
+            # Defensieve kopie (6 juli 2026): 'data' hier zou in principe altijd al een eigen kopie moeten zijn
+            # (zie de fix hierboven bij het ophalen uit self.stored_data), maar deze functie klemt/wijzigt data
+            # hieronder IN-PLACE. Als 'data' via een ander pad toch nog een gedeelde referentie blijkt te zijn
+            # (bv. rechtstreeks vanuit de cache, of gedeeld tussen panelen), voorkomt deze kopie dat die
+            # onbedoeld blijvend wordt aangepast. Extra vangnet, geen vervanging voor de fix hierboven.
+            data = data.copy()
             data_notmasked = (data!= self.pb.mask_values[product])
             #These 2 lines are necessary, to assure that no errors arise when p_lim does not capture the whole range of 
             #product values.
@@ -876,7 +954,18 @@ class DataSource_General():
                     
                     if j in self.scantimes:
                         before = self.data[j], self.scantimes[j], self.data_azimuth_offset[j], self.data_radius_offset[j]
-                    self.source_classes[self.data_source()].get_data(j)
+                    if self.crd.products[j] not in ('g', 'j'):
+                        self.source_classes[self.data_source()].get_data(j)
+                    else:
+                        # The skipped call above would normally also set these two flags (see e.g.
+                        # nlr_datasourcespecific.py's get_data methods) -- they're read unconditionally later
+                        # (e.g. in store_data_in_memory), so they must still be set here even though the rest
+                        # of that call isn't needed for 'g'/'f' (their component products are fetched
+                        # separately, inside _calculate_polrgb/_calculate_hclass). Neither PolRGB nor HCLASS
+                        # has a concept of using an unfiltered product or vertical polarization of its own, so
+                        # False is the correct default in both cases.
+                        self.crd.using_unfilteredproduct[j] = False
+                        self.crd.using_verticalpolarization[j] = False
                     
                     if self.crd.requesting_latest_data and not self.changing_radar and 'before' in locals():
                         # When plotting recent data, check whether data is available for the azimuth of the panel's center. If not,
@@ -919,13 +1008,23 @@ class DataSource_General():
                 else:
                     min_value, mask_value = self.pb.data_values_colors_int[product][0], self.pb.mask_values_int[product]
                 self.data[j][self.data[j] < min_value] = mask_value
-            if self.data[j].dtype.name.startswith('float'):
+            if product == 'g':
+                # Polarimetric RGB composite: R=Z, G=CC, B=ZDR (see DataSource_General._calculate_polrgb)
+                self.data[j] = self._calculate_polrgb(j)
+            elif product == 'j':
+                # Hydrometeorenclassificatie (HCLASS), C-band, Z/ZDR/KDP/CC + temperatuur
+                # (zie DataSource_General._calculate_hclass en nlr_hclass.py)
+                self.data[j] = self._calculate_hclass(j)
+            elif self.data[j].dtype.name.startswith('float'):
                 self.data[j] = self.convert_dtype_float_to_uint(self.data[j], product)
             
             # When self.data_changed[j]=False an empty array (created in self.store_data_in_memory) will be saved to memory, to indicate that no
             # data has been obtained. In the past nothing was saved to memory at all, but this had as disadvantage that new requests of the same
             # data would lead to renewed attempts to import, which were a waste of time.
-            if self.gui.max_radardata_in_memory_GBs > 0 and not self.dont_store_in_memory[j]:
+            if self.gui.max_radardata_in_memory_GBs > 0 and not self.dont_store_in_memory[j] and product not in ('g', 'j', 'o'):
+                # 'g' (PolRGB), 'j' (HCLASS) en 'o' (MESH) worden nooit meer uit dit geheugencache teruggelezen (zie de
+                # uitleg bij check_presence_data_in_memory hierboven), dus opslaan zou hier alleen geheugen
+                # en tijd verspillen.
                 self.store_data_in_memory(j)
                 
         for j in (i for i in panellist if self.data_changed[i]):
@@ -948,6 +1047,878 @@ class DataSource_General():
         # stats.print_stats(20)  
         return self.data_changed, self.total_files_size
     
+    # ESSL ECSS2025-poster RGB/alpha lookup tables (Van 't Veen, Groenemeijer & Pucik, "Detecting severe storms
+    # using an RGB composite combining polarimetric radar parameters", 12th ECSS, Utrecht, nov 2025) -- the
+    # POSTER'S OWN published values. Tunable via Settings -> PolRGB (self.gui.polrgb_params, keys ESSL_Z_MIN/
+    # ESSL_Z_MAX/ESSL_CC_MIN/ESSL_CC_MAX/ESSL_ZDR_MIN/ESSL_ZDR_MAX/ESSL_ALPHA_Z/ESSL_ALPHA_V), same "live
+    # GUI values, fallback dict only guards a missing key" pattern as Z_MIN/CC_MIN/etc. above -- see the p()
+    # helper in _calculate_polrgb/get_volume_grid_polrgb below, which resolves these before calling
+    # _essl_polrgb_channels. "Reset to defaults" (nlr.py, polrgb_params_default) resets these back to
+    # exactly these poster values, per Eriks explicit requirement (16 september 2026) that the default when
+    # choosing 'default' stays the ESSL poster's own numbers, not NLradar's passthrough numbers.
+    ESSL_Z_RANGE_POSTER_DEFAULT = (30.0, 60.0)      # Red: dBZ 30->60 maps linearly to 0->1
+    ESSL_CC_RANGE_POSTER_DEFAULT = (70.0, 100.0)    # Green: CC% 100->70 maps linearly to 0->1 (inverted)
+    ESSL_ZDR_RANGE_POSTER_DEFAULT = (0.0, 4.0)      # Blue: ZDR dB 0->4 maps linearly to 0->1
+    # Alpha (visibility) vs Z: 11-point piecewise-linear curve, straight from the poster's table. x must be
+    # strictly increasing for np.interp; values outside [-10, 40] clip to the nearest end (0.05 resp. 1.0).
+    ESSL_ALPHA_Z_POSTER_DEFAULT = [-10.0, 0.0, 10.0, 15.0, 20.0, 24.0, 28.0, 31.0, 34.0, 37.0, 40.0]
+    ESSL_ALPHA_V_POSTER_DEFAULT = [0.05, 0.12, 0.22, 0.29, 0.39, 0.48, 0.58, 0.67, 0.77, 0.88, 1.00]
+
+    @staticmethod
+    def _essl_polrgb_channels(data_z_filled, data_cc_filled, data_zdr_filled, nodata_z,
+                               z_min, z_max, cc_min, cc_max, zdr_min, zdr_max, alpha_z, alpha_v):
+        """R/G/B/alpha volgens de (instelbare, standaard=poster-)ESSL-tabel, i.p.v. de doorlopende passthrough
+        van _calculate_polrgb. De 6 grenswaarden en de 11-punts alpha-curve komen van de aanroeper (al
+        opgelost via polrgb_params/fallback_defaults, zie hierboven) -- deze functie kent zelf geen vaste
+        getallen meer, puur de formulevorm. Zie ESSL_MODE in _calculate_polrgb's docstring voor de achtergrond
+        en waarom hier GEEN gebruik wordt gemaakt van de eigen (a*(a*x0+1-a))-compositieformule van het
+        artikel -- de echte GPU-alphablending van NLradar vervangt die formule al, en beter (geen zwarte-
+        schijf-op-de-kaart-effect)."""
+        def norm(arr, vmin, vmax):
+            return np.clip((arr-vmin)/(vmax-vmin), 0.0, 1.0)
+        r = norm(data_z_filled, z_min, z_max)
+        g = 1.0 - norm(data_cc_filled, cc_min, cc_max)
+        b = norm(data_zdr_filled, zdr_min, zdr_max)
+        alpha = np.interp(data_z_filled, alpha_z, alpha_v)
+        alpha = np.where(nodata_z, 0.0, alpha)
+        return r, g, b, alpha
+
+    def _calculate_polrgb(self, j):
+        """Calculate a polarimetric RGB composite for panel j, combining reflectivity (Z), correlation
+        coefficient (CC/RhoHV) and differential reflectivity (ZDR) into one (azimuth, range, 4) uint8 RGBA
+        image, in the style of e.g. ARPA Lombardia's polarimetric composites.
+
+        R = Z   (dBZ)
+        G = CC  (%)
+        B = ZDR (dB)
+        A = visibility, see below
+
+        Visibility (alpha) depends only on Z and fades in smoothly with it, so that low-Z clutter near the
+        radar doesn't show up as colored speckle, without introducing a hard, unrealistic-looking cutoff edge.
+        The alpha channel is real (not premultiplied against a fixed background): the radar_polar/radar_cartesian
+        ImageVisuals use the 'translucent' GL state, so the GPU blends each pixel against whatever is actually
+        underneath (the map), letting it show through where there's no echo instead of a solid black disc.
+
+        CC and ZDR require a higher signal-to-noise ratio than Z to give a reliable estimate, so it's common
+        for a pixel to have a valid Z value while CC and/or ZDR are unavailable for that same pixel (e.g. in
+        weak/distant precipitation). Rather than blanking such a pixel entirely -- which would tear visible
+        holes in otherwise-continuous precipitation areas -- each channel falls back independently to a
+        neutral 'typical light rain' value (CC high, ZDR small positive) when its own data is missing. Only
+        when Z itself is unavailable does the pixel become (fade towards) fully transparent.
+
+        ESSL mode (self.gui.polrgb_params['ESSL_MODE'], default False/off): switches R/G/B/alpha from the
+        continuous passthrough above to the fixed lookup-table RGB from the ESSL ECSS2025 poster (Van 't Veen,
+        Groenemeijer & Pucik) -- R: Z 30->60dBZ, G: CC 100->70% (inverted), B: ZDR 0->4dB, each linearly
+        interpolated (and clipped) between just those 2 points. Alpha uses the poster's own 11-point piecewise-
+        linear Z-alpha curve (-10..40dBZ) instead of the 2-point ALPHA_GAMMA fade above. Real GPU alpha blending
+        (translucent GL state, see class docstring above) is kept in BOTH modes -- the poster's own compositing
+        formula x1=a*(a*x0+1-a) bakes translucency into RGB against an assumed black background, which would
+        reintroduce exactly the black-disc-hides-the-map problem the real alpha channel was built to avoid (15
+        augustus 2026), so it's deliberately not reproduced here. The toggle lives in polrgb_params like every
+        other PolRGB setting; the Settings -> PolRGB checkbox itself belongs in nlr.py (not covered by this file).
+
+        All numeric parameters below are tunable via Settings -> PolRGB (self.gui.polrgb_params) and persist
+        across sessions; see nlr.py's settings_tabpolrgb/change_polrgb_param for the GUI side. The values
+        looked up here ARE the current GUI values -- this isn't a one-time default, every call re-reads
+        self.gui.polrgb_params, so a change in Settings takes effect on the next redraw without needing a
+        restart. The hardcoded fallback dict guards only against a missing/corrupted key, not against the
+        normal case of the user having tuned these away from their original defaults.
+        """
+        params = getattr(self.gui, 'polrgb_params', {})
+        fallback_defaults = {
+            'Z_MIN':-10.0, 'Z_MAX':60.0, 'CC_MIN':70.0, 'CC_MAX':100.0, 'ZDR_MIN':0.0, 'ZDR_MAX':3.0,
+            'Z_FADE_LO':-15.0, 'Z_FADE_HI':10.0, 'ALPHA_GAMMA':0.6, 'CC_FALLBACK':97.0, 'ZDR_FALLBACK':0.5,
+            'Z_GAMMA':2.0, 'ESSL_MODE':False,
+            'ESSL_Z_MIN':self.ESSL_Z_RANGE_POSTER_DEFAULT[0], 'ESSL_Z_MAX':self.ESSL_Z_RANGE_POSTER_DEFAULT[1],
+            'ESSL_CC_MIN':self.ESSL_CC_RANGE_POSTER_DEFAULT[0], 'ESSL_CC_MAX':self.ESSL_CC_RANGE_POSTER_DEFAULT[1],
+            'ESSL_ZDR_MIN':self.ESSL_ZDR_RANGE_POSTER_DEFAULT[0], 'ESSL_ZDR_MAX':self.ESSL_ZDR_RANGE_POSTER_DEFAULT[1],
+            'ESSL_ALPHA_Z':self.ESSL_ALPHA_Z_POSTER_DEFAULT, 'ESSL_ALPHA_V':self.ESSL_ALPHA_V_POSTER_DEFAULT,
+        }
+        def p(key):
+            return params[key] if key in params else fallback_defaults[key]
+
+        Z_MIN, Z_MAX = p('Z_MIN'), p('Z_MAX')
+        CC_MIN, CC_MAX = p('CC_MIN'), p('CC_MAX')
+        ZDR_MIN, ZDR_MAX = p('ZDR_MIN'), p('ZDR_MAX')
+        Z_FADE_LO, Z_FADE_HI = p('Z_FADE_LO'), p('Z_FADE_HI')
+        ALPHA_GAMMA = p('ALPHA_GAMMA')
+        CC_FALLBACK, ZDR_FALLBACK = p('CC_FALLBACK'), p('ZDR_FALLBACK')
+        Z_GAMMA = max(p('Z_GAMMA'), 0.1)
+        ESSL_MODE = bool(p('ESSL_MODE'))
+        ESSL_Z_MIN, ESSL_Z_MAX = p('ESSL_Z_MIN'), p('ESSL_Z_MAX')
+        ESSL_CC_MIN, ESSL_CC_MAX = p('ESSL_CC_MIN'), p('ESSL_CC_MAX')
+        ESSL_ZDR_MIN, ESSL_ZDR_MAX = p('ESSL_ZDR_MIN'), p('ESSL_ZDR_MAX')
+        ESSL_ALPHA_Z, ESSL_ALPHA_V = np.array(p('ESSL_ALPHA_Z')), np.array(p('ESSL_ALPHA_V'))
+
+        def norm(arr, vmin, vmax):
+            return np.clip((arr - vmin) / (vmax - vmin), 0.0, 1.0)
+
+        scan = self.crd.scans[j]
+        source = self.source_classes[self.data_source()]
+
+        def fetch(product):
+            # get_data_multiple_scans returns either (data, scantimes, volume_starttime, volume_endtime) or
+            # (data, scantimes, volume_starttime, volume_endtime, meta) depending on the source -- e.g.
+            # Leonardo_vol_rainbow3/5 (IMGW/Poland) return 4 values, every other source returns 5. Unpack
+            # defensively so this works for either, rather than assuming a fixed 5-value return (which would
+            # raise a ValueError for the 4-value sources).
+            returns = source.get_data_multiple_scans(
+                product, [scan], productunfiltered=False, polarization='H', apply_dealiasing=False)
+            data, scantimes = returns[0], returns[1]
+            arrays = data[scan]
+            duplicate = self.duplicate(product, scan)
+            duplicate = duplicate if duplicate < len(arrays) else 0
+            scantime = scantimes[scan][duplicate] if scan in scantimes and duplicate < len(scantimes.get(scan, [])) else None
+            return arrays[duplicate].astype('float32'), scantime
+
+        try:
+            data_z, scantime_z = fetch('z')
+            data_cc, _ = fetch('c')
+            data_zdr, _ = fetch('d')
+            # The panel title reads self.scantimes[j] directly, and for every other product that's set inside
+            # the per-source get_data() methods in nlr_importdata.py (which 'g' deliberately bypasses, see the
+            # 'g' != check in get_data above). Without this, the title's displayed time would stay frozen at
+            # whatever it was the last time this panel showed a different product -- the underlying data DOES
+            # refresh correctly (via the fetch() calls above), only the displayed time was stuck. Z's scantime
+            # is used since all three channels come from the same scan and should share virtually the same time.
+            if scantime_z is not None:
+                self.scantimes[j] = scantime_z
+        except Exception as e:
+            print(e, '_calculate_polrgb, panel '+str(j))
+            traceback.print_exception(type(e), e, e.__traceback__)
+            self.dont_store_in_memory[j] = True
+            shape = self.data[j].shape if j in self.data and self.data[j].ndim == 2 else (1, 1)
+            # Fully transparent RGBA (not opaque black), so a failed fetch shows the map underneath rather than
+            # a solid black panel.
+            return np.zeros((*shape, 4), dtype='uint8')
+
+        # get_data_multiple_scans already masks missing values to NaN (see e.g. the 'd'-product handling, which
+        # combines the Zh and Zv masks before subtracting). Any remaining mismatch in shape between products
+        # (which in principle shouldn't occur for products imported from the same scan) is handled defensively.
+        shape = data_z.shape
+        if data_cc.shape != shape or data_zdr.shape != shape:
+            n_az = min(data_z.shape[0], data_cc.shape[0], data_zdr.shape[0])
+            n_rng = min(data_z.shape[1], data_cc.shape[1], data_zdr.shape[1])
+            data_z, data_cc, data_zdr = (a[:n_az, :n_rng] for a in (data_z, data_cc, data_zdr))
+
+        nodata_z = np.isnan(data_z)
+        # Each channel falls back independently -- a missing CC or ZDR doesn't blank out a pixel that has a
+        # perfectly valid Z value, it just makes that one channel render as 'typical light rain' instead.
+        data_z_filled = np.where(nodata_z, Z_FADE_LO, data_z)
+        data_cc_filled = np.where(np.isnan(data_cc), CC_FALLBACK, data_cc)
+        data_zdr_filled = np.where(np.isnan(data_zdr), ZDR_FALLBACK, data_zdr)
+
+        # Cache the raw (un-normalized, NaN where missing) physical values for this panel, so the mouse-cursor
+        # readout (see Plotting.update_data_readout) can show the actual Z/CC/ZDR values under the cursor
+        # without needing to re-fetch from disk on every mouse move. Keyed by panel; overwritten on every
+        # recalculation, which is fine since the readout always wants the data for whatever is currently shown.
+        self.polrgb_raw_data[j] = (data_z, data_cc, data_zdr)
+
+        if ESSL_MODE:
+            r, g, b, alpha = self._essl_polrgb_channels(
+                data_z_filled, data_cc_filled, data_zdr_filled, nodata_z,
+                ESSL_Z_MIN, ESSL_Z_MAX, ESSL_CC_MIN, ESSL_CC_MAX, ESSL_ZDR_MIN, ESSL_ZDR_MAX,
+                ESSL_ALPHA_Z, ESSL_ALPHA_V)
+        else:
+            r = norm(data_z_filled, Z_MIN, Z_MAX) ** Z_GAMMA  # Z_GAMMA>1: lage dBZ blijft donker, hoge dBZ snel rood (ESSL-stijl).
+            g = norm(data_cc_filled, CC_MIN, CC_MAX)
+            b = norm(data_zdr_filled, ZDR_MIN, ZDR_MAX)
+
+            # Visibility depends only on Z: that's the channel with the best sensitivity, and the one that defines
+            # where precipitation is considered present at all. Gamma-correct so weak echo near the bottom of the
+            # fade range becomes more visible, while clutter right at Z_FADE_LO still renders as fully transparent.
+            alpha = norm(data_z_filled, Z_FADE_LO, Z_FADE_HI) ** ALPHA_GAMMA
+            alpha[nodata_z] = 0.0
+
+        # CC-zichtbaarheidsfilter (15 augustus 2026, op Eriks verzoek: "dat groen van de regen wil ik kwijt"
+        # -- gewone regen heeft een hoge CC ONGEACHT Z, dus CC_MIN/CC_MAX hierboven -- die alleen de
+        # kleurintensiteit bepalen, niet OF een pixel getekend wordt -- helpen daar niet tegen). Werkt op de
+        # RUWE data_cc (voor de CC_FALLBACK-opvulling), zodat een pixel zonder CC-data NOOIT wordt
+        # weggefilterd (een vergelijking met NaN is altijd onwaar) -- alleen aantoonbaar hoge CC verdwijnt.
+        # Hagel heeft per definitie een lagere CC dan gewone regen, dus blijft hierdoor onaangeroerd. Los
+        # van/onafhankelijk van het analoge 3D-only filter (volume3d_polrgb_cc_max in nlr.py).
+        cc_hide_above = getattr(self.gui, 'polrgb_cc_hide_above', None)
+        if cc_hide_above is not None:
+            alpha[data_cc > cc_hide_above] = 0.0
+
+        # Return RGBA (not RGB premultiplied against a fixed background): the ImageVisual is already configured
+        # with the 'translucent' GL state (blend = src_alpha, one_minus_src_alpha), so passing a real alpha
+        # channel lets vispy blend each pixel against whatever is actually underneath (the map), rather than
+        # against a hardcoded black background -- which is what made the whole radar circle opaque black where
+        # there's no echo, hiding the map underneath it.
+        rgba = np.stack([r, g, b, alpha], axis=-1)
+        return (rgba * 255).astype('uint8')
+
+    def ensure_melting_level_grid_current(self):
+        """Haalt (zo nodig) het gedeelde temperatuurrooster op (nlr_hclass.NL_GRID_POINTS) voor het
+        HUIDIGE tijdstip, en cachet het resultaat in self.melting_level_grid_results.
+
+        LOS van de radar (in tegenstelling tot ensure_melting_levels_current/self.melting_level_h0_m,
+        die bij de radarlocatie zelf horen en de altijd-zichtbare balk voeden) - dit rooster hoort bij
+        het TIJDSTIP alleen, want de temperatuurstructuur van de atmosfeer heeft niks met een specifieke
+        radar te maken (zie gesprek met Erik, 22 juli). Daardoor wordt bij het wisselen tussen radars
+        (bv. Herwijnen/Den Helder) dit rooster niet opnieuw opgehaald als het tijdstip gelijk blijft.
+        """
+        # BUGFIX-VOORKOMEND (25 juli, zelfde soort valkuil als de eerdere VILD-schijf-cachebug):
+        # de cache-sleutel was tot nu toe alleen (datum, tijd) - als je de handmatige override
+        # aan/uit zet, of het station/datum/uur daarvan wijzigt, terwijl de scan zelf hetzelfde
+        # blijft, zou ensure_melting_level_grid_current hierboven anders VROEGTIJDIG terugkeren
+        # met het oude (automatische of eerder handmatig gekozen) resultaat. Vandaar de
+        # override-instellingen mee in de sleutel, maar ALLEEN als de override uit staat een
+        # simpele (datum, tijd) zoals voorheen - zo blijft de bestaande caching voor het
+        # automatische pad ongewijzigd.
+        manual_override_active = getattr(self.gui, 'melting_levels_manual_override', False)
+        if manual_override_active:
+            current_key = (self.crd.date, self.crd.time, True,
+                           getattr(self.gui, 'melting_levels_manual_station', None),
+                           getattr(self.gui, 'melting_levels_manual_date', None),
+                           getattr(self.gui, 'melting_levels_manual_hour', None))
+        else:
+            current_key = (self.crd.date, self.crd.time)
+        if getattr(self, 'melting_level_grid_key', None) == current_key:
+            return
+
+        try:
+            scan_dt = dtime.datetime.strptime(self.crd.date+self.crd.time, '%Y%m%d%H%M')
+        except Exception as e:
+            gv.log_product_check(
+                f"WAARSCHUWING - HCLASS - kon datum/tijd niet parsen voor temperatuurrooster "
+                f"(date={self.crd.date}, time={self.crd.time}): {e}")
+            self.melting_level_grid_results = None
+            self.melting_level_grid_key = current_key
+            return
+
+        try:
+            if getattr(self.gui, 'melting_levels_manual_override', False):
+                # HANDMATIGE TERUGVALOPTIE (25 juli, op Eriks verzoek, zie nlr.py's
+                # select_melting_levels_override/ALT+W): in plaats van de automatische,
+                # dichtstbijzijnde-tijd-keuze uit een op het TIJDSTIP gebaseerd station/uur,
+                # gebruikt de gebruiker hier zelf een gekozen station+datum+uur. Net als de
+                # bestaande automatische Wyoming-fallback (die ook maar 1 vaste waarde voor
+                # heel Nederland geeft, zie nlr_meltinglevels.py) wordt hetzelfde resultaat
+                # voor ALLE 16 roosterpunten gebruikt - een handmatig gekozen sounding is
+                # sowieso altijd de Wyoming-bron, die nooit een rooster kent.
+                try:
+                    year, month, day = (int(x) for x in self.gui.melting_levels_manual_date.split('-'))
+                    manual_result = nml.get_melting_levels_wyoming_manual(
+                        self.gui.melting_levels_manual_station, year, month, day,
+                        self.gui.melting_levels_manual_hour)
+                    self.melting_level_grid_results = [manual_result] * len(hc.NL_GRID_POINTS)
+                except (ValueError, AttributeError, nml.MeltingLevelError) as e:
+                    gv.log_product_check(
+                        f"WAARSCHUWING - HCLASS - handmatige Wyoming-keuze mislukt "
+                        f"(station={getattr(self.gui, 'melting_levels_manual_station', '?')}, "
+                        f"datum={getattr(self.gui, 'melting_levels_manual_date', '?')}, "
+                        f"uur={getattr(self.gui, 'melting_levels_manual_hour', '?')}): {e}")
+                    self.melting_level_grid_results = None
+            else:
+                self.melting_level_grid_results = nml.get_melting_levels_grid(hc.NL_GRID_POINTS, scan_dt)
+        except Exception as e:
+            print(e, 'ensure_melting_level_grid_current')
+            traceback.print_exception(type(e), e, e.__traceback__)
+            gv.log_product_check(
+                f"WAARSCHUWING - HCLASS - ophalen temperatuurrooster mislukt op {self.crd.date} {self.crd.time}: {e}")
+            self.melting_level_grid_results = None
+        self.melting_level_grid_key = current_key
+
+    def _calculate_hclass(self, j):
+        """Bereken de hydrometeorenclassificatie (HCLASS) voor paneel j: Z, ZDR, KDP, RhoHV plus een
+        geschatte temperatuur per bin (lineaire interpolatie/extrapolatie tussen het 0C- en -20C-niveau,
+        zie nlr_meltinglevels.py), via het C-band-schema van Dolan et al. 2013
+        (CSU_RadarTools-parameters, zie nlr_hclass.py voor bron/attributie).
+
+        Zelfde opzet als _calculate_polrgb hierboven: haalt zijn eigen componentproducten op via
+        get_data_multiple_scans (de normale get_data(j)-weg wordt overgeslagen, zie de 'g'/'f'-check
+        in self.get_data()), en retourneert direct een kant-en-klare (azimuth, range, 4) uint8
+        RGBA-array. Hetzelfde RGBA-passthrough-renderpad als PolRGB (product 'g') wordt hiervoor
+        hergebruikt in nlr_plotting.py (is_rgb_product geldt daar voor 'g' EN 'f').
+
+        Temperatuur per bin wordt (sinds 22 juli) geschat via een GEDEELD rooster van punten over heel
+        Nederland (nlr_hclass.NL_GRID_POINTS), i.p.v. 1 vast punt op de radarlocatie zelf: voor elke bin
+        wordt de echte lat/lon berekend (hc.destination_point) en het dichtstbijzijnde roosterpunt
+        gekozen (hc.nearest_grid_index). Dit voorkomt afwijkingen aan de rand van het radarbereik en een
+        sprong in temperatuur bij het wisselen tussen radars. Als het rooster niet beschikbaar is (bv.
+        netwerkfout), wordt zonder temperatuur geclassificeerd (minder scherpe scheiding tussen
+        ijs-/vloeistofklassen, zie nlr_hclass.classify_hid), in plaats van de hele berekening te laten
+        mislukken.
+        """
+        scan = self.crd.scans[j]
+        source = self.source_classes[self.data_source()]
+
+        def fetch(product):
+            # Zelfde defensieve unpack als _calculate_polrgb.fetch hierboven (zie daar voor uitleg).
+            returns = source.get_data_multiple_scans(
+                product, [scan], productunfiltered=False, polarization='H', apply_dealiasing=False)
+            data, scantimes = returns[0], returns[1]
+            arrays = data[scan]
+            duplicate = self.duplicate(product, scan)
+            duplicate = duplicate if duplicate < len(arrays) else 0
+            scantime = scantimes[scan][duplicate] if scan in scantimes and duplicate < len(scantimes.get(scan, [])) else None
+            return arrays[duplicate].astype('float32'), scantime
+
+        try:
+            data_z, scantime_z = fetch('z')
+            data_zdr, _ = fetch('d')
+            data_kdp, _ = fetch('k')
+            data_cc, _ = fetch('c')
+            if scantime_z is not None:
+                self.scantimes[j] = scantime_z
+        except Exception as e:
+            print(e, '_calculate_hclass, panel '+str(j))
+            traceback.print_exception(type(e), e, e.__traceback__)
+            self.dont_store_in_memory[j] = True
+            shape = self.data[j].shape if j in self.data and self.data[j].ndim == 2 else (1, 1)
+            return np.zeros((*shape, 4), dtype='uint8')
+
+        # ZPHI-verzwakkingscorrectie (C-band, Testud 2000/Bringi 2001/Gou 2019, zie
+        # nlr_attenuation.py - alleen toegepast op HCLASS/MESH/POSH/POH/SHI, op Eriks
+        # expliciete keuze, NIET op de gewone Z-weergave of PolRGB) - 28 juli 2026.
+        # Corrigeert data_z en data_zdr vóór classify_hid; data_kdp/data_cc blijven
+        # ongewijzigd (geen ZPHI-formule daarvoor, zie toelichting in nlr_attenuation.py).
+        # Defensief: als PhiDP niet beschikbaar is voor deze radar/scan (bv. een
+        # radarformaat zonder polarimetrie), gaat HCLASS gewoon door met de ongecorrigeerde
+        # data, net als bij een ontbrekend temperatuurrooster hieronder.
+        if getattr(self.gui, 'attenuation_correction_enabled', True):
+            try:
+                data_phidp, _ = fetch('p')
+                range_res_km = self.radial_res_all['z'][scan]
+                if data_phidp.shape == data_z.shape:
+                    data_z, data_zdr = att.correct_scan_zphi(
+                        data_z, data_phidp, data_cc / 100., range_res_km, ZDR_dBZ_2d=data_zdr)
+                else:
+                    print(f"_calculate_hclass: vorm-mismatch scan {scan} - "
+                          f"Z={data_z.shape} PhiDP={data_phidp.shape} - GEEN correctie toegepast")
+            except Exception as e:
+                print(e, '_calculate_hclass attenuation correction, panel '+str(j))
+                traceback.print_exception(type(e), e, e.__traceback__)
+
+        # Zelfde defensieve vorm-afstemming als in _calculate_polrgb (in principe zouden vormen altijd
+        # moeten matchen omdat ze uit dezelfde scan komen, maar dit voorkomt een crash in het
+        # onwaarschijnlijke geval dat dat een keer niet zo is).
+        shape = data_z.shape
+        others = (data_zdr, data_kdp, data_cc)
+        if any(a.shape != shape for a in others):
+            n_az = min(data_z.shape[0], *(a.shape[0] for a in others))
+            n_rng = min(data_z.shape[1], *(a.shape[1] for a in others))
+            data_z, data_zdr, data_kdp, data_cc = (
+                a[:n_az, :n_rng] for a in (data_z, data_zdr, data_kdp, data_cc))
+
+        # RhoHV wordt in NLradar intern als percentage (0-100) opgeslagen (zie get_data_multiple_scans:
+        # "if product == 'c': data[j][-1] *= 100."), maar de CSU-parameters (nlr_hclass.py) gaan uit
+        # van een fractie (0-1), dus hier terugschalen.
+        data_cc_frac = data_cc / 100.0
+
+        T = None
+        h0_2d = None
+        h_minus20_2d = None
+        grid_idx_2d = None
+        try:
+            self.ensure_melting_level_grid_current()
+            grid_results = getattr(self, 'melting_level_grid_results', None)
+            if grid_results is not None:
+                angle = self.scanangles_all_m['z'][scan]
+                radial_res = self.radial_res_all['z'][scan]  # km per bin
+                radar_elevation_km = gv.radar_elevations.get(self.crd.radar, 0)/1000.0
+                n_az, n_rng = shape
+                slant_ranges_km = radial_res*(np.arange(n_rng)+0.5)
+                heights_km = hc.beam_height_km(slant_ranges_km, angle, radar_elevation_km)
+                heights_m_2d = np.broadcast_to(heights_km*1000.0, shape)
+
+                # Grondafstand wordt hier benaderd als gelijk aan de slant range - een geldige
+                # vereenvoudiging voor de lage elevatiehoeken (doorgaans de onderste, ~0.3-0.5 graden
+                # scan) waarop HCLASS meestal wordt bekeken: cos(0.5 graden) verschilt < 0,004% van 1,
+                # dus het verschil met de exacte grondafstand is voor het kiezen van een roosterpunt
+                # (nauwkeurigheid ~150 km) totaal verwaarloosbaar.
+                ground_ranges_km = slant_ranges_km
+                azimuthal_res = 360.0/n_az
+                # LET OP: gebruikt azimuth-offset=0 (het midden van bin 0 wordt dus als 0 graden/Noord
+                # aangenomen). Dit is dezelfde vereenvoudiging die al impliciet gold in de vorige
+                # (1-punts-)versie en in _calculate_polrgb hierboven: self.dsg.data_azimuth_offset[j]
+                # wordt voor 'g'/'j' nooit gezet (die slaan de normale get_data(j)-weg over, waar dat
+                # normaliter gebeurt). Voor de keuze van het dichtstbijzijnde roosterpunt (nauwkeurigheid
+                # ~150 km) is een eventuele kleine afwijkende offset niet van belang.
+                azimuths_deg = azimuthal_res*(np.arange(n_az)+0.5)
+
+                lat0, lon0 = gv.radarcoords[self.crd.radar]
+                az_2d, rng_2d = np.meshgrid(azimuths_deg, ground_ranges_km, indexing='ij')
+                lats_2d, lons_2d = hc.destination_point(lat0, lon0, rng_2d, az_2d)
+
+                grid_idx_2d = hc.nearest_grid_index(lats_2d, lons_2d, hc.NL_GRID_POINTS)
+
+                grid_h0 = np.array([r['h0_m'] if r['h0_m'] is not None else np.nan for r in grid_results])
+                grid_h20 = np.array([r['h_minus20_m'] if r['h_minus20_m'] is not None else np.nan for r in grid_results])
+                h0_2d = grid_h0[grid_idx_2d]
+                h_minus20_2d = grid_h20[grid_idx_2d]
+
+                T = hc.estimate_temperature(heights_m_2d, h0_2d, h_minus20_2d)
+        except Exception as e:
+            print(e, '_calculate_hclass temperature grid estimation, panel '+str(j))
+            traceback.print_exception(type(e), e, e.__traceback__)
+            T = None
+            h0_2d = None
+            h_minus20_2d = None
+            grid_idx_2d = None
+
+        hid, _scores = hc.classify_hid(data_z, data_zdr, data_kdp, data_cc_frac, T=T)
+
+        # Cache voor de mouse-cursor-uitlezing (zie Plotting.update_data_readout), analoog aan
+        # self.polrgb_raw_data hierboven. h0_2d/h_minus20_2d (22 juli, op Eriks verzoek i.p.v. de losse
+        # 0C/-20C-balk in nlr.py, die is verwijderd) laten de tooltip de daadwerkelijke 0C-/-20C-hoogte
+        # voor DEZE specifieke bin tonen (uit het gedeelde temperatuurrooster), i.p.v. een apart
+        # venstertje met 1 vaste waarde voor het hele beeld. grid_idx_2d (teruggezet op Eriks verzoek,
+        # naast h0_2d/h_minus20_2d, niet in plaats ervan) laat de tooltip OOK tonen welk roosterpunt is
+        # gebruikt.
+        self.hclass_raw_data[j] = (hid, data_z, data_zdr, data_kdp, data_cc, T, h0_2d, h_minus20_2d, grid_idx_2d)
+
+        return hc.classes_to_rgba(hid)
+
+    def get_cross_section(self, product, point_a, point_b, n_samples=2000):
+        """Computes a vertical cross-section of the given product ('v' for Velocity, 'z' for Reflectivity) along
+        the straight line from point_a to point_b (both given as AEQD x/y coordinates in km from the radar, the
+        same convention used by the A/B line tool in nlr_plotting.py).
+
+        For each of n_samples points evenly spaced along the line, and for every available elevation scan,
+        looks up the product value at that ground position and computes the physical height there (via the
+        existing var1_to_var2 'gr+theta->h' formula, the same one already used elsewhere for e.g. choosing the
+        scan closest to a given beam height). Returns a flat list of (distance_along_line_km, height_km,
+        value) tuples -- one per (sample point, scan) combination that actually has data there -- ready to be
+        handed to a plotting routine for the actual cross-section visual.
+
+        This deliberately fetches ALL elevation scans in a single get_data_multiple_scans call (rather than
+        looping over scans with separate calls), mirroring how _calculate_polrgb fetches its 3 channels --
+        except _calculate_polrgb only ever asks for a single scan ([scan]) at a time, while this function asks
+        for every available elevation scan at once. That wider request was found to disturb the data source's
+        shared self.scannumbers_forduplicates/self.scannumbers_all bookkeeping (probably because requesting the
+        full scan range triggers an internal recomputation path that normal single-scan, single-panel requests
+        never hit), causing a KeyError further down the line the next time an ordinary panel tried to fetch its
+        own data (see nlr_datasourcegeneral.duplicate). To avoid that, both are snapshotted before this call and
+        restored immediately after (in a finally, so they're restored even if the fetch raises) -- this function
+        only reads from the fetched arrays, it has no legitimate reason to leave any lasting change to that
+        shared bookkeeping behind for the rest of the application.
+
+        Dealiasing (correcting Nyquist-velocity wrap-around) is only meaningful for Velocity, never for
+        Reflectivity, so apply_dealiasing is only passed as True when product == 'v'.
+        """
+        scan_to_angle = self.scanangles_all.get(product, {})
+        # 90-degree 'birdbath' scans (if present) don't usefully contribute to a horizontal cross-section and
+        # would need special-cased geometry (a single point straight up rather than a ground-range relation),
+        # so they're excluded here.
+        scans = sorted(scan for scan, angle in scan_to_angle.items() if isinstance(scan, int) and angle < 89.9)
+        if not scans:
+            return []
+
+        source = self.source_classes[self.data_source()]
+        scannumbers_forduplicates_snapshot = copy.deepcopy(self.scannumbers_forduplicates)
+        scannumbers_all_snapshot = copy.deepcopy(self.scannumbers_all)
+        try:
+            returns = source.get_data_multiple_scans(product, scans, productunfiltered=False, polarization='H',
+                                                       apply_dealiasing=(product == 'v'))
+        finally:
+            self.scannumbers_forduplicates = scannumbers_forduplicates_snapshot
+            self.scannumbers_all = scannumbers_all_snapshot
+        data_per_scan, scantimes = returns[0], returns[1]
+
+        radar_xy = np.array([0., 0.]) # By definition: point_a/point_b are already in radar-centered AEQD km.
+        line_vec = point_b-point_a
+        line_length_km = np.linalg.norm(line_vec)
+        if line_length_km == 0:
+            return []
+        t_values = np.linspace(0, 1, n_samples)
+        sample_points = point_a+t_values[:, None]*line_vec # shape (n_samples, 2)
+        distances_along_line = t_values*line_length_km
+
+        # Ground range (km from radar) and azimuth (degrees, 0=North, clockwise) for every sample point.
+        ground_ranges = np.linalg.norm(sample_points-radar_xy, axis=1)
+        # Computed directly here (rather than via nlr_functions.azimuthal_angle, which only handles a single
+        # scalar (x,y) pair, not an array of points) using the same 0=North-clockwise convention.
+        azimuths = (90.-np.degrees(np.arctan2(sample_points[:, 1], sample_points[:, 0]))) % 360.
+
+        points = [] # list of (distance_km, height_km, value)
+        mask_value = self.pb.mask_values.get(product, None)
+        for scan in scans:
+            angle = scan_to_angle[scan]
+            duplicate = self.duplicate(product, scan)
+            arrays = data_per_scan.get(scan, [])
+            if not arrays:
+                continue
+            arr = arrays[duplicate if duplicate < len(arrays) else 0]
+            n_az, n_range = arr.shape
+            radial_res = self.radial_res_all.get(product, {}).get(scan, None)
+            if radial_res is None or radial_res <= 0:
+                continue
+
+            heights_km = ft.var1_to_var2(ground_ranges, angle, 'gr+theta->h')
+            # NOTE: assumes a zero azimuth offset for row 0 of each scan. get_data_multiple_scans doesn't
+            # expose a per-scan azimuth offset (that's only determined per-panel, during the normal get_data(j)
+            # path that this function deliberately bypasses -- same as _calculate_polrgb does for Z/CC/ZDR).
+            # True for the great majority of scans tested so far; revisit if a cross-section ever looks
+            # azimuthally misaligned for a particular radar/scan.
+            az_offset = 0.
+            row_indices = np.round(((azimuths-az_offset) % 360.)/360.*n_az).astype('int64') % n_az
+            col_indices = np.round(ground_ranges/radial_res).astype('int64')
+            in_range_mask = col_indices < n_range
+
+            for i in np.nonzero(in_range_mask)[0]:
+                value = arr[row_indices[i], col_indices[i]]
+                if mask_value is not None and value == mask_value:
+                    continue
+                if np.isnan(value):
+                    continue
+                points.append((distances_along_line[i], heights_km[i], float(value)))
+
+        return points
+
+    def get_velocity_cross_section(self, point_a, point_b, n_samples=2000):
+        """Backwards-compatible wrapper around get_cross_section for Velocity specifically."""
+        return self.get_cross_section('v', point_a, point_b, n_samples=n_samples)
+
+    def get_volume_grid(self, product, x_range, y_range, grid_res_km=0.5, z_max_km=15., z_res_km=0.25,
+                         apply_dealiasing=None, smoothing_sigma_cells=1.2):
+        """Reconstructs a regular 3D Cartesian grid (x, y in AEQD km from the radar, z = height in km) for
+        `product`, meant as the data backbone for a future 3D/volumetric view (see conversation with Erik,
+        July 2026, about the "scan slierten, geen wolk" problem with a naive per-scan-surface 3D view).
+
+        This is the direct 2D-area generalization of get_cross_section/get_velocity_cross_section above: same
+        scan-fetching pattern (single get_data_multiple_scans call for every available elevation, with the
+        same snapshot/restore of scannumbers_forduplicates/scannumbers_all -- see the docstring of
+        get_cross_section for why that's needed), same idea of looking up a value per grid point via
+        row/col indices into each scan's raw (azimuth, range) array. The one real difference is *what* gets
+        interpolated: get_cross_section bins scattered (distance, height, value) points onto a raster and
+        interpolates vertically per distance-column (see the vertical-interpolation block in
+        nlr_plotting.show_cross_section); this function instead has an explicit x/y column for every grid
+        cell up front (no binning needed, since there's exactly one ground_range/azimuth per column) and
+        interpolates vertically per (x, y) column onto a fixed z-axis, using the same "only interpolate
+        BETWEEN the lowest and highest scan with real data in that column, never extrapolate beyond" rule.
+
+        x_range, y_range: (min_km, max_km) tuples, AEQD-relative to the radar (same convention as
+        ab_line_a/ab_line_b for the existing cross-section line).
+        grid_res_km: horizontal grid spacing (x and y).
+        z_max_km/z_res_km: vertical grid extent and spacing.
+
+        Returns a dict with:
+            'grid'       : ndarray, shape (n_z, n_y, n_x). np.nan where no bracketing measurement exists
+                           (above the highest scan, below the lowest scan, or beyond a scan's range/az
+                           coverage) -- deliberately never invented/extrapolated, same policy as the
+                           cross-section.
+            'x', 'y'     : 1D arrays of grid-cell-center coordinates (km).
+            'z'          : 1D array of grid-cell-center heights (km).
+            'scans_used' : list of scan numbers that contributed (diagnostic only).
+        Returns None if no non-birdbath scans are available for `product`.
+        """
+        scan_to_angle = self.scanangles_all.get(product, {})
+        scans = sorted(scan for scan, angle in scan_to_angle.items() if isinstance(scan, int) and angle < 89.9)
+        if not scans:
+            return None
+
+        source = self.source_classes[self.data_source()]
+        scannumbers_forduplicates_snapshot = copy.deepcopy(self.scannumbers_forduplicates)
+        scannumbers_all_snapshot = copy.deepcopy(self.scannumbers_all)
+        try:
+            returns = source.get_data_multiple_scans(
+                product, scans, productunfiltered=False, polarization='H',
+                apply_dealiasing=(product == 'v') if apply_dealiasing is None else apply_dealiasing)
+        finally:
+            self.scannumbers_forduplicates = scannumbers_forduplicates_snapshot
+            self.scannumbers_all = scannumbers_all_snapshot
+        data_per_scan, scantimes = returns[0], returns[1]
+
+        x_min, x_max = x_range
+        y_min, y_max = y_range
+        n_x = max(2, int(round((x_max-x_min)/grid_res_km)))
+        n_y = max(2, int(round((y_max-y_min)/grid_res_km)))
+        x_axis = x_min+(np.arange(n_x)+0.5)*grid_res_km
+        y_axis = y_min+(np.arange(n_y)+0.5)*grid_res_km
+        xx, yy = np.meshgrid(x_axis, y_axis) # shape (n_y, n_x)
+        ground_ranges = np.hypot(xx, yy).ravel() # (n_cols,)
+        # Same 0=North-clockwise azimuth convention as get_cross_section.
+        azimuths = ((90.-np.degrees(np.arctan2(yy, xx))) % 360.).ravel()
+        n_cols = ground_ranges.size
+
+        mask_value = self.pb.mask_values.get(product, None)
+        scan_heights, scan_values, used_scans = [], [], []
+        for scan in scans:
+            angle = scan_to_angle[scan]
+            duplicate = self.duplicate(product, scan)
+            arrays = data_per_scan.get(scan, [])
+            if not arrays:
+                continue
+            arr = arrays[duplicate if duplicate < len(arrays) else 0]
+            n_az, n_range = arr.shape
+            radial_res = self.radial_res_all.get(product, {}).get(scan, None)
+            if radial_res is None or radial_res <= 0:
+                continue
+
+            heights_km = ft.var1_to_var2(ground_ranges, angle, 'gr+theta->h')
+            az_offset = 0. # Same simplifying assumption as get_cross_section -- see its docstring.
+            # TERUGGEZET (5 juli 2026) naar de oorspronkelijke nearest-neighbor lookup. Er is kort
+            # geexperimenteerd met bilineaire interpolatie hier, als (foutieve) poging om een felle rand
+            # rondom de 3D-vorm bij V op te lossen -- die rand bleek uiteindelijk een losstaande, bekende
+            # vispy Volume/MIP-renderbeperking te zijn (zie show_volume_3d_viewer in nlr.py), dus deze
+            # wijziging loste niets op. Omdat de bilineaire versie ook niet apart gevalideerd was met echte
+            # productiedata (in tegenstelling tot deze nearest-neighbor versie, die de hele sessie door met
+            # echte buien is getest en goedgekeurd), is besloten 'm terug te zetten i.p.v. een niet-bewezen
+            # wijziging te laten staan zonder aangetoonde meerwaarde.
+            row_idx = np.round((azimuths-az_offset) % 360./360.*n_az).astype('int64') % n_az
+            col_idx = np.round(ground_ranges/radial_res).astype('int64')
+            in_range = col_idx < n_range
+            col_idx_clipped = np.where(in_range, col_idx, 0)
+            raw = arr[row_idx, col_idx_clipped]
+
+            valid = in_range.copy()
+            if mask_value is not None:
+                valid &= (raw != mask_value)
+            if np.issubdtype(raw.dtype, np.floating):
+                valid &= ~np.isnan(raw)
+            vals = np.full(n_cols, np.nan, dtype='float32')
+            vals[valid] = raw[valid]
+
+            scan_heights.append(heights_km)
+            scan_values.append(vals)
+            used_scans.append(scan)
+
+        if not scan_values:
+            return None
+
+        scan_heights = np.asarray(scan_heights) # (n_scans, n_cols)
+        scan_values = np.asarray(scan_values)    # (n_scans, n_cols)
+
+        n_z = max(1, int(round(z_max_km/z_res_km)))
+        z_axis = (np.arange(n_z)+0.5)*z_res_km
+        grid = np.full((n_z, n_cols), np.nan, dtype='float32')
+
+        # Per grid column: interpolate between the lowest and highest scan with real data there, exactly
+        # like the per-distance-column interpolation in show_cross_section, just done here per (x,y) column
+        # instead. NOTE: this loops in plain Python over every grid column (as show_cross_section also does
+        # over its distance-columns) -- fine for a first version / a modest, user-selected area, but if this
+        # is later pushed to a much finer/larger grid, this loop (not the data fetch) is the first place to
+        # optimize, e.g. by exploiting that scan_heights is already monotonically increasing per column
+        # (scans are sorted by ascending angle, and height increases with angle for fixed ground range) to
+        # vectorize the interpolation across all columns at once instead of column-by-column.
+        for col in range(n_cols):
+            v_col = scan_values[:, col]
+            valid = ~np.isnan(v_col)
+            if valid.sum() < 2:
+                continue
+            h_valid = scan_heights[valid, col]
+            v_valid = v_col[valid]
+            order = np.argsort(h_valid)
+            h_valid, v_valid = h_valid[order], v_valid[order]
+            lo, hi = h_valid[0], h_valid[-1]
+            in_bounds = (z_axis >= lo) & (z_axis <= hi)
+            if in_bounds.any():
+                grid[in_bounds, col] = np.interp(z_axis[in_bounds], h_valid, v_valid)
+
+        grid = grid.reshape(n_z, n_y, n_x)
+        # TERUGGEDRAAID (5 juli 2026): een uitschieter-filter hier bleek verkeerd -- bij velocity zijn
+        # scherpe overgangen vaak ECHTE structuur (windschering, mesocycloon), geen ruis, en het filter
+        # verwijderde daardoor legitieme data. _remove_volume_grid_outliers blijft hieronder gedefinieerd
+        # maar wordt niet meer aangeroepen.
+        #
+        # OOK TERUGGEDRAAID (5 juli 2026): de rand-erosie hieronder loste de felle rand rondom de vorm bij
+        # V NIET op (grondig uitgezocht en uiteindelijk bevestigd: dat is een interpolatie-"overshoot" van
+        # vispy's Volume-visual zelf op harde randen -- zie de toelichting in show_volume_3d_viewer in
+        # nlr.py -- geen data-kenmerk, dus ook niet op te lossen door data weg te snijden). Erosie kostte
+        # daarmee alleen onnodig een laagje echte randdata, zonder baat. _erode_volume_grid_edges blijft
+        # hieronder gedefinieerd maar wordt niet meer aangeroepen.
+        # Horizontale gladstrijking tussen NAAST ELKAAR liggende (x,y)-kolommen -- dit was tot nu toe de
+        # ontbrekende stap: elke kolom werd al verticaal netjes geinterpoleerd (tussen scans), maar kolommen
+        # onderling niet, wat de scherpe, blokkerige "Minecraft"-rand gaf die Erik terecht aanwees (5 juli
+        # 2026) i.p.v. een vloeiende wolkvorm. NaN-bewust: lege cellen tellen niet mee in het gemiddelde, en
+        # blijven leeg als er te weinig echte buren zijn (geen verzonnen data ver buiten de bui).
+        # smoothing_sigma_cells<=0 slaat deze stap over (instelbaar via Settings -> Miscellaneous in nlr.py),
+        # voor als je liever de ruwe, ongeladde reconstructie wilt zien.
+        if smoothing_sigma_cells > 0:
+            grid = self._smooth_volume_grid_horizontally(grid, sigma_cells=smoothing_sigma_cells)
+        return {'grid': grid, 'x': x_axis, 'y': y_axis, 'z': z_axis, 'scans_used': used_scans}
+
+    def get_volume_grid_polrgb(self, x_range, y_range, grid_res_km=0.5, z_max_km=15., z_res_km=0.25,
+                                smoothing_sigma_cells=1.2):
+        """PolRGB-equivalent van get_volume_grid hierboven, voor de 3D-viewer (CTRL+SHIFT+4, product 'g').
+
+        get_volume_grid reconstrueert een 3D-rooster voor EEN scalair product met een kleurentabel erop
+        toegepast; PolRGB heeft geen kleurentabel (R=Z, G=CC, B=ZDR, RGBA-passthrough -- zie
+        DataSource_General._calculate_polrgb voor de 2D-versie van dezelfde aanpak). Deze functie roept
+        get_volume_grid daarom 3x apart aan (voor 'z', 'c', 'd', met IDENTIEKE grid-parameters, dus
+        identieke x/y/z-assen), en combineert de 3 roosters daarna per voxel met EXACT dezelfde formule/
+        parameters (self.gui.polrgb_params) als _calculate_polrgb. Smoothing gebeurt dus per fysieke
+        grootheid (dBZ/%/dB), VOOR het combineren tot kleur -- niet achteraf op de al-gecombineerde RGB
+        (dat zou verkeerde tussenkleuren geven bij het middelen van bijvoorbeeld rood en blauw).
+
+        Returns een dict met:
+            'rgba'  : ndarray, shape (n_z, n_y, n_x, 4), float32 in [0, 1]. Alpha=0 waar geen Z-data
+                      bestaat (buiten het geinterpoleerde bereik, net als NaN bij get_volume_grid).
+            'z_raw' : ndarray, shape (n_z, n_y, n_x), de ruwe (ongevulde) Z-reconstructie in dBZ, NaN waar
+                      geen data -- voor eventuele extra filtering (volume3d_min_value/cirkelvormig gebied)
+                      door de aanroeper, op dezelfde manier als bij een gewoon scalair product.
+            'cc_raw': ndarray, shape (n_z, n_y, n_x), de ruwe (ongevulde) CC-reconstructie in %, NaN waar
+                      geen data -- voor het aparte CC-zichtbaarheidsfilter (volume3d_polrgb_cc_max) door de
+                      aanroeper, los van/onafhankelijk van het Z-filter hierboven.
+            'x', 'y', 'z' : 1D-assen, identiek aan een gewone get_volume_grid-aanroep met dezelfde parameters.
+            'scans_used'  : scans gebruikt voor Z (diagnostisch, zoals bij get_volume_grid).
+        Returns None als er geen (niet-birdbath) scans beschikbaar zijn voor Z, CC of ZDR.
+        """
+        result_z = self.get_volume_grid('z', x_range, y_range, grid_res_km=grid_res_km, z_max_km=z_max_km,
+                                          z_res_km=z_res_km, apply_dealiasing=False,
+                                          smoothing_sigma_cells=smoothing_sigma_cells)
+        if result_z is None:
+            return None
+        result_cc = self.get_volume_grid('c', x_range, y_range, grid_res_km=grid_res_km, z_max_km=z_max_km,
+                                           z_res_km=z_res_km, apply_dealiasing=False,
+                                           smoothing_sigma_cells=smoothing_sigma_cells)
+        result_zdr = self.get_volume_grid('d', x_range, y_range, grid_res_km=grid_res_km, z_max_km=z_max_km,
+                                            z_res_km=z_res_km, apply_dealiasing=False,
+                                            smoothing_sigma_cells=smoothing_sigma_cells)
+        if result_cc is None or result_zdr is None:
+            return None
+
+        grid_z, grid_cc, grid_zdr = result_z['grid'], result_cc['grid'], result_zdr['grid']
+        # Assen komen rechtstreeks uit x_range/y_range/grid_res_km/z_max_km/z_res_km (zie get_volume_grid),
+        # dus identiek voor alle 3 aanroepen -- shapes horen daardoor altijd overeen te komen. Defensief
+        # bijgeknipt voor het geval een van de 3 producten toch een andere n_range/scanopbouw blijkt te
+        # hebben, zodat dit nooit met een IndexError crasht.
+        if grid_cc.shape != grid_z.shape or grid_zdr.shape != grid_z.shape:
+            n_z = min(grid_z.shape[0], grid_cc.shape[0], grid_zdr.shape[0])
+            n_y = min(grid_z.shape[1], grid_cc.shape[1], grid_zdr.shape[1])
+            n_x = min(grid_z.shape[2], grid_cc.shape[2], grid_zdr.shape[2])
+            grid_z, grid_cc, grid_zdr = (a[:n_z, :n_y, :n_x] for a in (grid_z, grid_cc, grid_zdr))
+
+        # Zelfde parameters/fallbacks als _calculate_polrgb (nooit los opnieuw verzinnen -- 1 bron van
+        # waarheid, via Settings -> PolRGB).
+        params = getattr(self.gui, 'polrgb_params', {})
+        fallback_defaults = {
+            'Z_MIN':-10.0, 'Z_MAX':60.0, 'CC_MIN':70.0, 'CC_MAX':100.0, 'ZDR_MIN':0.0, 'ZDR_MAX':3.0,
+            'Z_FADE_LO':-15.0, 'Z_FADE_HI':10.0, 'ALPHA_GAMMA':0.6, 'CC_FALLBACK':97.0, 'ZDR_FALLBACK':0.5,
+            'Z_GAMMA':2.0, 'ESSL_MODE':False,
+            'ESSL_Z_MIN':self.ESSL_Z_RANGE_POSTER_DEFAULT[0], 'ESSL_Z_MAX':self.ESSL_Z_RANGE_POSTER_DEFAULT[1],
+            'ESSL_CC_MIN':self.ESSL_CC_RANGE_POSTER_DEFAULT[0], 'ESSL_CC_MAX':self.ESSL_CC_RANGE_POSTER_DEFAULT[1],
+            'ESSL_ZDR_MIN':self.ESSL_ZDR_RANGE_POSTER_DEFAULT[0], 'ESSL_ZDR_MAX':self.ESSL_ZDR_RANGE_POSTER_DEFAULT[1],
+            'ESSL_ALPHA_Z':self.ESSL_ALPHA_Z_POSTER_DEFAULT, 'ESSL_ALPHA_V':self.ESSL_ALPHA_V_POSTER_DEFAULT,
+        }
+        def p(key):
+            return params[key] if key in params else fallback_defaults[key]
+
+        Z_MIN, Z_MAX = p('Z_MIN'), p('Z_MAX')
+        CC_MIN, CC_MAX = p('CC_MIN'), p('CC_MAX')
+        ZDR_MIN, ZDR_MAX = p('ZDR_MIN'), p('ZDR_MAX')
+        Z_FADE_LO, Z_FADE_HI = p('Z_FADE_LO'), p('Z_FADE_HI')
+        ALPHA_GAMMA = p('ALPHA_GAMMA')
+        CC_FALLBACK, ZDR_FALLBACK = p('CC_FALLBACK'), p('ZDR_FALLBACK')
+        Z_GAMMA = max(p('Z_GAMMA'), 0.1)
+        ESSL_MODE = bool(p('ESSL_MODE'))
+        ESSL_Z_MIN, ESSL_Z_MAX = p('ESSL_Z_MIN'), p('ESSL_Z_MAX')
+        ESSL_CC_MIN, ESSL_CC_MAX = p('ESSL_CC_MIN'), p('ESSL_CC_MAX')
+        ESSL_ZDR_MIN, ESSL_ZDR_MAX = p('ESSL_ZDR_MIN'), p('ESSL_ZDR_MAX')
+        ESSL_ALPHA_Z, ESSL_ALPHA_V = np.array(p('ESSL_ALPHA_Z')), np.array(p('ESSL_ALPHA_V'))
+
+        def norm(arr, vmin, vmax):
+            return np.clip((arr-vmin)/(vmax-vmin), 0.0, 1.0)
+
+        nodata_z = np.isnan(grid_z)
+        data_z_filled = np.where(nodata_z, Z_FADE_LO, grid_z)
+        data_cc_filled = np.where(np.isnan(grid_cc), CC_FALLBACK, grid_cc)
+        data_zdr_filled = np.where(np.isnan(grid_zdr), ZDR_FALLBACK, grid_zdr)
+
+        if ESSL_MODE:
+            r, g, b, alpha = self._essl_polrgb_channels(
+                data_z_filled, data_cc_filled, data_zdr_filled, nodata_z,
+                ESSL_Z_MIN, ESSL_Z_MAX, ESSL_CC_MIN, ESSL_CC_MAX, ESSL_ZDR_MIN, ESSL_ZDR_MAX,
+                ESSL_ALPHA_Z, ESSL_ALPHA_V)
+        else:
+            r = norm(data_z_filled, Z_MIN, Z_MAX) ** Z_GAMMA
+            g = norm(data_cc_filled, CC_MIN, CC_MAX)
+            b = norm(data_zdr_filled, ZDR_MIN, ZDR_MAX)
+            alpha = norm(data_z_filled, Z_FADE_LO, Z_FADE_HI) ** ALPHA_GAMMA
+            alpha[nodata_z] = 0.0
+
+        rgba = np.stack([r, g, b, alpha], axis=-1).astype('float32')
+        return {'rgba': rgba, 'z_raw': grid_z, 'cc_raw': grid_cc, 'x': result_z['x'], 'y': result_z['y'],
+                'z': result_z['z'], 'scans_used': result_z['scans_used']}
+
+    def _erode_volume_grid_edges(self, grid, erosion_cells=1):
+        """Verwijdert een dunne laag (erosion_cells cellen breed) rondom de RAND van de geldige data (waar
+        geldig overgaat in NaN), in alle richtingen (x, y, en z) tegelijk. Zie de toelichting hierboven in
+        get_volume_grid voor waarom -- kort gezegd: een aanhoudende felle rand in de 3D-weergave die niet
+        oplosbaar bleek via de kleurenschaal/interpolatie, dus nu weggesneden aan de bron in plaats van
+        weergegeven en dan proberen te verdoezelen."""
+        try:
+            from scipy.ndimage import binary_erosion
+        except ImportError:
+            print('_erode_volume_grid_edges: scipy niet beschikbaar, sla rand-erosie over.')
+            return grid
+        valid = ~np.isnan(grid)
+        if not valid.any() or erosion_cells <= 0:
+            return grid
+        eroded_valid = binary_erosion(valid, iterations=erosion_cells)
+        cleaned = grid.copy()
+        cleaned[valid & ~eroded_valid] = np.nan
+        return cleaned
+
+    def _remove_volume_grid_outliers(self, grid, threshold_frac=0.3):
+        """Verwijdert (zet op NaN) cellen die sterk afwijken van de mediaan van hun 6 directe buren (boven,
+        onder, noord, zuid, oost, west) -- zie de uitgebreide toelichting in get_volume_grid hierboven.
+        threshold_frac is het toegestane verschil met die buur-mediaan, als fractie van de totale
+        waardespreiding in het grid (dus zelfde soort robuuste, dimensieloze drempel voor elk product, of
+        het nou dBZ of m/s is). Verwijdert alleen, verzint nooit een vervangende waarde."""
+        valid = ~np.isnan(grid)
+        if not valid.any():
+            return grid
+        value_range = float(np.nanmax(grid)-np.nanmin(grid))
+        if value_range <= 0:
+            return grid
+        threshold = threshold_frac*value_range
+
+        shifts = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
+        neighbour_values = []
+        for dz, dy, dx in shifts:
+            shifted = np.roll(np.roll(np.roll(grid, dz, axis=0), dy, axis=1), dx, axis=2).copy()
+            # np.roll wraps rond -- de kant waar het vandaan "wrapt" hoort niet als buur mee te tellen.
+            if dz == 1: shifted[0, :, :] = np.nan
+            elif dz == -1: shifted[-1, :, :] = np.nan
+            if dy == 1: shifted[:, 0, :] = np.nan
+            elif dy == -1: shifted[:, -1, :] = np.nan
+            if dx == 1: shifted[:, :, 0] = np.nan
+            elif dx == -1: shifted[:, :, -1] = np.nan
+            neighbour_values.append(shifted)
+        neighbour_stack = np.array(neighbour_values)
+        with np.errstate(invalid='ignore'):
+            # All-NaN warnings zijn hier verwacht (cellen zonder enige geldige buur) en onschuldig -- die
+            # cellen blijven vanzelf ongemoeid (is_outlier wordt daar False, zie hieronder).
+            old_settings = np.seterr(invalid='ignore')
+            local_median = np.nanmedian(neighbour_stack, axis=0)
+            np.seterr(**old_settings)
+
+        is_outlier = valid & ~np.isnan(local_median) & (np.abs(grid-local_median) > threshold)
+        cleaned = grid.copy()
+        cleaned[is_outlier] = np.nan
+        return cleaned
+
+    def _smooth_volume_grid_horizontally(self, grid, sigma_cells=1.2):
+        """NaN-bewuste Gaussische gladstrijking over alleen de x/y-assen van een get_volume_grid-resultaat
+        (niet over z, want die richting is al vloeiend geinterpoleerd tussen scans in get_volume_grid zelf).
+        Gebruikt scipy.ndimage als die beschikbaar is; anders wordt het ongeladde (blokkeriger) resultaat
+        teruggegeven in plaats van te crashen.
+        """
+        try:
+            from scipy.ndimage import gaussian_filter
+        except ImportError:
+            print('_smooth_volume_grid_horizontally: scipy niet beschikbaar, sla gladstrijking over.')
+            return grid
+        valid = ~np.isnan(grid)
+        if not valid.any():
+            return grid
+        filled = np.where(valid, grid, 0.).astype('float32')
+        weight = valid.astype('float32')
+        # sigma=0 voor de z-as (axis 0) betekent: geen smoothing in die richting, alleen over y (axis 1) en
+        # x (axis 2).
+        smoothed_sum = gaussian_filter(filled, sigma=(0, sigma_cells, sigma_cells), mode='nearest')
+        smoothed_weight = gaussian_filter(weight, sigma=(0, sigma_cells, sigma_cells), mode='nearest')
+        with np.errstate(invalid='ignore', divide='ignore'):
+            smoothed = smoothed_sum/smoothed_weight
+        # Cellen met nauwelijks echte buren (grotendeels lege omgeving) teruggezet naar NaN, in plaats van
+        # een verdunde/half-verzonnen waarde te tonen net buiten de rand van de bui.
+        smoothed[smoothed_weight < 0.2] = np.nan
+        return smoothed.astype('float32')
+
     def perform_mono_prf_dealiasing(self, j, data, vn=None, azis=None, da=None): # j is the panel
         if VDA is None:
             self.dont_store_in_memory[j] = True
@@ -1503,7 +2474,26 @@ class DataSource_General():
             self.product_versions_datetimesdict, self.products_version_dependent, self.product_versions_in1file =\
                 source_class.get_product_versions(filenames, datetimes)
             if self.product_versions_datetimesdict:
-                self.product_versions_directory = np.unique(np.concatenate(list(self.product_versions_datetimesdict.values())))    
+                self.product_versions_directory = np.unique(np.concatenate(list(self.product_versions_datetimesdict.values())))
+                # Warn once per radar+version-name if a product-version name (e.g. a DWD scan-strategy variant
+                # like 'pcp'/'vol') that hasn't been seen before for this radar shows up -- this is the kind
+                # of change that could silently break code relying on a specific, known set of version names
+                # (e.g. get_volume_grid's plain-vs-versioned key lookup for the 3D viewer) without ever
+                # triggering a data-format error, since NLradar would just treat it as yet another valid
+                # version rather than something worth flagging.
+                if not hasattr(self, '_known_product_versions'):
+                    self._known_product_versions = {}
+                known = self._known_product_versions.setdefault(radar, set())
+                new_versions = set(self.product_versions_directory) - known
+                for version_name in new_versions:
+                    gv.log_product_check(
+                        f"WAARSCHUWING - PRODUCTVERSIE - nieuwe, niet eerder geziene productversie {version_name!r} "
+                        f"aangetroffen voor radar {radar} (bijv. een scanstrategie-variant). Dit is geen fout, maar "
+                        f"kan erop wijzen dat de databron iets heeft gewijzigd."
+                    )
+                known.update(self.product_versions_directory)
+                if not new_versions and known:
+                    gv.log_product_check(f"OK - PRODUCTVERSIE - check uitgevoerd voor radar {radar}, geen nieuwe productversies gevonden.")
     
     def get_files(self,radar,directory,return_datetimes = False):
         filenames = self.get_filenames_directory(radar,directory)
@@ -1538,7 +2528,20 @@ class DataSource_General():
     
     def get_total_volume_files_size(self, datetime=None):
         files_datetime = self.files_datetimesdict[datetime] if datetime else self.files_datetime
-        return sum([os.path.getsize(self.crd.directory+'/'+j) for j in files_datetime])
+        # self.crd.directory and files_datetime can momentarily be out of sync with each other -- e.g. when
+        # the dataset (Z/V) was just switched elsewhere (such as the automatic switch in
+        # determine_list_filedatetimes in nlr_changedata.py) without self.crd.directory having been updated to
+        # match yet. In that case a filename meant for the other dataset's directory may not exist in
+        # self.crd.directory. Skip such files here rather than letting a FileNotFoundError propagate -- this
+        # mirrors the defensive 'continue on missing file' approach already used elsewhere in this codebase for
+        # similar races, and the resulting total is simply based on whichever files are actually present.
+        total = 0
+        for j in files_datetime:
+            try:
+                total += os.path.getsize(self.crd.directory+'/'+j)
+            except FileNotFoundError:
+                continue
+        return total
     
     def get_filenames_and_datetimes_in_datetime_range(self,radar,dataset = None,dir_string = None,startdatetime = None,enddatetime = None,return_abspaths = False,return_completely_selected_directories = False):
         #Either dir_string or dataset should be given as input

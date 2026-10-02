@@ -20,3 +20,15 @@ dist
 build
 *egg-info
 Python_files/NLradar.lnk
+# Eigen/persoonlijke en gegenereerde bestanden (niet publiceren)
+Generated_files/
+Output_files/
+unknown_products_log.txt
+build_installer/
+start_NLradar_*.bat
+*.bak
+*.backup_*
+*.sqlite3
+Python_files/vispy_OLD_BACKUP/
+Python_files/_short/
+Python_files/volume_grid_test_output/
