@@ -16,6 +16,8 @@ from the `Python_files` folder. This version uses vispy 0.14.1 from pip; the vis
 
 API keys (KNMI, etc.) are not included; enter your own under Settings.
 
+Keyboard shortcuts for this version (in Dutch): `docs/NLradar_Toetsenkaart.pdf` (one-page overview) and `docs/NLradar_Toetsenbediening.pdf` (full description). The built-in Help describes the original version.
+
 Data sources and required attribution are listed in `ATTRIBUTION.txt` (Open-Meteo and EUMETNET OPERA data are CC BY 4.0).
 
 **Known issue:** with vispy 0.14.1 the VWP (vertical wind profile) window works, but its title bar and the purple

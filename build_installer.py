@@ -107,6 +107,7 @@ kopieer(os.path.join(ROOT, 'Input_files'), os.path.join(DIST, 'Input_files'))
 kopieer(os.path.join(ROOT, 'NLradar.ico'), os.path.join(DIST, 'NLradar.ico'))
 kopieer(os.path.join(ROOT, 'LICENSE'), os.path.join(DIST, 'LICENSE'))
 kopieer(os.path.join(ROOT, 'ATTRIBUTION.txt'), os.path.join(DIST, 'ATTRIBUTION.txt'))
+kopieer(os.path.join(ROOT, 'docs'), os.path.join(DIST, 'docs'))   # handleidingen (toetsenkaart + toetsenbediening)
 for sub in ('Tables', '_data', 'gifsicle'):
     kopieer(os.path.join(PF, sub), os.path.join(DIST, 'Python_files', sub))
 kopieer(os.path.join(PF, 'dealiasing', 'unet_vda', 'models'),
